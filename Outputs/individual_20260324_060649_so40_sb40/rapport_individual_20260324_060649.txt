@@ -1,0 +1,97 @@
+====================================================================
+  OED-IA SNO Marins — Rapport
+  Mode     : individual
+  Généré le: 20260324_060649
+====================================================================
+
+── REPRODUCTIBILITÉ ─────────────────────────────────────────────────
+  seed_ocean  : 40
+  seed_buoys  : 40
+  nt          : 800  pas de temps
+  n_buoys     : 30  capteurs
+
+── NATURE RUN ───────────────────────────────────────────────────────
+  SST : [0.95, 27.99] °C
+
+── POSITIONS (pixel x, y) ──────────────────────────────────────────
+  B00 : (  89,  175)
+  B01 : (   3,  166)
+  B02 : (  70,  226)
+  B03 : (   5,   14)
+  B04 : (  75,  165)
+  B05 : (  11,  221)
+  B06 : ( 113,  114)
+  B07 : (   8,   81)
+  B08 : ( 105,  144)
+  B09 : ( 122,  175)
+  B10 : ( 126,   26)
+  B11 : ( 157,   26)
+  B12 : (  57,  152)
+  B13 : (  30,   10)
+  B14 : (  85,   11)
+  B15 : ( 134,   76)
+  B16 : ( 103,   50)
+  B17 : (  29,  186)
+  B18 : (  27,  191)
+  B19 : (  21,   41)
+  B20 : ( 137,   33)
+  B21 : (  78,   88)
+  B22 : (  72,  127)
+  B23 : (  77,  130)
+  B24 : ( 140,   91)
+  B25 : ( 129,  103)
+  B26 : ( 120,   86)
+  B27 : ( 118,   65)
+  B28 : (  10,  148)
+  B29 : (  54,   64)
+
+── BRIQUE 1 — AE-UNet MC-Dropout ────────────────────────────────────
+  Loss train (best)   : 0.1621
+  RMSE_val (normalisé): 0.2429
+  RMSE_val physique   : 1.273 °C
+  Temps               : 170.9 s
+
+── BRIQUE 2 — GNN ───────────────────────────────────────────────────
+  Arêtes graphe          : 472
+  Score contrib. moy±std : 0.192 ± 0.113
+  Redondance moyenne     : 0.277
+  Capteurs redondants    : 8  (unicité Q25)
+  Temps                  : 2.0 s
+  IDs redondants         : [0, 4, 6, 16, 21, 22, 23, 27]
+
+── BRIQUE 3 — RL [SCALARIZED] ──────────────────────────────────────────
+  N★ optimal           : 40 capteurs
+  Score info N★        : 0.047
+  Score info max       : 0.047
+  Config légère N      : 20 capteurs
+  Perte info dense→lég : 0.0 %
+  Temps                : 99.4 s
+
+── RÉSUMÉ ───────────────────────────────────────────────────────────
+  Mode        : individual
+  Temps total : 289.9 s
+
+── FICHIERS PRODUITS ────────────────────────────────────────────────
+  ae_best.pt                                     32270 KB
+  ae_network_evaluation.png                       1986 KB
+  ae_uncertainty_density.png                       986 KB
+  gnn_best.pt                                       29 KB
+  gnn_network_analysis.png                         814 KB
+  ocean_overview.png                              1534 KB
+  rl_best.pt                                      1421 KB
+  rl_progression.gif                              5449 KB
+  rl_scalarized.png                                 92 KB
+  rl_training_curves.png                           199 KB
+  rl_training_curves_lam=0.001.png                 299 KB
+  rl_training_curves_lam=0.005.png                 315 KB
+  rl_training_curves_lam=0.01.png                  333 KB
+  rl_training_curves_lam=0.02.png                  343 KB
+  rl_two_configs.png                               270 KB
+
+{
+  "seed_ocean": 40,
+  "seed_buoys": 40,
+  "nt": 800,
+  "mode": "individual"
+}
+====================================================================

@@ -1,5 +1,6 @@
-# OED-IA SNO Marins (NAIADE) 
+# OED-IA SNO Marins (NAIADE) — Network AI for Adaptive Design of Experiments
 Documentation générée par IA (Opus 3) 
+
 Optimal Experimental Design par Intelligence Artificielle — Application aux réseaux d'observation océanographiques.
 
 ---

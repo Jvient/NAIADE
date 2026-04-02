@@ -147,6 +147,7 @@ def _train_ae_quick(b1, T, S, args, ae_ns):
                                       n_obs_max=ae_ns.n_obs_max,
                                       augment_train=True)
     loader = DataLoader(train_ds, batch_size=8, shuffle=True)
+    val_ld = DataLoader(val_ds,   batch_size=8, shuffle=False)
     model  = b1.ObservabilityAE(
         base_ch=ae_ns.base_ch, latent_ch=ae_ns.latent_ch,
         dropout_p=ae_ns.dropout_p, cond_dim=ae_ns.cond_dim).to(DEVICE)
@@ -154,24 +155,57 @@ def _train_ae_quick(b1, T, S, args, ae_ns):
     crit   = b1.AELoss(w_unobs=ae_ns.w_unobs, lambda_grad=ae_ns.lambda_grad,
                         huber_delta=ae_ns.huber_delta)
 
+    npar = sum(p.numel() for p in model.parameters())
+    print(f"  Modèle AE-UNet (base_ch={ae_ns.base_ch}, latent_ch={ae_ns.latent_ch}, "
+          f"dropout={ae_ns.dropout_p}, cond_dim={ae_ns.cond_dim})")
+    print(f"  Paramètres : {npar:,}")
+    print(f"  Entraînement {ae_ns.epochs} ep | Huber δ={ae_ns.huber_delta} | "
+          f"λ_grad={ae_ns.lambda_grad} | MC-Dropout p={ae_ns.dropout_p} | n_mc_val={ae_ns.n_mc_val}")
+
     best_loss = np.inf
     t0 = time.time()
-    model.train()
-    for ep in range(ae_ns.epochs):
-        ep_loss = 0.0
+    for ep in range(1, ae_ns.epochs + 1):
+        model.train()
+        ep_loss = ep_aux = 0.0
         for x, y, mask in loader:
             x, y, mask = x.to(DEVICE), y.to(DEVICE), mask.to(DEVICE)
             pred, z, aux = model(x)
-            loss, *_ = crit(pred, y, mask, aux_preds=aux)
+            loss, l_rec, l_aux = crit(pred, y, mask, aux_preds=aux)
             optim.zero_grad(); loss.backward(); optim.step()
             ep_loss += loss.item()
-        ep_loss /= len(loader)
+            ep_aux += l_aux.item()
+        ep_loss /= len(loader); ep_aux /= len(loader)
         best_loss = min(best_loss, ep_loss)
-        print(f"    ep {ep+1}/{ae_ns.epochs} | Loss={ep_loss:.4f}")
 
-    # RMSE validation MC
+        if ep % 10 == 0 or ep == 1:
+            # RMSE val MC avec stratification par densité
+            model.eval()
+            rmses_all = []
+            rmse_by_d = {"sparse": [], "medium": [], "dense": []}
+            with torch.no_grad():
+                for xv, yv, mv in val_ld:
+                    xv, yv, mv = xv.to(DEVICE), yv.to(DEVICE), mv.to(DEVICE)
+                    preds = torch.stack([model(xv)[0] for _ in range(ae_ns.n_mc_val)])
+                    pm = preds.mean(0)
+                    sq = (pm - yv) ** 2
+                    for b in range(xv.shape[0]):
+                        n_obs_b = int(mv[b].sum().item())
+                        rmse_b = float(torch.sqrt((sq[b] * (1 - mv[b])).mean()).item())
+                        rmses_all.append(rmse_b)
+                        if n_obs_b < 20: rmse_by_d["sparse"].append(rmse_b)
+                        elif n_obs_b < 50: rmse_by_d["medium"].append(rmse_b)
+                        else: rmse_by_d["dense"].append(rmse_b)
+            vr = float(np.mean(rmses_all))
+            sp = np.mean(rmse_by_d["sparse"]) if rmse_by_d["sparse"] else float("nan")
+            me = np.mean(rmse_by_d["medium"]) if rmse_by_d["medium"] else float("nan")
+            de = np.mean(rmse_by_d["dense"])  if rmse_by_d["dense"]  else float("nan")
+            print(f"    ep {ep:3d}/{ae_ns.epochs} | Loss={ep_loss:.4f} | "
+                  f"RMSE={vr:.4f} [sp:{sp:.3f} me:{me:.3f} de:{de:.3f}] | "
+                  f"Laux={ep_aux:.4f}")
+            model.train()
+
+    # RMSE validation finale MC
     model.eval()
-    val_ld = DataLoader(val_ds, batch_size=8, shuffle=False)
     rmses = []
     with torch.no_grad():
         for x, y, mask in val_ld:

@@ -101,13 +101,22 @@ class OceanNetworkEnv:
         active_idx = np.where(self.active_mask > 0.5)[0]
         if len(active_idx) == 0:
             return 0.0
-        coverage = float(self.field_stats[active_idx].sum()) / self.K
+
+        # Couverture avec saturation (Michaelis-Menten) :
+        # alpha calibré sur n_max → demi-saturation quand ~n_max capteurs actifs.
+        # Donne une concavité forte dans [n_min, n_max].
+        sum_var = float(self.field_stats[active_idx].sum())
+        alpha = float(self.n_max) * float(self.field_stats.mean())
+        coverage = sum_var / (sum_var + alpha + 1e-9)
+
+        # Bonus espacement : pénalise le clustering
         if len(active_idx) > 1:
             pos = np.array([self.candidate_positions[i] for i in active_idx], dtype=np.float32)
             nn_d, _ = KDTree(pos).query(pos, k=2)
             spread = float(nn_d[:, 1].mean() / np.sqrt(NX**2 + NY**2))
         else:
             spread = 0.0
+
         return 0.7 * coverage + 0.3 * spread
 
     def step(self, action):
@@ -256,7 +265,7 @@ def train_ppo(args, env, label=""):
                             + vf_c*F.mse_loss(va, batch["returns"][m]) - ent_c*ent)
                     optim.zero_grad(); loss.backward()
                     nn.utils.clip_grad_norm_(policy.parameters(), 0.5); optim.step()
-            if len(ep_rews) > 0 and (step+1)%(args.buffer_size*5)==0:
+            if len(ep_rews) > 0 and (step+1)%(args.buffer_size*10)==0:
                 print(f"    Step {step+1:6d} | R={np.mean(ep_rews):+.3f} | Best={best_rew:+.3f}")
     print(f"  Best reward: {best_rew:.4f}")
 
@@ -331,7 +340,7 @@ def _n_light(n_star):
 def compute_pareto(env, policy, args):
     print("\n-- Methode PARETO --")
     out_dir = Path(args.output_dir); out_dir.mkdir(parents=True, exist_ok=True)
-    n_range = range(max(2, env.n_min-5), min(env.K, env.n_max+10))
+    n_range = range(env.n_min, min(env.K, env.n_max + 1))
     points = _sweep_info(env, policy, n_range)
     iv = np.array([p["info_mean"] for p in points])
     nv = np.array([p["n_buoys"] for p in points])
@@ -347,7 +356,7 @@ def compute_pareto(env, policy, args):
         elbow = int(np.argmax(dist))
     if elbow <= 1: elbow = len(nv)//3
     elif elbow >= len(nv)-2: elbow = 2*len(nv)//3
-    n_star = int(nv[elbow])
+    n_star = int(np.clip(nv[elbow], env.n_min, env.n_max))
     # Pareto mask
     pmask = np.zeros(len(points), dtype=bool)
     for i in range(len(points)):
@@ -374,40 +383,60 @@ def compute_pareto(env, policy, args):
 
 
 # =========================================================================
-#  METHODE 2 -- EFFICIENCY eta(N) = info(N) / (1+log(N))
+#  METHODE 2 -- EFFICIENCY : gain net d'information
 # =========================================================================
 
 def compute_efficiency(env, policy, args):
+    """
+    Gain net : eta(N) = info(N) - info(n_min) - beta*(N - n_min).
+    beta = 70% de la pente moyenne info → pic vers 60-70% de [n_min, n_max].
+    N* = n_min + argmax(eta).
+    """
     print("\n-- Methode EFFICIENCY --")
     out_dir = Path(args.output_dir); out_dir.mkdir(parents=True, exist_ok=True)
-    n_range = range(max(2, env.n_min-5), min(env.K, env.n_max+10))
+    n_range = range(env.n_min, min(env.K, env.n_max + 1))
     points = _sweep_info(env, policy, n_range)
     iv = np.array([p["info_mean"] for p in points])
     nv = np.array([p["n_buoys"] for p in points])
     ist = np.array([p["info_std"] for p in points])
-    eta = iv / (1.0 + np.log(nv.astype(float)))
-    best = int(np.argmax(eta)); n_star = int(nv[best])
+
+    # Gain net : info relative a n_min, penalisee par cout lineaire
+    info_base = iv[0]
+    avg_slope = (iv[-1] - iv[0]) / (nv[-1] - nv[0] + 1e-9)
+    beta = avg_slope * 0.9  # pénalité = 90% de la pente moyenne
+    eta = (iv - info_base) - beta * (nv - nv[0])
+    best = int(np.argmax(eta))
+    n_star = int(nv[best])
+    eta_per_buoy = iv / nv.astype(float)
+
     # Figure 1x3
     fig, axes = plt.subplots(1, 3, figsize=(18, 5))
-    fig.suptitle("EFFICIENCY -- eta = info / (1+log N)", fontsize=14, fontweight="bold")
-    axes[0].fill_between(nv, iv-ist, iv+ist, alpha=0.2, color="steelblue")
-    axes[0].plot(nv, iv, "o-", color="steelblue", ms=4)
-    axes[0].axvline(n_star, color="red", lw=1.5, ls="--", label=f"N*={n_star}")
-    axes[0].set_xlabel("N"); axes[0].set_ylabel("Info"); axes[0].legend(fontsize=8); axes[0].grid(True, alpha=0.3)
-    axes[1].plot(nv, eta, "s-", color="#e67e22", ms=5, lw=2)
-    axes[1].scatter([n_star], [eta[best]], c="red", s=200, zorder=6, marker="*")
-    axes[1].axvline(n_star, color="red", lw=1.5, ls="--")
-    axes[1].set_xlabel("N"); axes[1].set_ylabel("eta"); axes[1].set_title("Efficacite"); axes[1].grid(True, alpha=0.3)
-    axes[2].plot(nv, iv, "o-", color="steelblue", ms=3, label="Info")
-    ax2 = axes[2].twinx()
-    ax2.plot(nv, 1+np.log(nv.astype(float)), "^-", color="#e74c3c", ms=3, label="1+log(N)")
-    axes[2].set_xlabel("N"); axes[2].set_ylabel("Info", color="steelblue")
-    ax2.set_ylabel("Cout log", color="#e74c3c")
-    l1,lb1 = axes[2].get_legend_handles_labels(); l2,lb2 = ax2.get_legend_handles_labels()
-    axes[2].legend(l1+l2, lb1+lb2, fontsize=8); axes[2].grid(True, alpha=0.3)
+    fig.suptitle("EFFICIENCY -- Gain net d'information", fontsize=14, fontweight="bold")
+    ax = axes[0]
+    ax.fill_between(nv, iv-ist, iv+ist, alpha=0.2, color="steelblue")
+    ax.plot(nv, iv, "o-", color="steelblue", ms=4, label="Info(N)")
+    cost_line = info_base + beta * (nv - nv[0])
+    ax.plot(nv, cost_line, "--", color="#e74c3c", lw=1.5, alpha=0.7, label=f"Cout (beta={beta:.4f})")
+    ax.axvline(n_star, color="red", lw=1.5, ls="--", label=f"N*={n_star}")
+    ax.set_xlabel("N"); ax.set_ylabel("Info"); ax.set_title("Info vs Cout")
+    ax.legend(fontsize=8); ax.grid(True, alpha=0.3)
+    ax = axes[1]
+    ax.plot(nv, eta, "s-", color="#e67e22", ms=5, lw=2, label="Gain net")
+    ax.axvline(n_star, color="red", lw=1.5, ls="--")
+    ax.axhline(0, color="gray", lw=0.8, ls=":")
+    ax.scatter([n_star], [eta[best]], c="red", s=200, zorder=6, marker="*", label=f"N*={n_star}")
+    ax.fill_between(nv, 0, eta, where=eta>0, alpha=0.15, color="#2ecc71")
+    ax.fill_between(nv, 0, eta, where=eta<0, alpha=0.15, color="#e74c3c")
+    ax.set_xlabel("N"); ax.set_ylabel("Gain net"); ax.set_title("eta = gain - cout")
+    ax.legend(fontsize=8); ax.grid(True, alpha=0.3)
+    ax = axes[2]
+    ax.plot(nv, eta_per_buoy*1000, "^-", color="#9b59b6", ms=4, lw=1.5, label="Info/N (x1000)")
+    ax.axvline(n_star, color="red", lw=1.5, ls="--")
+    ax.set_xlabel("N"); ax.set_ylabel("Info/N (x1000)"); ax.set_title("Rendement par capteur")
+    ax.legend(fontsize=8); ax.grid(True, alpha=0.3)
     fig.tight_layout()
     fig.savefig(out_dir/"rl_efficiency.png", dpi=150, bbox_inches="tight"); plt.close()
-    print(f"  N* = {n_star} | eta* = {eta[best]:.4f}")
+    print(f"  N* = {n_star} | eta* = {eta[best]:.4f} | info = {iv[best]:.3f}")
     return points, n_star
 
 

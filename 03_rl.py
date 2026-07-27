@@ -1,17 +1,20 @@
 """
-===========================================================================
-  BRIQUE 3 -- Reinforcement Learning : Optimisation du Reseau
-  
-  3 methodes de selection du N* optimal :
-    pareto      : front de Pareto info vs N (sweep + Kneedle)
-    efficiency  : eta(N) = info(N) / (1+log(N)), score unique
-    scalarized  : PPO avec cout marginal integre, sweep sur lambda
-  
-  Usage :
-    python 03_rl.py --train --evaluate --rl_method pareto
-    python 03_rl.py --train --evaluate --rl_method efficiency
-    python 03_rl.py --train --evaluate --rl_method scalarized
-===========================================================================
+╔══════════════════════════════════════════════════════════════════════════════╗
+║         BRIQUE 3 — Reinforcement Learning : Optimisation du Réseau          ║
+║                                                                              ║
+║  Formalisation MDP :                                                         ║
+║    État    s_t : masque binaire actuel (grille grossière) + stats champ     ║
+║    Action  a_t : activer / désactiver une des K positions candidates        ║
+║    Récompense  : gain de reconstruction RMSE − pénalité budget bouées      ║
+║                                                                              ║
+║  Algorithme : PPO (Proximal Policy Optimization) implémenté en PyTorch pur  ║
+║  Multi-objectif : front de Pareto information vs nombre de capteurs         ║
+║                                                                              ║
+║  Usage :                                                                     ║
+║    python 03_rl.py --train                                                   ║
+║    python 03_rl.py --pareto           (front Pareto info/nb capteurs)       ║
+║    python 03_rl.py --train --pareto                                          ║
+╚══════════════════════════════════════════════════════════════════════════════╝
 """
 
 import sys, argparse
@@ -22,141 +25,264 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
 from scipy.spatial import KDTree
 
 sys.path.insert(0, str(Path(__file__).parent))
 from config import *
-try:
-    from dataset import SyntheticOceanGenerator
-except ModuleNotFoundError:
-    from data.dataset import SyntheticOceanGenerator
+from data.loader import load_ocean, add_data_args
 
+# ─── Import optionnel de la Brique 1 pour la récompense dense ─────────────────
 try:
-    from importlib.util import spec_from_file_location, module_from_spec
-    _spec = spec_from_file_location("autoencoder", Path(__file__).parent / "01_autoencoder.py")
-    _ae_mod = module_from_spec(_spec)
-    _spec.loader.exec_module(_ae_mod)
-    ObservabilityAE = _ae_mod.ObservabilityAE
+    from brique1_autoencoder import ObservabilityVAE
     AE_AVAILABLE = True
-except Exception:
+except ImportError:
     AE_AVAILABLE = False
 
 
-# =========================================================================
+# ══════════════════════════════════════════════════════════════════════════════
 #  ENVIRONNEMENT MDP
-# =========================================================================
+# ══════════════════════════════════════════════════════════════════════════════
 
 class OceanNetworkEnv:
     """
-    Grille candidate GX*GY. Action = toggle d'une position.
-    Supporte deux modes de recompense :
-      - standard  : delta_info - budget_penalty
-      - scalarized: delta_info - lambda * cout marginal
-    """
-    def __init__(self, T, S, grid_x=16, grid_y=24,
-                 n_min=10, n_max=40, episode_len=20,
-                 w_info=1.0, w_budget=0.5, marginal_cost=0.0):
-        self.T = T.astype(np.float32)
-        self.S = S.astype(np.float32)
-        self.grid_x, self.grid_y = grid_x, grid_y
-        self.K = grid_x * grid_y
-        self.n_min, self.n_max = n_min, n_max
-        self.ep_len = episode_len
-        self.w_info, self.w_budget = w_info, w_budget
-        self.marginal_cost = marginal_cost
-        self.nt = len(T)
+    Environnement RL pour l'optimisation du réseau d'observation.
 
-        sx, sy = NX / grid_x, NY / grid_y
-        self.candidate_positions = [
-            (min(int(gx*sx + sx/2), NX-1), min(int(gy*sy + sy/2), NY-1))
-            for gx in range(grid_x) for gy in range(grid_y)
-        ]
+    Grille candidate (coarse grid) :
+        On discrétise l'espace en une grille GX × GY de positions candidates.
+        L'espace d'action est donc de taille K = GX × GY (toggle par position).
+        Le budget de bouées actives est contraint : [n_min, n_max].
+
+    État s_t : (K + n_stats,) float32
+        - K premiers éléments : masque binaire des positions actives
+        - n_stats derniers : statistiques globales du champ nature run
+          (variance locale agrégée, gradient moyen...)
+
+    Récompense r_t :
+        r_t = w_info * r_info − w_budget * r_budget
+
+        r_info    = amélioration de la couverture pondérée variance
+                    (proxy : couverture variance locale)
+        r_budget  = pénalité si hors de la plage [n_min, n_max] bouées actives
+
+    Épisode :
+        T_ep actions consécutives → à la fin, évaluation de la configuration finale
+    """
+
+    def __init__(self, T, S=None,
+                 grid_x=16, grid_y=24,    # résolution de la grille candidate
+                 n_min=10, n_max=40,       # plage de bouées actives
+                 episode_len=20,           # actions par épisode
+                 w_info=1.0, w_budget=0.5,
+                 ae_model=None,            # autoencoder optionnel (Brique 1)
+                 sea_mask=None,            # masque océanique (nx, ny)
+                 dx_km=None):              # résolution, pour un Pareto en km
+        # `T` accepte deux formes :
+        #   - (nt, nx, ny)        : champ unique, mode legacy
+        #   - (nt, n_ch, nx, ny)  : tenseur multi-canaux GLORYS
+        if T.ndim == 4:
+            self.fields = T.astype(np.float32)
+        else:
+            arrs = [T] if S is None else [T, S]
+            self.fields = np.stack(arrs, axis=1).astype(np.float32)
+        self.n_ch = self.fields.shape[1]
+        self.sea_mask = (np.ones(self.fields.shape[2:], dtype=bool)
+                         if sea_mask is None else np.asarray(sea_mask, bool))
+        self.dx_km = dx_km
+        # Rétro-compatibilité : les figures accèdent encore à env.T / env.S
+        self.T = self.fields[:, 0]
+        self.S = self.fields[:, min(1, self.n_ch - 1)]
+        self.grid_x  = grid_x
+        self.grid_y  = grid_y
+        self.K       = grid_x * grid_y    # nb de positions candidates
+        self.n_min   = n_min
+        self.n_max   = n_max
+        self.ep_len  = episode_len
+        self.w_info, self.w_budget = w_info, w_budget
+        self.ae_model = ae_model
+        self.nt = len(self.fields)
+
+        # Positions physiques des K candidats (centre de chaque cellule)
+        self.candidate_positions = []
+        sx = NX / grid_x
+        sy = NY / grid_y
+        for gx in range(grid_x):
+            for gy in range(grid_y):
+                px = min(int(gx * sx + sx / 2), NX - 1)
+                py = min(int(gy * sy + sy / 2), NY - 1)
+                # Un candidat sur la terre serait une bouée impossible à
+                # déployer. Sans terre dans la fenêtre, ce filtre est neutre.
+                if self.sea_mask[px, py]:
+                    self.candidate_positions.append((px, py))
+        # K n'est plus grid_x*grid_y dès qu'un candidat est écarté : il
+        # dimensionne l'espace d'action du PPO et doit rester cohérent.
+        self.K = len(self.candidate_positions)
+        if self.K < n_max:
+            raise ValueError(f"{self.K} candidats en mer < n_max={n_max}.")
+
+        # Statistiques globales du nature run (pré-calculées une fois)
         self._precompute_field_stats()
-        self.active_mask = None
-        self.step_count = 0
+
+        # État courant
+        self.active_mask = None    # (K,) binaire
+        self.step_count  = 0
+        self.t_current   = 0
         self.obs_dim = self.K + len(self.field_stats)
 
     def _precompute_field_stats(self):
+        """
+        Variance locale et gradient moyen par cellule candidate.
+        Ces statistiques encodent la "difficulté" de chaque zone à reconstruire.
+        """
+        # Normalisation PAR CANAL avant tout calcul de variance.
+        # Sans elle, la variance en °C (O(0.1)) écrase totalement celle des
+        # courants en m/s (O(0.001)) : le RL n'optimiserait que pour la
+        # température, et les canaux uo/vo n'auraient aucun poids.
+        mu = self.fields.mean(axis=(0, 2, 3), keepdims=True)
+        sd = self.fields.std(axis=(0, 2, 3), keepdims=True) + 1e-9
+        Fn = (self.fields - mu) / sd
+
         stats = []
         for (px, py) in self.candidate_positions:
+            # Fenêtre locale 5×5 autour de la position
             x0, x1 = max(0, px-2), min(NX, px+3)
             y0, y1 = max(0, py-2), min(NY, py+3)
-            stats.append(0.6*float(self.T[:, x0:x1, y0:y1].var())
-                         + 0.4*float(self.S[:, x0:x1, y0:y1].var()))
+            win_sea = self.sea_mask[x0:x1, y0:y1]
+            sub_f = Fn[:, :, x0:x1, y0:y1]
+            if win_sea.all():
+                v = sub_f.var(axis=(0, 2, 3))
+            else:
+                # Exclure la terre : sa valeur constante ferait chuter la
+                # variance et sous-estimerait l'intérêt des zones côtières.
+                v = sub_f[:, :, win_sea].var(axis=(0, 2))
+            stats.append(float(v.mean()))
+
         stats = np.array(stats, dtype=np.float32)
-        s_min, s_max = stats.min(), stats.max()
-        self.field_stats = (stats - s_min) / (s_max - s_min + 1e-9)
+        # Normalisation
+        stats = (stats - stats.mean()) / (stats.std() + 1e-9)
+        self.field_stats = stats      # (K,) — variance locale normalisée par candidat
 
     def reset(self):
+        """Initialise un épisode : placement aléatoire de n_init bouées."""
         n_init = np.random.randint(self.n_min, self.n_max + 1)
         self.active_mask = np.zeros(self.K, dtype=np.float32)
-        self.active_mask[np.random.choice(self.K, n_init, replace=False)] = 1.0
+        init_idx = np.random.choice(self.K, n_init, replace=False)
+        self.active_mask[init_idx] = 1.0
         self.step_count = 0
+        self.t_current  = np.random.randint(0, self.nt)
         return self._get_obs()
 
     def _get_obs(self):
+        """Vecteur d'état : masque actif ∥ statistiques du champ."""
         return np.concatenate([self.active_mask, self.field_stats])
 
     def _compute_info_reward(self):
+        """
+        Récompense d'information : couverture pondérée par la variance locale.
+
+        Interprétation : on valorise les bouées placées dans des régions
+        à forte variabilité (où l'observation apporte le plus d'information).
+
+        Si l'autoencoder est chargé, on utilise le RMSE de reconstruction
+        directement (récompense plus précise mais plus coûteuse).
+        """
         active_idx = np.where(self.active_mask > 0.5)[0]
         if len(active_idx) == 0:
             return 0.0
 
-        # Couverture avec saturation (Michaelis-Menten) :
-        # alpha calibré sur n_max → demi-saturation quand ~n_max capteurs actifs.
-        # Donne une concavité forte dans [n_min, n_max].
-        sum_var = float(self.field_stats[active_idx].sum())
-        alpha = float(self.n_max) * float(self.field_stats.mean())
-        coverage = sum_var / (sum_var + alpha + 1e-9)
+        # Proxy variance-weighted coverage
+        coverage_score = float(self.field_stats[active_idx].mean())
 
-        # Bonus espacement : pénalise le clustering
+        # Bonus anti-clustering : pénalise les bouées trop proches
         if len(active_idx) > 1:
-            pos = np.array([self.candidate_positions[i] for i in active_idx], dtype=np.float32)
-            nn_d, _ = KDTree(pos).query(pos, k=2)
-            spread = float(nn_d[:, 1].mean() / np.sqrt(NX**2 + NY**2))
+            positions_active = np.array([self.candidate_positions[i]
+                                         for i in active_idx], dtype=np.float32)
+            tree = KDTree(positions_active)
+            nn_dists, _ = tree.query(positions_active, k=2)
+            mean_nn_dist = nn_dists[:, 1].mean()
+            # Normalisation par la diagonale du domaine
+            max_dist = np.sqrt(NX**2 + NY**2)
+            spread_bonus = float(mean_nn_dist / max_dist)
+            self.last_mean_nn_km = (float(mean_nn_dist * self.dx_km)
+                                    if self.dx_km else None)
         else:
-            spread = 0.0
+            spread_bonus = 0.0
 
-        return 0.7 * coverage + 0.3 * spread
+        return 0.7 * coverage_score + 0.3 * spread_bonus
 
     def step(self, action):
-        assert 0 <= action < self.K
+        """
+        Action : toggle de la position candidate `action` (0..K-1).
+        
+        Retourne : (obs, reward, done, info)
+        """
+        assert 0 <= action < self.K, f"Action invalide : {action}"
         prev_info = self._compute_info_reward()
+        prev_n_active = int(self.active_mask.sum())
+
+        # Toggle
         was_active = self.active_mask[action] > 0.5
         self.active_mask[action] = 0.0 if was_active else 1.0
         n_active = int(self.active_mask.sum())
+
+        # Information après action
         new_info = self._compute_info_reward()
         delta_info = new_info - prev_info
 
-        if self.marginal_cost > 0:
-            cost = self.marginal_cost if not was_active else -self.marginal_cost * 0.5
-            reward = self.w_info * delta_info - cost
-        else:
-            penalty = 0.0
-            if n_active < self.n_min:
-                penalty = float(self.n_min - n_active) / self.n_min
-            elif n_active > self.n_max:
-                penalty = float(n_active - self.n_max) / self.n_max
-            reward = self.w_info * delta_info - self.w_budget * penalty
+        # Pénalité budget (hors de la plage autorisée)
+        budget_penalty = 0.0
+        if n_active < self.n_min:
+            budget_penalty = float(self.n_min - n_active) / self.n_min
+        elif n_active > self.n_max:
+            budget_penalty = float(n_active - self.n_max) / self.n_max
+
+        reward = (self.w_info   * delta_info
+                  - self.w_budget * budget_penalty)
 
         self.step_count += 1
-        done = self.step_count >= self.ep_len
-        return self._get_obs(), float(reward), done, {
-            "n_active": n_active, "total_info": new_info, "delta_info": delta_info}
+        done = (self.step_count >= self.ep_len)
+
+        info = {
+            "n_active":       n_active,
+            "delta_info":     delta_info,
+            "budget_penalty": budget_penalty,
+            "total_info":     new_info,
+        }
+        return self._get_obs(), float(reward), done, info
 
 
-# =========================================================================
-#  POLITIQUE PPO
-# =========================================================================
+# ══════════════════════════════════════════════════════════════════════════════
+#  POLITIQUE PPO — Actor-Critic
+# ══════════════════════════════════════════════════════════════════════════════
 
 class ActorCritic(nn.Module):
+    """
+    Réseau actor-critic partagé pour PPO.
+
+    Architecture :
+        Tronc commun MLP (obs_dim → 256 → 256)
+        ├── Actor  → logits (K actions) → distribution catégorielle
+        └── Critic → valeur d'état V(s) (scalaire)
+
+    L'entrée mélange deux types d'information :
+        - masque binaire actif (sparse) : traité via embedding
+        - statistiques continues du champ
+    On les concatène et on passe dans le MLP commun.
+    """
     def __init__(self, obs_dim, n_actions, hidden=256):
         super().__init__()
         self.trunk = nn.Sequential(
-            nn.Linear(obs_dim, hidden), nn.LayerNorm(hidden), nn.GELU(),
-            nn.Linear(hidden, hidden), nn.LayerNorm(hidden), nn.GELU())
-        self.actor = nn.Linear(hidden, n_actions)
+            nn.Linear(obs_dim, hidden),
+            nn.LayerNorm(hidden),
+            nn.GELU(),
+            nn.Linear(hidden, hidden),
+            nn.LayerNorm(hidden),
+            nn.GELU(),
+        )
+        self.actor  = nn.Linear(hidden, n_actions)
         self.critic = nn.Linear(hidden, 1)
+
+        # Initialisation orthogonale (recommandée pour PPO)
         for m in self.modules():
             if isinstance(m, nn.Linear):
                 nn.init.orthogonal_(m.weight, gain=np.sqrt(2))
@@ -174,547 +300,903 @@ class ActorCritic(nn.Module):
         return action, dist.log_prob(action), dist.entropy(), value
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+#  ROLLOUT BUFFER
+# ══════════════════════════════════════════════════════════════════════════════
+
 class RolloutBuffer:
-    def __init__(self, sz, obs_dim):
-        self.obs = np.zeros((sz, obs_dim), np.float32)
-        self.actions = np.zeros(sz, np.int64)
-        self.rewards = np.zeros(sz, np.float32)
-        self.dones = np.zeros(sz, np.float32)
-        self.log_probs = np.zeros(sz, np.float32)
-        self.values = np.zeros(sz, np.float32)
-        self.ptr = 0; self.size = sz
+    """
+    Stocke les transitions (obs, action, reward, done, log_prob, value)
+    pour un mini-batch PPO.
+    """
+    def __init__(self, buffer_size, obs_dim):
+        self.obs       = np.zeros((buffer_size, obs_dim), dtype=np.float32)
+        self.actions   = np.zeros(buffer_size, dtype=np.int64)
+        self.rewards   = np.zeros(buffer_size, dtype=np.float32)
+        self.dones     = np.zeros(buffer_size, dtype=np.float32)
+        self.log_probs = np.zeros(buffer_size, dtype=np.float32)
+        self.values    = np.zeros(buffer_size, dtype=np.float32)
+        self.ptr       = 0
+        self.size      = buffer_size
 
-    def add(self, obs, a, r, d, lp, v):
-        i = self.ptr
-        self.obs[i]=obs; self.actions[i]=a; self.rewards[i]=r
-        self.dones[i]=float(d); self.log_probs[i]=lp; self.values[i]=v
-        self.ptr = (self.ptr+1) % self.size
+    def add(self, obs, action, reward, done, log_prob, value):
+        self.obs[self.ptr]       = obs
+        self.actions[self.ptr]   = action
+        self.rewards[self.ptr]   = reward
+        self.dones[self.ptr]     = float(done)
+        self.log_probs[self.ptr] = log_prob
+        self.values[self.ptr]    = value
+        self.ptr = (self.ptr + 1) % self.size
 
-    def compute_returns(self, last_v, gamma=0.99, lam=0.95):
-        adv = np.zeros(self.size, np.float32); gae = 0.0
+    def compute_returns(self, last_value, gamma=0.99, lam=0.95):
+        """GAE-λ : advantage estimé par Generalized Advantage Estimation."""
+        advantages = np.zeros(self.size, dtype=np.float32)
+        gae = 0.0
         for t in reversed(range(self.size)):
-            nv = last_v if t==self.size-1 else self.values[t+1]
-            nd = 0.0 if t==self.size-1 else self.dones[t+1]
-            delta = self.rewards[t] + gamma*nv*(1-nd) - self.values[t]
-            gae = delta + gamma*lam*(1-nd)*gae; adv[t] = gae
-        return adv, adv + self.values
+            if t == self.size - 1:
+                next_val = last_value
+                next_done = 0.0
+            else:
+                next_val  = self.values[t + 1]
+                next_done = self.dones[t + 1]
+            delta = (self.rewards[t]
+                     + gamma * next_val * (1 - next_done)
+                     - self.values[t])
+            gae = delta + gamma * lam * (1 - next_done) * gae
+            advantages[t] = gae
+        returns = advantages + self.values
+        return advantages, returns
 
-    def get_tensors(self, adv, ret, dev):
-        return {"obs": torch.tensor(self.obs, device=dev),
-                "actions": torch.tensor(self.actions, device=dev),
-                "log_probs": torch.tensor(self.log_probs, device=dev),
-                "advantages": torch.tensor(adv, device=dev),
-                "returns": torch.tensor(ret, device=dev)}
+    def get_tensors(self, advantages, returns, device):
+        return {
+            "obs":       torch.tensor(self.obs,       device=device),
+            "actions":   torch.tensor(self.actions,   device=device),
+            "log_probs": torch.tensor(self.log_probs, device=device),
+            "advantages":torch.tensor(advantages,     device=device),
+            "returns":   torch.tensor(returns,        device=device),
+        }
 
 
-# =========================================================================
-#  ENTRAINEMENT PPO (commun)
-# =========================================================================
+# ══════════════════════════════════════════════════════════════════════════════
+#  ENTRAÎNEMENT PPO
+# ══════════════════════════════════════════════════════════════════════════════
 
-def train_ppo(args, env, label=""):
-    prefix = f" [{label}]" if label else ""
-    print(f"  PPO{prefix} : {args.rl_steps} steps")
+def train_ppo(args, env):
+    """
+    Boucle d'entraînement PPO complète.
 
-    policy = ActorCritic(env.obs_dim, env.K).to(DEVICE)
-    optim = torch.optim.Adam(policy.parameters(), lr=args.lr, eps=1e-5)
-    buf = RolloutBuffer(args.buffer_size, env.obs_dim)
-    clip_eps, vf_c, ent_c, n_ep, mb = 0.2, 0.5, 0.01, 4, 64
-    out_dir = Path(args.output_dir); out_dir.mkdir(parents=True, exist_ok=True)
-    hist = {"episode_reward": [], "n_active": [], "info_score": []}
-    ep_rews = deque(maxlen=20); best_rew = -np.inf
-    obs = env.reset(); ep_r = 0.0
+    Hyperparamètres clés :
+        clip_eps     : clipping du ratio de politique (0.2 standard)
+        entropy_coef : encourage l'exploration (0.01)
+        vf_coef      : pondération de la value loss (0.5)
+        n_epochs_ppo : passes sur chaque mini-batch (4)
+    """
+    print("═" * 60)
+    print(" Brique 3 — PPO : Optimisation du Réseau d'Observation")
+    print("═" * 60)
+
+    obs_dim   = env.obs_dim
+    n_actions = env.K
+    policy    = ActorCritic(obs_dim, n_actions).to(DEVICE)
+    optimizer = torch.optim.Adam(policy.parameters(), lr=args.lr, eps=1e-5)
+
+    n_params = sum(p.numel() for p in policy.parameters())
+    print(f"\n  Politique PPO — {n_params:,} paramètres")
+    print(f"  Espace d'état  : {obs_dim} dim")
+    print(f"  Espace d'action: {n_actions} positions candidates")
+
+    buffer     = RolloutBuffer(args.buffer_size, obs_dim)
+    clip_eps   = 0.2
+    vf_coef    = 0.5
+    ent_coef   = 0.01
+    n_ppo_ep   = 4
+    mini_batch = 64
+
+    out_dir = Path(args.output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    history = {"episode_reward": [], "n_active": [], "info_score": []}
+    ep_rewards = deque(maxlen=20)
+    best_reward = -np.inf
+
+    obs = env.reset()
+    ep_reward = 0.0
+    global_step = 0
+
+    print(f"\n  Entraînement : {args.rl_steps} steps | buffer={args.buffer_size}")
+    print("─" * 60)
 
     for step in range(args.rl_steps):
         obs_t = torch.tensor(obs, dtype=torch.float32, device=DEVICE).unsqueeze(0)
+
         with torch.no_grad():
-            act, lp, _, val = policy.get_action(obs_t)
-        nobs, rew, done, info = env.step(act.item())
-        buf.add(obs, act.item(), rew, done, lp.item(), val.item())
-        ep_r += rew; obs = nobs
+            action, log_prob, entropy, value = policy.get_action(obs_t)
+        a = action.item()
+        lp = log_prob.item()
+        v  = value.item()
+
+        next_obs, reward, done, info = env.step(a)
+        buffer.add(obs, a, reward, done, lp, v)
+        ep_reward += reward
+        global_step += 1
+        obs = next_obs
+
         if done:
-            ep_rews.append(ep_r)
-            hist["episode_reward"].append(ep_r)
-            hist["n_active"].append(info["n_active"])
-            hist["info_score"].append(info["total_info"])
-            if ep_r > best_rew:
-                best_rew = ep_r
+            ep_rewards.append(ep_reward)
+            history["episode_reward"].append(ep_reward)
+            history["n_active"].append(info["n_active"])
+            history["info_score"].append(info["total_info"])
+            
+
+            if ep_reward > best_reward:
+                best_reward = ep_reward
                 torch.save({"policy_state": policy.state_dict(),
                             "args": vars(args),
                             "active_mask": env.active_mask.copy()},
                            out_dir / "rl_best.pt")
-            obs = env.reset(); ep_r = 0.0
-        if (step+1) % args.buffer_size == 0:
+
+            obs = env.reset()
+            ep_reward = 0.0
+
+        # ── Mise à jour PPO tous les buffer_size steps ───────────────────────
+        if (step + 1) % args.buffer_size == 0:
             with torch.no_grad():
                 obs_t = torch.tensor(obs, dtype=torch.float32, device=DEVICE).unsqueeze(0)
-                _, _, _, lv = policy.get_action(obs_t)
-            adv, ret = buf.compute_returns(lv.item())
-            adv = (adv-adv.mean())/(adv.std()+1e-8)
-            batch = buf.get_tensors(adv, ret, DEVICE)
+                _, _, _, last_value = policy.get_action(obs_t)
+                last_v = last_value.item()
+
+            advantages, returns = buffer.compute_returns(last_v)
+            # Normalisation des avantages
+            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+            batch = buffer.get_tensors(advantages, returns, DEVICE)
+
+            # PPO updates
             idx = np.arange(args.buffer_size)
-            for _ in range(n_ep):
+            for _ in range(n_ppo_ep):
                 np.random.shuffle(idx)
-                for s in range(0, args.buffer_size, mb):
-                    m = idx[s:s+mb]
-                    lo, va = policy(batch["obs"][m])
-                    dist = torch.distributions.Categorical(logits=lo)
-                    lp_ = dist.log_prob(batch["actions"][m])
-                    ent = dist.entropy().mean()
-                    ratio = torch.exp(lp_ - batch["log_probs"][m])
-                    a = batch["advantages"][m]
-                    loss = (-torch.min(ratio*a, torch.clamp(ratio,1-clip_eps,1+clip_eps)*a).mean()
-                            + vf_c*F.mse_loss(va, batch["returns"][m]) - ent_c*ent)
-                    optim.zero_grad(); loss.backward()
-                    nn.utils.clip_grad_norm_(policy.parameters(), 0.5); optim.step()
-            if len(ep_rews) > 0 and (step+1)%(args.buffer_size*10)==0:
-                print(f"    Step {step+1:6d} | R={np.mean(ep_rews):+.3f} | Best={best_rew:+.3f}")
-    print(f"  Best reward: {best_rew:.4f}")
+                for start in range(0, args.buffer_size, mini_batch):
+                    end  = start + mini_batch
+                    mb   = idx[start:end]
+                    obs_mb = batch["obs"][mb]
+                    act_mb = batch["actions"][mb]
+                    lp_old = batch["log_probs"][mb]
+                    adv_mb = batch["advantages"][mb]
+                    ret_mb = batch["returns"][mb]
 
-    # Courbes
-    sfx = f"_{label}" if label else ""
+                    logits, values = policy(obs_mb)
+                    dist    = torch.distributions.Categorical(logits=logits)
+                    lp_new  = dist.log_prob(act_mb)
+                    entropy = dist.entropy().mean()
+
+                    ratio = torch.exp(lp_new - lp_old)
+                    surr1 = ratio * adv_mb
+                    surr2 = torch.clamp(ratio, 1 - clip_eps, 1 + clip_eps) * adv_mb
+                    actor_loss  = -torch.min(surr1, surr2).mean()
+                    critic_loss = F.mse_loss(values, ret_mb)
+                    loss = actor_loss + vf_coef * critic_loss - ent_coef * entropy
+
+                    optimizer.zero_grad()
+                    loss.backward()
+                    nn.utils.clip_grad_norm_(policy.parameters(), 0.5)
+                    optimizer.step()
+
+            if len(ep_rewards) > 0 and (step + 1) % (args.buffer_size * 5) == 0:
+                print(f"  Step {step+1:6d} | "
+                      f"Mean reward (20 ep) = {np.mean(ep_rewards):+.3f} | "
+                      f"Best = {best_reward:+.3f}")
+
+    print(f"\n  ✓ Meilleure récompense : {best_reward:.4f}")
+    print(f"  ✓ Checkpoint → {out_dir}/rl_best.pt")
+
+    # ── Courbes d'apprentissage ────────────────────────────────────────────────
     fig, axes = plt.subplots(2, 2, figsize=(14, 8))
-    fig.suptitle(f"PPO{prefix}", fontsize=14, fontweight="bold")
-    axes[0,0].plot(hist["episode_reward"], alpha=0.4, color="steelblue")
-    w = max(1, len(hist["episode_reward"])//20)
-    if len(hist["episode_reward"]) >= w:
-        sm = np.convolve(hist["episode_reward"], np.ones(w)/w, mode="valid")
-        axes[0,0].plot(range(w-1, len(hist["episode_reward"])), sm, color="navy", lw=2)
-    axes[0,0].set_title("Reward/ep"); axes[0,0].grid(True, alpha=0.3)
-    axes[0,1].plot(hist["n_active"], color="orange", alpha=0.6)
-    axes[0,1].axhline(env.n_min, color="red", ls="--"); axes[0,1].axhline(env.n_max, color="red", ls=":")
-    axes[0,1].set_title("N actifs"); axes[0,1].grid(True, alpha=0.3)
-    axes[1,0].plot(hist["info_score"], color="green", alpha=0.6)
-    axes[1,0].set_title("Info score"); axes[1,0].grid(True, alpha=0.3)
-    axes[1,1].plot(np.cumsum(hist["episode_reward"]), color="#9b59b6", alpha=0.8)
-    axes[1,1].set_title("Reward cumulee"); axes[1,1].grid(True, alpha=0.3)
+    fig.suptitle("Brique 3 — PPO : Courbes d'entraînement", fontsize=14, fontweight="bold")
+
+    axes[0, 0].plot(history["episode_reward"], alpha=0.4, color="steelblue")
+    # Moyenne glissante
+    w = max(1, len(history["episode_reward"]) // 20)
+    smooth = np.convolve(history["episode_reward"],
+                         np.ones(w)/w, mode="valid")
+    axes[0, 0].plot(range(w-1, len(history["episode_reward"])), smooth, color="navy", lw=2)
+    axes[0, 0].set_title("Récompense par épisode"); axes[0, 0].set_xlabel("Épisode")
+    axes[0, 0].grid(True, alpha=0.3)
+
+    axes[0, 1].plot(history["n_active"], color="orange", alpha=0.6)
+    axes[0, 1].axhline(env.n_min, color="red", linestyle="--", label=f"n_min={env.n_min}")
+    axes[0, 1].axhline(env.n_max, color="red", linestyle=":",  label=f"n_max={env.n_max}")
+    axes[0, 1].set_title("Nombre de capteurs actifs en fin d'épisode")
+    axes[0, 1].legend(); axes[0, 1].grid(True, alpha=0.3)
+
+    axes[1, 0].plot(history["info_score"], color="green", alpha=0.6)
+    axes[1, 0].set_title("Score d'information (couverture pondérée variance)")
+    axes[1, 0].grid(True, alpha=0.3)
+
+    axes[1, 1].plot(history["info_score"], color="#74c476", alpha=0.8)
+    axes[1, 1].set_title("Score d information (couverture pondérée variance)")
+    axes[1, 1].grid(True, alpha=0.3)
+
     fig.tight_layout()
-    fig.savefig(out_dir / f"rl_training_curves{sfx}.png", dpi=150); plt.close()
-    return policy, hist
+    fig.savefig(out_dir / "rl_training_curves.png", dpi=150)
+    plt.close()
+    print(f"  ✓ Courbes → {out_dir}/rl_training_curves.png")
+
+    return policy
 
 
-# =========================================================================
-#  HELPERS
-# =========================================================================
+# ══════════════════════════════════════════════════════════════════════════════
+#  FRONT DE PARETO — Optimisation sous contrainte budgétaire
+# ══════════════════════════════════════════════════════════════════════════════
 
-def _sweep_info(env, policy, n_range, n_trials=20):
-    policy.eval(); points = []
-    for nt_ in n_range:
-        scores = []
-        for trial in range(n_trials):
-            env.active_mask[:] = 0.0
-            env.active_mask[np.random.choice(env.K, min(nt_, env.K), replace=False)] = 1.0
-            if trial < n_trials//2:
-                obs = env._get_obs()
-                with torch.no_grad():
-                    for _ in range(env.ep_len):
-                        ot = torch.tensor(obs, dtype=torch.float32, device=DEVICE).unsqueeze(0)
-                        a, _, _, _ = policy.get_action(ot, deterministic=False)
-                        obs, _, d, _ = env.step(a.item())
-                        if d: break
-            scores.append(env._compute_info_reward())
-        points.append({"n_buoys": nt_, "info_mean": float(np.mean(scores)),
-                        "info_std": float(np.std(scores))})
-    return points
+def compute_pareto_front(env, policy, args):
+    """
+    Courbe rendement décroissant : score d'information vs nombre de capteurs.
 
-def _run_policy_config(env, policy, n_target):
-    env.active_mask[:] = 0.0
-    env.active_mask[np.random.choice(env.K, min(n_target, env.K), replace=False)] = 1.0
-    obs = env._get_obs(); policy.eval()
-    with torch.no_grad():
-        for _ in range(env.ep_len):
-            ot = torch.tensor(obs, dtype=torch.float32, device=DEVICE).unsqueeze(0)
-            a, _, _, _ = policy.get_action(ot, deterministic=True)
-            obs, _, d, _ = env.step(a.item())
-            if d: break
-    return np.where(env.active_mask > 0.5)[0], float(env._compute_info_reward())
+    Pour chaque N dans [n_min-5, n_max+10] on tire 30 configurations aléatoires
+    et on mesure le score d'information moyen. La courbe montre le point de
+    rendement décroissant : au-delà d'un certain N, ajouter un capteur
+    n'améliore plus significativement la couverture.
 
-def _n_light(n_star):
-    nl = max(2, int(n_star)//2)
-    if nl >= int(n_star): nl = max(2, int(n_star) - max(3, int(n_star)//3))
-    return nl
+    Les points "non-dominés" (info élevée pour N bas) sont mis en évidence.
+    """
+    print("\n── Courbe Information vs Nombre de capteurs ──────────────────────")
+    out_dir = Path(args.output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
 
+    # Le balayage doit rester DANS le budget sous lequel la politique a été
+    # entraînée. L'ancienne plage [n_min-5, n_max+10] explorait des
+    # configurations que le MDP pénalise explicitement (budget_penalty), et
+    # le point de coude pouvait donc tomber sous n_min — recommandation
+    # inapplicable et incohérente avec l'énoncé du problème.
+    n_range = range(env.n_min, min(env.K, env.n_max) + 1)
+    pareto_points = []
 
-# =========================================================================
-#  METHODE 1 -- PARETO (Kneedle)
-# =========================================================================
+    print("  Sweep sur le nombre de bouées actives...")
+    for n_target in n_range:
+        info_scores = []
+        for _ in range(30):
+            mask = np.zeros(env.K, dtype=np.float32)
+            idx  = np.random.choice(env.K, n_target, replace=False)
+            mask[idx] = 1.0
+            env.active_mask = mask.copy()
+            info_scores.append(env._compute_info_reward())
+        pareto_points.append({
+            "n_buoys":   n_target,
+            "info_mean": float(np.mean(info_scores)),
+            "info_std":  float(np.std(info_scores)),
+        })
 
-def compute_pareto(env, policy, args):
-    print("\n-- Methode PARETO --")
-    out_dir = Path(args.output_dir); out_dir.mkdir(parents=True, exist_ok=True)
-    n_range = range(env.n_min, min(env.K, env.n_max + 1))
-    points = _sweep_info(env, policy, n_range)
-    iv = np.array([p["info_mean"] for p in points])
-    nv = np.array([p["n_buoys"] for p in points])
-    ist = np.array([p["info_std"] for p in points])
-    # Kneedle
-    x0,y0 = float(nv[0]),float(iv[0]); x1,y1 = float(nv[-1]),float(iv[-1])
-    nn_ = (nv-x0)/(x1-x0+1e-9); ii_ = (iv-y0)/(y1-y0+1e-9)
-    dist = np.abs(ii_-nn_)/np.sqrt(2)
-    conc = ii_ >= nn_-0.05
-    if conc.any():
-        cands = np.where(conc)[0]; elbow = cands[int(np.argmax(dist[cands]))]
-    else:
-        elbow = int(np.argmax(dist))
-    if elbow <= 1: elbow = len(nv)//3
-    elif elbow >= len(nv)-2: elbow = 2*len(nv)//3
-    n_star = int(np.clip(nv[elbow], env.n_min, env.n_max))
-    # Pareto mask
-    pmask = np.zeros(len(points), dtype=bool)
-    for i in range(len(points)):
-        pmask[i] = not any((iv[j]>=iv[i] and nv[j]<=nv[i]) and (iv[j]>iv[i] or nv[j]<nv[i])
-                           for j in range(len(points)) if j!=i)
-    # Figure
+    # ── Points non-dominés : info élevée ET N bas ────────────────────────────
+    info_vals = np.array([p["info_mean"] for p in pareto_points])
+    n_vals    = np.array([p["n_buoys"]   for p in pareto_points])
+
+    pareto_mask = np.zeros(len(pareto_points), dtype=bool)
+    for i in range(len(pareto_points)):
+        dominated = False
+        for j in range(len(pareto_points)):
+            if j == i: continue
+            # j domine i si : plus d'info avec moins (ou égal) de capteurs
+            if info_vals[j] >= info_vals[i] and n_vals[j] <= n_vals[i]:
+                if info_vals[j] > info_vals[i] or n_vals[j] < n_vals[i]:
+                    dominated = True; break
+        pareto_mask[i] = not dominated
+
+    # ── Figure ────────────────────────────────────────────────────────────────
     fig, axes = plt.subplots(1, 2, figsize=(14, 6))
-    fig.suptitle("PARETO -- Info vs N", fontsize=14, fontweight="bold")
-    axes[0].fill_between(nv, iv-ist, iv+ist, alpha=0.2, color="steelblue")
-    axes[0].plot(nv, iv, "o-", color="steelblue", ms=4, label="Info")
-    axes[0].scatter(nv[pmask], iv[pmask], c=nv[pmask], cmap="plasma", s=120, zorder=5,
-                    edgecolors="black", lw=0.8, label="Pareto")
-    axes[0].axvline(n_star, color="red", lw=1.5, ls="--", label=f"N*={n_star}")
-    axes[0].legend(fontsize=8); axes[0].grid(True, alpha=0.3)
-    axes[0].set_xlabel("N"); axes[0].set_ylabel("Info")
-    mg = np.gradient(iv, nv)
-    axes[1].bar(nv, mg, color=["#2ecc71" if g>0 else "#e74c3c" for g in mg], alpha=0.8)
-    axes[1].axhline(0, color="black", lw=0.8)
-    axes[1].set_xlabel("N"); axes[1].set_ylabel("Gain marginal"); axes[1].grid(True, alpha=0.3)
-    fig.tight_layout()
-    fig.savefig(out_dir/"rl_pareto_front.png", dpi=150, bbox_inches="tight"); plt.close()
-    print(f"  N* = {n_star} (Kneedle)")
-    return points, n_star
+    fig.suptitle("Brique 3 — Information vs Nombre de capteurs",
+                 fontsize=14, fontweight="bold")
 
-
-# =========================================================================
-#  METHODE 2 -- EFFICIENCY : gain net d'information
-# =========================================================================
-
-def compute_efficiency(env, policy, args):
-    """
-    Gain net : eta(N) = info(N) - info(n_min) - beta*(N - n_min).
-    beta = 70% de la pente moyenne info → pic vers 60-70% de [n_min, n_max].
-    N* = n_min + argmax(eta).
-    """
-    print("\n-- Methode EFFICIENCY --")
-    out_dir = Path(args.output_dir); out_dir.mkdir(parents=True, exist_ok=True)
-    n_range = range(env.n_min, min(env.K, env.n_max + 1))
-    points = _sweep_info(env, policy, n_range)
-    iv = np.array([p["info_mean"] for p in points])
-    nv = np.array([p["n_buoys"] for p in points])
-    ist = np.array([p["info_std"] for p in points])
-
-    # Gain net : info relative a n_min, penalisee par cout lineaire
-    info_base = iv[0]
-    avg_slope = (iv[-1] - iv[0]) / (nv[-1] - nv[0] + 1e-9)
-    beta = avg_slope * 0.9  # pénalité = 90% de la pente moyenne
-    eta = (iv - info_base) - beta * (nv - nv[0])
-    best = int(np.argmax(eta))
-    n_star = int(nv[best])
-    eta_per_buoy = iv / nv.astype(float)
-
-    # Figure 1x3
-    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
-    fig.suptitle("EFFICIENCY -- Gain net d'information", fontsize=14, fontweight="bold")
+    # Panneau gauche : scatter info vs N avec enveloppe ±σ
     ax = axes[0]
-    ax.fill_between(nv, iv-ist, iv+ist, alpha=0.2, color="steelblue")
-    ax.plot(nv, iv, "o-", color="steelblue", ms=4, label="Info(N)")
-    cost_line = info_base + beta * (nv - nv[0])
-    ax.plot(nv, cost_line, "--", color="#e74c3c", lw=1.5, alpha=0.7, label=f"Cout (beta={beta:.4f})")
-    ax.axvline(n_star, color="red", lw=1.5, ls="--", label=f"N*={n_star}")
-    ax.set_xlabel("N"); ax.set_ylabel("Info"); ax.set_title("Info vs Cout")
+    info_stds = np.array([p["info_std"] for p in pareto_points])
+    ax.fill_between(n_vals, info_vals - info_stds, info_vals + info_stds,
+                    alpha=0.2, color="steelblue", label="±1σ (variabilité configs)")
+    ax.plot(n_vals, info_vals, "o-", color="steelblue", alpha=0.7,
+            markersize=4, label="Info score moyen")
+
+    # Points Pareto en évidence
+    pf_n    = n_vals[pareto_mask]
+    pf_info = info_vals[pareto_mask]
+    sc = ax.scatter(pf_n, pf_info, c=pf_n, cmap="plasma",
+                    s=120, zorder=5, edgecolors="black", linewidths=0.8,
+                    label="Configurations Pareto-optimales")
+    plt.colorbar(sc, ax=ax, label="Nombre de bouées")
+
+    # Annotation rendement décroissant : point du coude
+    grad = np.gradient(info_vals, n_vals)
+    elbow_idx = int(np.argmax(np.abs(np.gradient(grad, n_vals))))
+    ax.axvline(n_vals[elbow_idx], color="red", lw=1.5, linestyle="--", alpha=0.7,
+               label=f"Coude (N={n_vals[elbow_idx]})")
+    ax.annotate(f"N★={n_vals[elbow_idx]}", (n_vals[elbow_idx], info_vals[elbow_idx]),
+                textcoords="offset points", xytext=(8, -15),
+                fontsize=10, color="red", fontweight="bold")
+
+    ax.set_xlabel("Nombre de capteurs actifs")
+    ax.set_ylabel("Score d'information (couverture pondérée variance)")
+    ax.set_title("Rendement décroissant\n(rouge = point de coude optimal)")
     ax.legend(fontsize=8); ax.grid(True, alpha=0.3)
-    ax = axes[1]
-    ax.plot(nv, eta, "s-", color="#e67e22", ms=5, lw=2, label="Gain net")
-    ax.axvline(n_star, color="red", lw=1.5, ls="--")
-    ax.axhline(0, color="gray", lw=0.8, ls=":")
-    ax.scatter([n_star], [eta[best]], c="red", s=200, zorder=6, marker="*", label=f"N*={n_star}")
-    ax.fill_between(nv, 0, eta, where=eta>0, alpha=0.15, color="#2ecc71")
-    ax.fill_between(nv, 0, eta, where=eta<0, alpha=0.15, color="#e74c3c")
-    ax.set_xlabel("N"); ax.set_ylabel("Gain net"); ax.set_title("eta = gain - cout")
-    ax.legend(fontsize=8); ax.grid(True, alpha=0.3)
-    ax = axes[2]
-    ax.plot(nv, eta_per_buoy*1000, "^-", color="#9b59b6", ms=4, lw=1.5, label="Info/N (x1000)")
-    ax.axvline(n_star, color="red", lw=1.5, ls="--")
-    ax.set_xlabel("N"); ax.set_ylabel("Info/N (x1000)"); ax.set_title("Rendement par capteur")
-    ax.legend(fontsize=8); ax.grid(True, alpha=0.3)
+
+    # Panneau droit : gain marginal (dérivée)
+    ax2 = axes[1]
+    marginal_gain = np.gradient(info_vals, n_vals)
+    colors_mg = ["#2ecc71" if g > 0 else "#e74c3c" for g in marginal_gain]
+    ax2.bar(n_vals, marginal_gain, color=colors_mg, alpha=0.8, edgecolor="gray", lw=0.3)
+    ax2.axhline(0, color="black", lw=0.8)
+    ax2.axhline(marginal_gain.max() * 0.05, color="orange", lw=1.5,
+                linestyle="--", alpha=0.8, label="Seuil 5% du gain max")
+
+    # Régions Pareto en vert
+    for i, p in enumerate(pareto_points):
+        if pareto_mask[i]:
+            ax2.axvspan(p["n_buoys"] - 0.5, p["n_buoys"] + 0.5,
+                        alpha=0.12, color="green")
+
+    ax2.set_xlabel("Nombre de capteurs actifs")
+    ax2.set_ylabel("Gain marginal d'information (ΔInfo / ΔN)")
+    ax2.set_title("Gain marginal par capteur ajouté\n(vert = zones Pareto-optimales)")
+    ax2.legend(fontsize=8); ax2.grid(True, alpha=0.3)
+
     fig.tight_layout()
-    fig.savefig(out_dir/"rl_efficiency.png", dpi=150, bbox_inches="tight"); plt.close()
-    print(f"  N* = {n_star} | eta* = {eta[best]:.4f} | info = {iv[best]:.3f}")
-    return points, n_star
+    fig.savefig(out_dir / "rl_pareto_front.png", dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f"  Figure → {out_dir}/rl_pareto_front.png")
+
+    print(f"\n── Recommandations ────────────────────────────────────────────────")
+    print(f"  Point de coude : N★ = {n_vals[elbow_idx]} capteurs "
+          f"(info={info_vals[elbow_idx]:.3f})")
+    print(f"  {pareto_mask.sum()} configurations Pareto-optimales :")
+    for i, p in enumerate(pareto_points):
+        if pareto_mask[i]:
+            print(f"    n={p['n_buoys']:2d} | info={p['info_mean']:.3f} ±{p['info_std']:.3f}")
+
+    return pareto_points, pareto_mask, n_vals[elbow_idx]
 
 
-# =========================================================================
-#  METHODE 3 -- SCALARIZED (sweep lambda)
-# =========================================================================
+# ══════════════════════════════════════════════════════════════════════════════
+#  DEUX CONFIGURATIONS RÉSEAU : DENSE (optimal) + LÉGÈRE (~50%)
+# ══════════════════════════════════════════════════════════════════════════════
 
-def compute_scalarized(env_T, env_S, policy_std, args):
-    print("\n-- Methode SCALARIZED (sweep lambda) --")
+def mark_retained_config_on_pareto(n_retained, info_retained, out_dir):
+    """
+    Ajoute une étoile ★ sur le graphe rl_pareto_front.png pour montrer
+    la configuration effectivement retenue (depuis le best checkpoint).
+    Produit rl_pareto_front_pipeline.png pour ne pas écraser l'original.
+    """
+    import matplotlib.pyplot as plt
+    import matplotlib.image as mpimg
+
+    out_dir = Path(out_dir)
+    src = out_dir / "rl_pareto_front.png"
+    if not src.exists():
+        return
+
+    img = mpimg.imread(str(src))
+    fig, ax = plt.subplots(figsize=(14, 6), dpi=150)
+    ax.imshow(img)
+    ax.axis("off")
+
+    # Annoter en overlay — position textuelle en bas de l'image
+    fig.text(0.5, 0.01,
+             f"★ Config retenue (best checkpoint) : N={n_retained}  |  "
+             f"info={info_retained:.3f}",
+             ha="center", color="#ffd93d", fontsize=10, fontweight="bold",
+             bbox=dict(boxstyle="round,pad=0.3", facecolor="#0a1628",
+                       edgecolor="#ffd93d", alpha=0.9))
+
+    out = out_dir / "rl_pareto_front_pipeline.png"
+    fig.savefig(out, dpi=150, bbox_inches="tight", facecolor="#0a1628")
+    plt.close()
+    print(f"  Pareto annoté → {out}")
+
+
+def visualize_two_configs(env, pareto_points, n_star, policy, args,
+                          best_mask=None):
+    """
+    Compare deux configurations réseau :
+
+    Config Dense  : best_mask du checkpoint (si fourni) ou simulation depuis N★
+                    → c'est la configuration RETENUE transmise à GNN et AE
+    Config Légère : N ≈ N★ // 2, simulée par la politique
+
+    best_mask : np.ndarray (K,) float32 — active_mask du meilleur épisode RL.
+                Quand fourni (mode pipeline), le panneau Dense montre exactement
+                la configuration qui sera évaluée par GNN et AE.
+    """
     out_dir = Path(args.output_dir); out_dir.mkdir(parents=True, exist_ok=True)
-    lambdas = [0.001, 0.005, 0.01, 0.02]
-    results = []; steps_lam = max(1000, args.rl_steps // 4)
-    for lam in lambdas:
-        print(f"\n  lambda = {lam} ({steps_lam} steps)...")
-        env_lam = OceanNetworkEnv(env_T, env_S, grid_x=args.grid_x, grid_y=args.grid_y,
-                                   n_min=2, n_max=args.n_max+20,
-                                   episode_len=args.episode_len, marginal_cost=lam)
-        args_lam = argparse.Namespace(**vars(args)); args_lam.rl_steps = steps_lam
-        pol_lam, _ = train_ppo(args_lam, env_lam, label=f"lam={lam}")
-        idx, info = _run_policy_config(env_lam, pol_lam, env_lam.n_max)
-        n_act = len(idx); eta = info / (1+np.log(max(2, n_act)))
-        results.append({"lambda": lam, "n_active": n_act, "info": info, "eta": eta,
-                         "policy": pol_lam, "active_idx": idx})
-        print(f"    -> N={n_act} | info={info:.3f} | eta={eta:.4f}")
-    best = max(results, key=lambda r: r["eta"]); n_star = best["n_active"]
-    torch.save({"policy_state": best["policy"].state_dict(), "args": vars(args),
-                "active_mask": np.zeros(0)}, out_dir/"rl_best.pt")
-    # Figure
-    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
-    fig.suptitle("SCALARIZED -- Sweep lambda", fontsize=14, fontweight="bold")
-    lams = [r["lambda"] for r in results]
-    ns = [r["n_active"] for r in results]
-    infos = [r["info"] for r in results]
-    etas = [r["eta"] for r in results]
-    axes[0].bar(range(len(lams)), ns, color=["#3498db","#2ecc71","#e67e22","#e74c3c"], alpha=0.8)
-    axes[0].set_xticks(range(len(lams))); axes[0].set_xticklabels([f"l={l}" for l in lams])
-    axes[0].set_ylabel("N capteurs"); axes[0].set_title("N par lambda"); axes[0].grid(True, alpha=0.3)
-    sc = axes[1].scatter(ns, infos, c=lams, cmap="RdYlGn_r", s=200, zorder=5, edgecolors="black", lw=1.2)
-    for r in results:
-        axes[1].annotate(f"l={r['lambda']}", (r["n_active"], r["info"]),
-                         textcoords="offset points", xytext=(8,5), fontsize=8)
-    axes[1].scatter([best["n_active"]], [best["info"]], marker="*", c="red", s=400, zorder=6)
-    plt.colorbar(sc, ax=axes[1], label="lambda")
-    axes[1].set_xlabel("N"); axes[1].set_ylabel("Info"); axes[1].set_title("Info vs N (*=best eta)"); axes[1].grid(True, alpha=0.3)
-    colors = ["#e74c3c" if r is best else "#3498db" for r in results]
-    axes[2].bar(range(len(lams)), etas, color=colors, alpha=0.8)
-    axes[2].set_xticks(range(len(lams))); axes[2].set_xticklabels([f"l={l}" for l in lams])
-    axes[2].set_ylabel("eta"); axes[2].set_title("eta = info/(1+log N)"); axes[2].grid(True, alpha=0.3)
-    fig.tight_layout()
-    fig.savefig(out_dir/"rl_scalarized.png", dpi=150, bbox_inches="tight"); plt.close()
-    points = [{"n_buoys": r["n_active"], "info_mean": r["info"], "info_std": 0.0} for r in results]
-    print(f"\n  Best: lam={best['lambda']} -> N*={n_star} | eta={best['eta']:.4f}")
-    return points, n_star
 
-
-# =========================================================================
-#  DISPATCH
-# =========================================================================
-
-def run_rl_method(env, policy, args):
-    method = getattr(args, "rl_method", "pareto")
-    if method == "efficiency":
-        return compute_efficiency(env, policy, args)
-    elif method == "scalarized":
-        return compute_scalarized(env.T, env.S, policy, args)
-    else:
-        return compute_pareto(env, policy, args)
-
-
-# =========================================================================
-#  VISUALISATIONS
-# =========================================================================
-
-def visualize_two_configs(env, n_star, policy, args, best_mask=None):
     from matplotlib.colors import LinearSegmentedColormap
-    out_dir = Path(args.output_dir); out_dir.mkdir(parents=True, exist_ok=True)
-    oc = LinearSegmentedColormap.from_list("oc",
+    ocean_cmap = LinearSegmentedColormap.from_list("oc",
         ["#08306b","#2171b5","#6baed6","#c6dbef","#fff5eb",
          "#fdd49e","#fc8d59","#d7301f","#7f0000"], N=256)
-    BG = "#0a1628"; nl = _n_light(n_star)
+    BG = "#0a1628"
+
+    n_light = max(env.n_min, int(n_star) // 2)
+
+    def _run_config_policy(n_target):
+        """Simule une configuration à n_target bouées avec la politique."""
+        env.active_mask[:] = 0.0
+        idx = np.random.choice(env.K, min(n_target, env.K), replace=False)
+        env.active_mask[idx] = 1.0
+        obs = env._get_obs()
+        policy.eval()
+        with torch.no_grad():
+            for _ in range(env.ep_len):
+                obs_t = torch.tensor(obs, dtype=torch.float32,
+                                     device=DEVICE).unsqueeze(0)
+                action, _, _, _ = policy.get_action(obs_t, deterministic=True)
+                obs, _, done, _ = env.step(action.item())
+                if done:
+                    break
+        active_idx = np.where(env.active_mask > 0.5)[0]
+        return active_idx, float(env._compute_info_reward())
+
+    # Config dense : best_mask si fourni, sinon simulation depuis N★
     if best_mask is not None:
         env.active_mask = best_mask.copy()
-        di = np.where(best_mask>0.5)[0]; dinf = float(env._compute_info_reward())
-        dl, dn = "Dense (retenue)", "-> GNN & AE"
+        dense_idx  = np.where(best_mask > 0.5)[0]
+        dense_info = float(env._compute_info_reward())
+        dense_label = "Dense  (config retenue)"
+        dense_note  = "★ configuration transmise au GNN & AE"
     else:
-        di, dinf = _run_policy_config(env, policy, int(n_star))
-        dl, dn = "Dense (N*)", f"N*={n_star}"
-    li, linf = _run_policy_config(env, policy, nl)
-    ap = np.array(env.candidate_positions); Tb = env.T[0]; vm,vM = float(env.T.min()),float(env.T.max())
-    method = getattr(args, "rl_method", "pareto").upper()
-    fig = plt.figure(figsize=(18,8), facecolor=BG)
-    fig.suptitle(f"RL [{method}] -- Dense vs Legere", color="white", fontsize=13, fontweight="bold", y=0.99)
-    for col,(idx,inf,lb,clr) in enumerate([(di,dinf,dl,"#6bcb77"),(li,linf,f"Legere (N~{nl})","#ffd93d")]):
-        inact = np.setdiff1d(range(env.K), idx)
-        ax = fig.add_axes([0.05+col*0.47, 0.10, 0.40, 0.80])
+        dense_idx, dense_info = _run_config_policy(int(n_star))
+        dense_label = "Dense  (N★ simulée)"
+        dense_note  = f"N★={n_star} (coude Pareto)"
+
+    light_idx, light_info = _run_config_policy(n_light)
+    light_label = f"Légère  (N★ ÷ 2 ≈ {n_light})"
+
+    # La politique peut librement activer/désactiver des positions pendant la
+    # simulation : rien ne garantit que la config partie de N★ finisse avec
+    # plus de bouées que celle partie de N★/2. Si l'ordre s'inverse, on
+    # échange pour que les étiquettes restent vraies.
+    if len(light_idx) > len(dense_idx):
+        print(f"  ⚠ la politique a inversé les tailles "
+              f"({len(dense_idx)} vs {len(light_idx)}) — étiquettes échangées")
+        dense_idx, light_idx = light_idx, dense_idx
+        dense_info, light_info = light_info, dense_info
+        dense_label, light_label = "Dense  (simulée)", "Légère  (simulée)"
+        dense_note = f"N★={n_star} (coude Pareto)"
+
+    T_bg    = env.T[0]
+    vTmin, vTmax = float(env.T.min()), float(env.T.max())
+    all_pos = np.array(env.candidate_positions)
+
+    fig = plt.figure(figsize=(18, 8), facecolor=BG)
+    title = ("Brique 3 RL — Config retenue (best checkpoint) vs Légère"
+             if best_mask is not None
+             else "Brique 3 RL — Dense (N★) vs Légère (N★÷2)")
+    fig.suptitle(title, color="white", fontsize=13, fontweight="bold", y=0.99)
+
+    for col, (active_idx, info_score, label, note, col_c) in enumerate([
+        (dense_idx,  dense_info,  dense_label, dense_note,  "#6bcb77"),
+        (light_idx,  light_info,  light_label, f"N={len(light_idx)} capteurs", "#ffd93d"),
+    ]):
+        env.active_mask[:] = 0.0
+        env.active_mask[active_idx] = 1.0
+        inactive_idx = np.where(env.active_mask <= 0.5)[0]
+
+        ax = fig.add_axes([0.05 + col*0.47, 0.10, 0.40, 0.80])
         ax.set_facecolor("#050d1a")
         for sp in ax.spines.values(): sp.set_edgecolor("#1a3a5c")
-        ax.imshow(Tb.T, cmap=oc, origin="lower", aspect="auto", vmin=vm, vmax=vM, alpha=0.5, extent=[0,NX,0,NY])
-        ax.scatter(ap[inact,0], ap[inact,1], c="#1a3a5c", s=14, alpha=0.35)
-        sc = ax.scatter(ap[idx,0], ap[idx,1], c=env.field_stats[idx], cmap="plasma",
-                        s=90, vmin=0, vmax=1, edgecolors="white", lw=0.8, zorder=6)
-        cb = plt.colorbar(sc, ax=ax, pad=0.02, fraction=0.04)
-        cb.set_label("Var", color="white", fontsize=7)
-        cb.ax.yaxis.set_tick_params(color="white", labelcolor="white", labelsize=6)
-        ax.set_title(f"{lb}\nN={len(idx)} | Info={inf:.3f}", color=clr, fontsize=11, fontweight="bold")
-        ax.set_xticks([]); ax.set_yticks([])
-    lp = max(0, (dinf-linf)/max(dinf,1e-3)*100)
-    fig.text(0.5, 0.02, f"Dense: N={len(di)} info={dinf:.3f} | Legere: N={len(li)} info={linf:.3f} | Perte: {lp:.1f}%",
-             ha="center", color="#8ab4d4", fontsize=9)
-    fig.savefig(out_dir/"rl_two_configs.png", dpi=150, facecolor=BG, bbox_inches="tight"); plt.close()
-    print(f"  Dense: N={len(di)} info={dinf:.3f}")
-    print(f"  Legere: N={len(li)} info={linf:.3f} (perte {lp:.1f}%)")
 
-def visualize_final_config(env, active_mask, args):
+        ax.imshow(T_bg.T, cmap=ocean_cmap, origin="lower", aspect="auto",
+                  vmin=vTmin, vmax=vTmax, alpha=0.5, extent=[0, NX, 0, NY])
+        ax.set_xlim(0, NX); ax.set_ylim(0, NY)
+        ax.scatter(all_pos[inactive_idx, 0], all_pos[inactive_idx, 1],
+                   c="#1a3a5c", s=14, alpha=0.35, zorder=2)
+        sc = ax.scatter(all_pos[active_idx, 0], all_pos[active_idx, 1],
+                        c=env.field_stats[active_idx], cmap="plasma",
+                        s=90, vmin=0, vmax=1,
+                        edgecolors="white", linewidths=0.8, zorder=6)
+        cb = plt.colorbar(sc, ax=ax, pad=0.02, fraction=0.04)
+        cb.set_label("Variance locale", color="white", fontsize=7)
+        cb.ax.yaxis.set_tick_params(color="white", labelcolor="white", labelsize=6)
+        ax.set_title(f"{label}\nN={len(active_idx)} bouées  |  Info={info_score:.3f}",
+                     color=col_c, fontsize=11, fontweight="bold", pad=6)
+        ax.text(0.02, 0.03, note, transform=ax.transAxes,
+                color=col_c, fontsize=8, alpha=0.85)
+        ax.set_xticks([]); ax.set_yticks([])
+
+    loss_info = (dense_info - light_info) / (dense_info + 1e-9) * 100
+    fig.text(0.5, 0.02,
+             f"{dense_label}: N={len(dense_idx)} | info={dense_info:.3f}     "
+             f"{light_label}: N={len(light_idx)} | info={light_info:.3f}     "
+             f"Perte info: {loss_info:.1f}%  pour {len(dense_idx)-len(light_idx)} capteurs en moins",
+             ha="center", color="#8ab4d4", fontsize=9)
+
+    out = out_dir / "rl_two_configs.png"
+    fig.savefig(out, dpi=150, facecolor=BG, bbox_inches="tight")
+    plt.close()
+    print(f"\n  ── Deux configurations ──────────────────────────────────────")
+    print(f"  Dense  : N={len(dense_idx)} bouées  info={dense_info:.3f}  [{dense_note}]")
+    print(f"  Légère : N={len(light_idx)} bouées  info={light_info:.3f}")
+    print(f"  Figure → {out}")
+
+
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  VISUALISATION CONFIGURATION FINALE
+# ══════════════════════════════════════════════════════════════════════════════
+
+def visualize_final_config(env, active_mask, args, title="Configuration optimale RL"):
+    """Visualise la configuration de réseau trouvée par l'agent RL."""
     out_dir = Path(args.output_dir)
-    ai = np.where(active_mask>0.5)[0]; ii = np.where(active_mask<=0.5)[0]
-    ap = np.array(env.candidate_positions)
-    method = getattr(args, "rl_method", "pareto").upper()
     fig, axes = plt.subplots(1, 2, figsize=(14, 6))
-    fig.suptitle(f"RL [{method}] -- Config optimale", fontsize=13, fontweight="bold")
-    axes[0].scatter(ap[ii,0], ap[ii,1], c="lightgray", s=30, alpha=0.4)
-    sc = axes[0].scatter(ap[ai,0], ap[ai,1], c=env.field_stats[ai], cmap="YlOrRd",
-                         s=120, edgecolors="black", lw=0.8, zorder=5)
-    plt.colorbar(sc, ax=axes[0], label="Var locale")
-    axes[0].set_xlim(0,NX); axes[0].set_ylim(0,NY)
-    axes[0].set_title(f"Reseau ({len(ai)} bouees)"); axes[0].grid(True, alpha=0.2)
-    axes[1].bar(range(len(ai)), np.sort(env.field_stats[ai])[::-1], color="steelblue")
-    axes[1].set_title("Variance (decroissant)"); axes[1].grid(True, alpha=0.3)
-    fig.tight_layout(); fig.savefig(out_dir/"rl_final_config.png", dpi=150); plt.close()
+    fig.suptitle(f"Brique 3 — {title}", fontsize=13, fontweight="bold")
+
+    active_idx = np.where(active_mask > 0.5)[0]
+    inactive_idx = np.where(active_mask <= 0.5)[0]
+    all_pos = np.array(env.candidate_positions)
+
+    ax = axes[0]
+    ax.scatter(all_pos[inactive_idx, 0], all_pos[inactive_idx, 1],
+               c="lightgray", s=30, alpha=0.4, label="Positions inactives")
+    sc = ax.scatter(all_pos[active_idx, 0], all_pos[active_idx, 1],
+                    c=env.field_stats[active_idx], cmap="YlOrRd",
+                    s=120, edgecolors="black", linewidths=0.8, zorder=5,
+                    label=f"Bouées actives ({len(active_idx)})")
+    plt.colorbar(sc, ax=ax, label="Variance locale (importance OED)")
+    ax.set_xlim(0, NX); ax.set_ylim(0, NY)
+    ax.set_title(f"Réseau optimal — {len(active_idx)}/{env.K} positions actives")
+    ax.legend()
+    ax.grid(True, alpha=0.2)
+    ax.set_xlabel("x (pixel)"); ax.set_ylabel("y (pixel)")
+
+    # Heatmap de la variance du champ
+    ax2 = axes[1]
+    variance_grid = env.field_stats.reshape(env.grid_x, env.grid_y)
+    im = ax2.imshow(variance_grid.T, cmap="YlOrRd", origin="lower", aspect="auto")
+    plt.colorbar(im, ax=ax2, label="Variance locale normalisée")
+    # Overlay des bouées
+    for ai in active_idx:
+        gx_idx = ai // env.grid_y
+        gy_idx = ai % env.grid_y
+        ax2.scatter(gx_idx, gy_idx, c="blue", s=60, marker="*", zorder=5)
+    ax2.set_title("Grille de variance + positionnement RL\n(étoile bleue = bouée active)")
+    ax2.set_xlabel(f"x (cellule grille {env.grid_x})")
+    ax2.set_ylabel(f"y (cellule grille {env.grid_y})")
+
+    fig.tight_layout()
+    fig.savefig(out_dir / "rl_optimal_network.png", dpi=150)
+    plt.close()
+    print(f"  ✓ Configuration finale → {out_dir}/rl_optimal_network.png")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  POINT D'ENTRÉE
+# ══════════════════════════════════════════════════════════════════════════════
+
+# =============================================================================
+#  GIF — Progression de l'agent RL
+# =============================================================================
 
 def save_rl_gif(env, policy, args, n_frames=80):
+    """
+    Genere un GIF animant la progression de l agent RL.
+
+    Chaque frame = 1 step de l agent dans l environnement.
+    On rejoue depuis un etat initial aleatoire et on laisse tourner
+    l agent avec la politique entrainees (mode deterministe).
+
+    Panneau gauche  : champ de variance locale (OED target) + bouees actives
+    Panneau central : graphe du reseau (positions + aretes kNN)
+    Panneau droit   : courbe de recompense cumulee en temps reel
+    """
+    import matplotlib; matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
     from matplotlib.animation import FuncAnimation, PillowWriter
     from matplotlib.colors import LinearSegmentedColormap
-    out_dir = Path(args.output_dir)
-    oc = LinearSegmentedColormap.from_list("oc",
+    from collections import deque
+    from scipy.spatial import KDTree as _KDTree
+
+    out_dir = Path(args.output_dir); out_dir.mkdir(parents=True, exist_ok=True)
+
+    ocean_cmap = LinearSegmentedColormap.from_list("oc",
         ["#08306b","#2171b5","#6baed6","#c6dbef","#fff5eb",
          "#fdd49e","#fc8d59","#d7301f","#7f0000"], N=256)
-    BG = "#0a1628"; Tb = env.T[0]; vm,vM = float(env.T.min()),float(env.T.max())
-    ca = np.array(env.candidate_positions, dtype=float)
-    method = getattr(args, "rl_method", "pareto").upper()
-    fig,(ax1,ax2,ax3) = plt.subplots(1,3,figsize=(18,5.5),facecolor=BG)
-    for ax in (ax1,ax2,ax3):
+    var_cmap = LinearSegmentedColormap.from_list("vc",
+        ["#050d1a","#1a3a5c","#2e75b6","#ffd93d","#ff6b6b"], N=256)
+
+    BG = "#0a1628"
+    cands = np.array(env.candidate_positions)
+
+    # Rejouer avec la politique
+    obs = env.reset()
+    all_states   = [env.active_mask.copy()]
+    all_rewards  = [0.0]
+    cum_rewards  = [0.0]
+    all_infos    = [{"n_active": int(env.active_mask.sum()),
+                     "total_info": env._compute_info_reward()}]
+
+    policy.eval()
+    with torch.no_grad():
+        for _ in range(n_frames - 1):
+            obs_t = torch.tensor(obs, dtype=torch.float32, device=DEVICE).unsqueeze(0)
+            action, _, _, _ = policy.get_action(obs_t, deterministic=False)
+            obs, reward, done, info = env.step(action.item())
+            all_states.append(env.active_mask.copy())
+            all_rewards.append(reward)
+            cum_rewards.append(cum_rewards[-1] + reward)
+            all_infos.append(info)
+            if done:
+                obs = env.reset()
+
+    # Variance de fond sur la grille candidate
+    var_grid = env.field_stats.reshape(env.grid_x, env.grid_y)
+
+    # Coordonnées pixel des positions candidates — doivent correspondre
+    # à l'extent de l'imshow SST (0→NX, 0→NY) pour que les points
+    # soient bien placés sur la carte.
+    cands_px_x = cands[:, 0].astype(float)   # ∈ [0, NX]
+    cands_px_y = cands[:, 1].astype(float)   # ∈ [0, NY]
+
+    # Construction du GIF
+    fig = plt.figure(figsize=(18, 7), facecolor=BG)
+    ax1 = fig.add_axes([0.03, 0.10, 0.28, 0.78])    # carte SST + variance + bouees
+    ax2 = fig.add_axes([0.36, 0.10, 0.28, 0.78])    # graphe reseau
+    ax3 = fig.add_axes([0.70, 0.10, 0.27, 0.78])    # courbe recompense
+
+    for ax in [ax1, ax2, ax3]:
         ax.set_facecolor("#050d1a")
         for sp in ax.spines.values(): sp.set_edgecolor("#1a3a5c")
-    ax1.imshow(Tb.T, cmap=oc, origin="lower", aspect="auto", vmin=vm, vmax=vM, alpha=0.5, extent=[0,NX,0,NY])
-    si = ax1.scatter([],[],c="#1a3a5c",s=14,alpha=0.4)
-    sa = ax1.scatter([],[],c="white",s=60,edgecolors="black",lw=0.5,zorder=5)
-    ax1.set_xlim(0,NX); ax1.set_ylim(0,NY); ax1.set_title("Actions",color="white",fontsize=9,fontweight="bold")
-    ax2.imshow(Tb.T, cmap=oc, origin="lower", aspect="auto", vmin=vm, vmax=vM, alpha=0.5, extent=[0,NX,0,NY])
-    si2 = ax2.scatter([],[],c="#1a3a5c",s=14,alpha=0.3)
-    sa2 = ax2.scatter([],[],c="white",s=70,edgecolors="white",lw=0.6,zorder=5)
-    ax2.set_xlim(0,NX); ax2.set_ylim(0,NY); ax2.set_title("Reseau",color="white",fontsize=9,fontweight="bold")
-    ax3.set_xlim(0,n_frames); ax3.set_ylim(0,0.5)
-    info_line, = ax3.plot([],[],color="#6bcb77",lw=2,label="Info score")
-    ax3_n = ax3.twinx()
-    ax3_n.set_ylim(0, env.n_max+5)
-    n_line, = ax3_n.plot([],[],color="#ffd93d",lw=1.5,alpha=0.7,label="N actifs")
-    ax3_n.tick_params(colors="#ffd93d",labelsize=6)
-    vl = ax3.axvline(0,color="white",lw=0.5,alpha=0.3)
-    ax3.set_title("Info & N actifs",color="white",fontsize=9,fontweight="bold")
-    ax3.tick_params(colors="#6bcb77",labelsize=6)
-    ax3.set_ylabel("Info", color="#6bcb77", fontsize=7)
-    ax3_n.set_ylabel("N", color="#ffd93d", fontsize=7)
-    txt = fig.text(0.5,0.97,"",ha="center",color="white",fontsize=10,fontweight="bold")
-    obs = env.reset(); rx,ry_info,ry_n=[],[],[]; el=[]
-    def update(f):
-        nonlocal obs,el
-        if f==0: obs=env.reset(); rx.clear(); ry_info.clear(); ry_n.clear()
-        ot = torch.tensor(obs,dtype=torch.float32,device=DEVICE).unsqueeze(0)
-        with torch.no_grad(): a,_,_,_ = policy.get_action(ot)
-        obs,r,d,info = env.step(a.item())
-        cur_info = env._compute_info_reward()
-        if d: obs=env.reset()
-        ai=np.where(env.active_mask>0.5)[0]; ii=np.where(env.active_mask<=0.5)[0]
-        n_active = len(ai)
-        si.set_offsets(ca[ii] if len(ii) else np.empty((0,2)))
-        sa.set_offsets(ca[ai] if n_active else np.empty((0,2)))
-        for ln in el: ln.remove()
-        el=[]
-        if n_active>1:
-            pa=ca[ai]; tree=KDTree(pa)
-            for i in range(len(pa)):
-                _,idxs=tree.query(pa[i],k=min(3,len(pa)))
+        ax.tick_params(colors="#8ab4d4", labelsize=7)
+
+    # Fond fixe ax1 : champ SST du nature run (coordonnées pixel NX×NY)
+    T_bg = env.T[0]
+    vTmin, vTmax = float(env.T.min()), float(env.T.max())
+    ax1.imshow(T_bg.T, cmap=ocean_cmap, origin="lower", aspect="auto",
+               vmin=vTmin, vmax=vTmax, extent=[0, NX, 0, NY])
+    ax1.set_xlim(0, NX); ax1.set_ylim(0, NY)
+    ax1.set_title("Variance locale (OED target)", color="white",
+                  fontsize=9, fontweight="bold", pad=5)
+    ax1.set_xticks([]); ax1.set_yticks([])
+
+    # Fond fixe ax2 : même étendue pixel pour cohérence
+    ax2.set_xlim(0, NX); ax2.set_ylim(0, NY)
+    ax2.imshow(T_bg.T, cmap=ocean_cmap, origin="lower", aspect="auto",
+               vmin=vTmin, vmax=vTmax, alpha=0.3, extent=[0, NX, 0, NY])
+    ax2.set_title("Graphe du reseau (kNN)", color="white",
+                  fontsize=9, fontweight="bold", pad=5)
+    ax2.set_xticks([]); ax2.set_yticks([])
+
+    # Courbe recompense
+    ax3.set_xlim(0, n_frames); ax3.set_ylim(min(cum_rewards)*1.1, max(cum_rewards)*1.1)
+    ax3.set_title("Recompense cumulee", color="white", fontsize=9, fontweight="bold", pad=5)
+    ax3.set_xlabel("Etape", color="#8ab4d4", fontsize=8)
+    ax3.grid(True, alpha=0.15, color="white")
+    reward_line, = ax3.plot([], [], color="#6bcb77", lw=2)
+    step_vline   = ax3.axvline(0, color="#ffd93d", lw=1, alpha=0.7)
+
+    # Elements dynamiques — les offsets utilisent les coordonnées pixel (0→NX, 0→NY)
+    sc_inactive = ax1.scatter([], [], c="#1a3a5c", s=20, alpha=0.3, zorder=2)
+    sc_active1  = ax1.scatter([], [], s=90, zorder=5, edgecolors="white",
+                               linewidths=0.7)
+    sc_inactive2 = ax2.scatter([], [], c="#1a3a5c", s=15, alpha=0.3, zorder=2)
+    sc_active2   = ax2.scatter([], [], s=70, zorder=5, edgecolors="white",
+                                linewidths=0.7)
+
+    edge_lines = []   # lignes d aretes (recreees a chaque frame)
+
+    txt_step = fig.text(0.5, 0.96, "", ha="center", color="white",
+                         fontsize=11, fontweight="bold")
+    txt_n    = ax1.text(0.02, 0.02, "", transform=ax1.transAxes,
+                         color="#ffd93d", fontsize=9, va="bottom", fontweight="bold")
+    txt_r    = ax3.text(0.98, 0.05, "", transform=ax3.transAxes,
+                         color="#6bcb77", fontsize=9, ha="right", fontweight="bold")
+
+    reward_x, reward_y = [], []
+
+    def update(frame):
+        nonlocal edge_lines
+        mask    = all_states[frame]
+        info    = all_infos[frame]
+        cum_r   = cum_rewards[frame]
+        n_active = int(mask.sum())
+
+        active_idx   = np.where(mask > 0.5)[0]
+        inactive_idx = np.where(mask <= 0.5)[0]
+
+        # ── Panneau 1 : carte SST + variance ───────────────────────────────
+        if len(inactive_idx) > 0:
+            sc_inactive.set_offsets(
+                np.c_[cands_px_x[inactive_idx], cands_px_y[inactive_idx]])
+        if len(active_idx) > 0:
+            colors = plt.cm.plasma(env.field_stats[active_idx])
+            sc_active1.set_offsets(
+                np.c_[cands_px_x[active_idx], cands_px_y[active_idx]])
+            sc_active1.set_color(colors)
+        else:
+            sc_active1.set_offsets(np.empty((0, 2)))
+
+        # ── Panneau 2 : graphe reseau ─────────────────────────────────────────
+        for ln in edge_lines: ln.remove()
+        edge_lines = []
+
+        if len(active_idx) > 1:
+            pos_active = cands[active_idx].astype(float)
+            tree_ = _KDTree(pos_active)
+            for i in range(len(pos_active)):
+                dists, idxs = tree_.query(pos_active[i], k=min(4, len(pos_active)))
                 for j in idxs[1:]:
-                    ln,=ax2.plot([pa[i,0],pa[j,0]],[pa[i,1],pa[j,1]],color="#2e75b6",alpha=0.5,lw=1.2)
-                    el.append(ln)
-        si2.set_offsets(ca[ii] if len(ii) else np.empty((0,2)))
-        if n_active: sa2.set_offsets(ca[ai]); sa2.set_color(plt.cm.YlOrRd(env.field_stats[ai]))
-        else: sa2.set_offsets(np.empty((0,2)))
-        rx.append(f); ry_info.append(cur_info); ry_n.append(n_active)
-        info_line.set_data(rx,ry_info); n_line.set_data(rx,ry_n)
-        vl.set_xdata([f,f])
-        # Auto-scale Y
-        if len(ry_info) > 1:
-            ax3.set_ylim(0, max(ry_info)*1.3+0.01)
-        txt.set_text(f"RL [{method}] | Step {f+1}/{n_frames} | N={n_active} | Info={cur_info:.3f}")
-        return (si,sa,si2,sa2,info_line,n_line,vl,txt)
-    anim = FuncAnimation(fig,update,frames=n_frames,interval=200,blit=False)
-    anim.save(str(out_dir/"rl_progression.gif"), writer=PillowWriter(fps=6), dpi=110,
-              savefig_kwargs={"facecolor":BG})
-    plt.close(); print(f"  GIF -> {out_dir}/rl_progression.gif")
+                    alpha_ = float(np.clip(1 - dists[list(idxs).index(j)] /
+                                           (0.5*np.sqrt(NX**2+NY**2)), 0.05, 0.8))
+                    ln_, = ax2.plot([pos_active[i,0], pos_active[j,0]],
+                                    [pos_active[i,1], pos_active[j,1]],
+                                    color="#2e75b6", alpha=alpha_, lw=1.2)
+                    edge_lines.append(ln_)
 
-def mark_retained_config_on_pareto(n_ret, info_ret, out_dir):
-    import matplotlib.image as mpimg
-    out_dir = Path(out_dir)
-    for src_name in ["rl_pareto_front.png","rl_efficiency.png","rl_scalarized.png"]:
-        src = out_dir/src_name
-        if src.exists():
-            img = mpimg.imread(str(src))
-            fig,ax = plt.subplots(figsize=(14,6),dpi=150)
-            ax.imshow(img); ax.axis("off")
-            fig.text(0.5,0.01,f"* Config retenue: N={n_ret} | info={info_ret:.3f}",
-                     ha="center",color="#ffd93d",fontsize=10,fontweight="bold",
-                     bbox=dict(boxstyle="round,pad=0.3",facecolor="#0a1628",edgecolor="#ffd93d",alpha=0.9))
-            fig.savefig(out_dir/f"{src.stem}_pipeline.png",dpi=150,bbox_inches="tight",facecolor="#0a1628")
-            plt.close(); break
+        if len(inactive_idx) > 0:
+            sc_inactive2.set_offsets(cands[inactive_idx])
+        if len(active_idx) > 0:
+            colors2 = plt.cm.YlOrRd(env.field_stats[active_idx])
+            sc_active2.set_offsets(cands[active_idx])
+            sc_active2.set_color(colors2)
+        else:
+            sc_active2.set_offsets(np.empty((0, 2)))
+
+        # ── Panneau 3 : courbe ────────────────────────────────────────────────
+        reward_x.append(frame); reward_y.append(cum_r)
+        reward_line.set_data(reward_x, reward_y)
+        step_vline.set_xdata([frame, frame])
+
+        # ── Textes ────────────────────────────────────────────────────────────
+        eps = max(0.05, 1.0 - frame / n_frames)
+        txt_step.set_text(
+            f"Brique 3 — RL  |  Etape {frame+1}/{n_frames}  "
+            f"|  epsilon={eps:.2f}  |  N actives={n_active}")
+        txt_step.set_color(plt.cm.cool(frame / n_frames))
+        txt_n.set_text(f"Bouees: {n_active} [{env.n_min}-{env.n_max}]")
+        txt_r.set_text(f"R_cum = {cum_r:+.3f}")
+
+        return (sc_inactive, sc_active1, sc_inactive2, sc_active2,
+                reward_line, step_vline, txt_step, txt_n, txt_r)
+
+    anim = FuncAnimation(fig, update, frames=n_frames, interval=200, blit=True)
+    gif_path = out_dir / "rl_progression.gif"
+    writer = PillowWriter(fps=6, metadata={"title": "OED-IA RL SNO"})
+    anim.save(str(gif_path), writer=writer, dpi=110,
+              savefig_kwargs={"facecolor": BG})
+    plt.close()
+    print(f"  GIF RL -> {gif_path}")
 
 
-# =========================================================================
-#  POINT D'ENTREE
-# =========================================================================
+# =============================================================================
+#  ARGUMENTS + MAIN
+# =============================================================================
 
 def parse_args():
-    p = argparse.ArgumentParser(description="Brique 3 -- RL pour OED")
-    p.add_argument("--train", action="store_true")
-    p.add_argument("--evaluate", action="store_true", help="Evalue avec la methode choisie")
-    p.add_argument("--gif", action="store_true")
-    p.add_argument("--rl_method", choices=["pareto","efficiency","scalarized"],
-                   default="pareto", help="Methode de selection N*")
-    p.add_argument("--seed_ocean", type=int, default=42)
-    p.add_argument("--seed_buoys", type=int, default=7)
-    p.add_argument("--checkpoint", type=str, default="outputs/rl_best.pt")
-    p.add_argument("--output_dir", type=str, default="outputs")
-    p.add_argument("--rl_steps", type=int, default=50000)
-    p.add_argument("--buffer_size", type=int, default=512)
-    p.add_argument("--lr", type=float, default=3e-4)
-    p.add_argument("--grid_x", type=int, default=16)
-    p.add_argument("--grid_y", type=int, default=24)
-    p.add_argument("--n_min", type=int, default=10)
-    p.add_argument("--n_max", type=int, default=40)
-    p.add_argument("--episode_len", type=int, default=20)
-    p.add_argument("--w_info", type=float, default=1.0)
-    p.add_argument("--w_budget", type=float, default=0.5)
-    p.add_argument("--gif_frames", type=int, default=80)
+    p = argparse.ArgumentParser(description="Brique 3 — RL pour OED")
+    p.add_argument("--train",        action="store_true", help="Lancer PPO")
+    p.add_argument("--pareto",       action="store_true", help="Front de Pareto")
+    p.add_argument("--gif",          action="store_true", help="Genere le GIF")
+    p.add_argument("--report",       action="store_true",
+                   help="Produit un rapport .txt avec les métriques clés")
+    p.add_argument("--seed_ocean",   type=int, default=42)
+    p.add_argument("--seed_buoys",   type=int, default=7)
+    p.add_argument("--checkpoint",   type=str, default="outputs/rl_best.pt")
+    p.add_argument("--output_dir",   type=str, default="outputs")
+    p.add_argument("--rl_steps",     type=int, default=50000)
+    p.add_argument("--buffer_size",  type=int, default=512)
+    p.add_argument("--lr",           type=float, default=3e-4)
+    p.add_argument("--grid_x",       type=int, default=16)
+    p.add_argument("--grid_y",       type=int, default=24)
+    p.add_argument("--n_min",        type=int, default=10)
+    p.add_argument("--n_max",        type=int, default=40)
+    p.add_argument("--episode_len",  type=int, default=20)
+    p.add_argument("--w_info",       type=float, default=1.0)
+    p.add_argument("--w_budget",     type=float, default=0.5)
+    p.add_argument("--gif_frames",   type=int, default=80)
+    add_data_args(p)
     return p.parse_args()
 
 
 if __name__ == "__main__":
+    from datetime import datetime
     args = parse_args()
-    if not args.train and not args.evaluate and not args.gif:
-        print("Usage: python 03_rl.py --train [--evaluate] [--gif] [--rl_method pareto|efficiency|scalarized]")
+
+    if not args.train and not args.pareto and not args.gif:
+        print("Usage: python 03_rl.py --train [--pareto] [--gif] [--report]")
         sys.exit(0)
-    set_global_seed(args.seed_ocean)
-    print(f"\n  Methode : {args.rl_method.upper()}")
-    gen = SyntheticOceanGenerator()
-    T, S = gen.generate_dataset(nt=NT, seed=args.seed_ocean)
-    env = OceanNetworkEnv(T, S, grid_x=args.grid_x, grid_y=args.grid_y,
-                          n_min=args.n_min, n_max=args.n_max,
-                          episode_len=args.episode_len, w_info=args.w_info, w_budget=args.w_budget)
-    print(f"  K={env.K} | Budget [{args.n_min}, {args.n_max}]")
-    policy = None
+
+    print("\n[1/2] Chargement du champ oceanique...")
+    fields, channels, sea_mask, data_info = load_ocean(args)
+    print(f"  {data_info['source']} | {fields.shape} | canaux={channels}")
+
+    print("[2/2] Initialisation de l environnement MDP...")
+    env = OceanNetworkEnv(
+        fields,
+        grid_x=args.grid_x, grid_y=args.grid_y,
+        n_min=args.n_min, n_max=args.n_max,
+        episode_len=args.episode_len,
+        w_info=args.w_info, w_budget=args.w_budget,
+        sea_mask=sea_mask, dx_km=data_info.get("dx_km"))
+    print(f"  K = {env.K} positions candidates en mer "
+          f"({args.grid_x}x{args.grid_y} = {args.grid_x*args.grid_y} theoriques)")
+    print(f"  Budget bouees : [{args.n_min}, {args.n_max}]")
+
+    policy = None; pareto_data = {}
     if args.train:
-        policy, _ = train_ppo(args, env)
-        ckpt = torch.load(Path(args.output_dir)/"rl_best.pt", map_location=DEVICE, weights_only=False)
+        policy = train_ppo(args, env)
+        ckpt = torch.load(Path(args.output_dir) / "rl_best.pt",
+                          map_location=DEVICE, weights_only=False)
         visualize_final_config(env, ckpt["active_mask"], args)
+        print("\n  Generation automatique du GIF post-entrainement...")
         save_rl_gif(env, policy, args, n_frames=args.gif_frames)
-    if args.evaluate:
+
+    if args.pareto:
         if policy is None:
             policy = ActorCritic(env.obs_dim, env.K).to(DEVICE)
-            cp = Path(args.output_dir)/"rl_best.pt"
-            if cp.exists():
-                policy.load_state_dict(torch.load(cp, map_location=DEVICE, weights_only=False)["policy_state"])
-        pts, n_star = run_rl_method(env, policy, args)
-        visualize_two_configs(env, n_star, policy, args)
-    if args.gif and policy is None:
-        policy = ActorCritic(env.obs_dim, env.K).to(DEVICE)
-        cp = Path(args.output_dir)/"rl_best.pt"
-        if cp.exists():
-            policy.load_state_dict(torch.load(cp, map_location=DEVICE, weights_only=False)["policy_state"])
+            ckpt_path = Path(args.output_dir) / "rl_best.pt"
+            if ckpt_path.exists():
+                ckpt = torch.load(ckpt_path, map_location=DEVICE, weights_only=False)
+                policy.load_state_dict(ckpt["policy_state"])
+        pareto_points, pareto_mask, n_star = compute_pareto_front(env, policy, args)
+        visualize_two_configs(env, pareto_points, n_star, policy, args)
+        info_vals = np.array([p["info_mean"] for p in pareto_points])
+        n_vals    = np.array([p["n_buoys"]   for p in pareto_points])
+        n_light   = max(env.n_min, n_star // 2)
+        pareto_data = {
+            "n_star": int(n_star),
+            "info_star": float(info_vals[np.argmin(np.abs(n_vals - n_star))]),
+            "info_max":  float(info_vals.max()),
+            "n_light":   int(n_light),
+            "info_light": float(info_vals[np.argmin(np.abs(n_vals - n_light))]),
+            "n_pareto_opt": int(pareto_mask.sum()),
+        }
+
+    if args.gif:
+        print("\n  Generation du GIF de progression RL...")
+        if policy is None:
+            policy = ActorCritic(env.obs_dim, env.K).to(DEVICE)
+            ckpt_path = Path(args.output_dir) / "rl_best.pt"
+            if ckpt_path.exists():
+                ckpt = torch.load(ckpt_path, map_location=DEVICE, weights_only=False)
+                policy.load_state_dict(ckpt["policy_state"])
+                print(f"  Politique chargee depuis {ckpt_path}")
         save_rl_gif(env, policy, args, n_frames=args.gif_frames)
+
+    if args.report:
+        ts  = datetime.now().strftime("%Y%m%d_%H%M%S")
+        out = Path(args.output_dir)
+        perte_pct = 0.0
+        if pareto_data:
+            i_s = pareto_data.get("info_star", 0)
+            i_l = pareto_data.get("info_light", 0)
+            perte_pct = (i_s - i_l) / (i_s + 1e-9) * 100
+        lines = [
+            "=" * 68,
+            "  Brique 3 — RL — Rapport",
+            f"  Généré le : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+            "=" * 68, "",
+            "── REPRODUCTIBILITÉ ─────────────────────────────────────────────────",
+            f"  seed_ocean    : {args.seed_ocean}",
+            f"  seed_buoys    : {args.seed_buoys}",
+            "",
+            "── PARAMÈTRES RL ────────────────────────────────────────────────────",
+            f"  rl_steps      : {args.rl_steps}",
+            f"  grid          : {args.grid_x}×{args.grid_y}  ({env.K} candidats)",
+            f"  n_min / n_max : {args.n_min} / {args.n_max}",
+            f"  w_info        : {args.w_info}",
+        ]
+        if pareto_data:
+            lines += [
+                "",
+                "── RÉSULTATS PARETO ─────────────────────────────────────────────────",
+                f"  N★ (coude)              : {pareto_data['n_star']} capteurs",
+                f"  Score info N★           : {pareto_data['info_star']:.3f}",
+                f"  Score info maximum      : {pareto_data['info_max']:.3f}",
+                f"  Config légère N         : {pareto_data['n_light']} capteurs",
+                f"  Score info légère       : {pareto_data['info_light']:.3f}",
+                f"  Perte info dense→légère : {perte_pct:.1f} %",
+                f"  Configs Pareto-optimales: {pareto_data['n_pareto_opt']}",
+            ]
+        lines += ["", "── FICHIERS PRODUITS ────────────────────────────────────────────────"]
+        for f in sorted(out.iterdir()):
+            if f.suffix in {".pt", ".png", ".gif"}:
+                lines.append(f"  {f.name:<44} {f.stat().st_size//1024:>5} KB")
+        lines += ["", "=" * 68]
+        rpt = out / f"rapport_rl_{ts}.txt"
+        rpt.write_text("\n".join(lines), encoding="utf-8")
+        print(f"\n  Rapport RL → {rpt}")
+
     print("\n  Brique 3 terminee.")

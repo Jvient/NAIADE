@@ -2,8 +2,20 @@
 ╔══════════════════════════════════════════════════════════════════════════════╗
 ║   OED-IA pour SNO Marins — Orchestrateur                                    ║
 ╠══════════════════════════════════════════════════════════════════════════════╣
-║  --mode individual : briques indépendantes (AE → GNN → RL)                 ║
-║  --mode pipeline   : RL → GNN → AE (réseau optimisé)                       ║
+║  Deux modes d'exécution :                                                   ║
+║                                                                             ║
+║  --mode individual   (défaut)                                               ║
+║    Chaque brique est lancée indépendamment sur le même nature run.          ║
+║    Utile pour comparer les sorties brique par brique.                       ║
+║    Ordre : AE → GNN → RL                                                    ║
+║                                                                             ║
+║  --mode pipeline                                                            ║
+║    1. RL propose un réseau optimal (N★ bouées)                              ║
+║    2. GNN évalue ce réseau (structure + redondance)                         ║
+║    3. AE évalue ce réseau (zones lacunaires + 3 bouées proposées)           ║
+║    → Les briques 2 et 3 travaillent sur le MÊME réseau RL.                 ║
+║                                                                             ║
+║  Dans les deux cas : rapport .txt + JSON de reproductibilité.               ║
 ║                                                                             ║
 ║  Usage :                                                                    ║
 ║    python run_demo.py --mode individual                                     ║
@@ -20,11 +32,10 @@ import torch
 from torch.utils.data import DataLoader
 
 sys.path.insert(0, str(Path(__file__).parent))
-from config import DEVICE, NX, NY, NT, N_BUOYS, set_global_seed, make_output_dir
-try:
-    from dataset import SyntheticOceanGenerator, build_datasets
-except ModuleNotFoundError:
-    from data.dataset import SyntheticOceanGenerator, build_datasets
+from config import (DEVICE, NX, NY, NT, N_BUOYS, N_CHANNELS,
+                    VAE_IN_CH, VAE_OUT_CH, OBSERVED_VARS, MIN_BUOY_DIST)
+from data.loader import load_ocean, add_data_args
+from data.dataset import build_datasets, BuoySampler
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -32,16 +43,18 @@ except ModuleNotFoundError:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def parse_args():
-    p = argparse.ArgumentParser(description="OED-IA Orchestrateur")
-    p.add_argument("--mode",        choices=["individual", "pipeline"], default="individual")
-    p.add_argument("--seed_ocean",  type=int, default=42)
-    p.add_argument("--seed_buoys",  type=int, default=7)
-    p.add_argument("--nt",          type=int, default=200)
-    p.add_argument("--n_buoys",     type=int, default=None)
-    p.add_argument("--eval_light",  action="store_true",
-                   help="Pipeline : évalue aussi la config légère (N★/2) avec GNN + AE")
-    p.add_argument("--rl_method",   choices=["pareto", "efficiency", "scalarized"],
-                   default="pareto", help="Méthode de sélection N★ pour le RL")
+    p = argparse.ArgumentParser(description="OED-IA Orchestrateur (individual|pipeline)")
+    p.add_argument("--mode",        choices=["individual", "pipeline"],
+                   default="individual",
+                   help="individual : briques indépendantes | pipeline : RL→GNN→AE")
+    p.add_argument("--seed_ocean",  type=int, default=42,
+                   help="Seed du nature run (reproductibilité)")
+    p.add_argument("--seed_buoys",  type=int, default=7,
+                   help="Seed du réseau initial de bouées")
+    p.add_argument("--nt",          type=int, default=200,
+                   help="Pas de temps du nature run")
+    p.add_argument("--n_buoys",     type=int, default=None,
+                   help="Nombre de bouées (défaut = config.N_BUOYS)")
     # AE
     p.add_argument("--ae_epochs",   type=int, default=5)
     p.add_argument("--ae_base_ch",  type=int, default=16)
@@ -53,9 +66,11 @@ def parse_args():
     p.add_argument("--rl_grid_y",   type=int, default=12)
     p.add_argument("--rl_n_min",    type=int, default=5)
     p.add_argument("--rl_n_max",    type=int, default=20)
-    p.add_argument("--rl_episode_len", type=int, default=20)
+    p.add_argument("--rl_episode_len", type=int, default=20,
+                   help="Actions par épisode RL (défaut=20, identique au standalone)")
     p.add_argument("--gif_frames",  type=int, default=40)
     p.add_argument("--output_dir",  type=str, default="outputs")
+    add_data_args(p)
     return p.parse_args()
 
 
@@ -71,253 +86,336 @@ def load_brick(filename):
 
 
 def write_report(path, sections):
+    """Écrit le rapport texte depuis une liste de sections (str ou list[str])."""
     lines = []
     for s in sections:
-        lines.extend(s if isinstance(s, list) else [s])
+        if isinstance(s, list):
+            lines.extend(s)
+        else:
+            lines.append(s)
     Path(path).write_text("\n".join(lines), encoding="utf-8")
     print(f"\n  Rapport → {path}")
 
 
-def plot_ocean_overview(T, S, positions, out_dir, seed_ocean=42, seed_buoys=7):
-    """
-    Figure d'illustration : SST et SSS à 3 instants + réseau de bouées.
-    Layout 2×3 : ligne 1 = SST, ligne 2 = SSS ; colonnes = t=0, t=mid, t=fin.
-    Bouées affichées sur chaque panneau.
-    """
-    import matplotlib; matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-    import matplotlib.gridspec as gridspec
-    from matplotlib.colors import LinearSegmentedColormap
-
-    ocean_cmap = LinearSegmentedColormap.from_list("oc",
-        ["#08306b","#2171b5","#6baed6","#c6dbef","#fff5eb",
-         "#fdd49e","#fc8d59","#d7301f","#7f0000"], N=256)
-    sal_cmap = LinearSegmentedColormap.from_list("sal",
-        ["#003c30","#01665e","#35978f","#80cdc1","#f5f5f5",
-         "#dfc27d","#bf812d","#8c510a","#543005"], N=256)
-    BG = "#0a1628"
-
-    nt = len(T)
-    snaps = [0, nt // 2, nt - 1]
-    obs = np.array(positions)
-    vT = (T.min(), T.max())
-    vS = (S.min(), S.max())
-
-    fig = plt.figure(figsize=(18, 10), facecolor=BG)
-    gs = gridspec.GridSpec(2, 3, figure=fig, hspace=0.25, wspace=0.22,
-                           left=0.04, right=0.97, top=0.90, bottom=0.04)
-
-    for col, t in enumerate(snaps):
-        for row, (field, cmap, vmin, vmax, var_name, unit) in enumerate([
-            (T, ocean_cmap, *vT, "SST", "°C"),
-            (S, sal_cmap,   *vS, "SSS", "psu"),
-        ]):
-            ax = fig.add_subplot(gs[row, col])
-            im = ax.imshow(field[t].T, cmap=cmap, origin="lower", aspect="auto",
-                           vmin=vmin, vmax=vmax, interpolation="bilinear")
-            # Bouées
-            ax.scatter(obs[:, 0], obs[:, 1], c="white", s=28,
-                       edgecolors="black", linewidths=0.6, zorder=6)
-            ax.scatter(obs[:, 0], obs[:, 1], c="#ffd93d", s=8, zorder=7)
-            ax.set_xticks([]); ax.set_yticks([])
-            ax.set_facecolor("#050d1a")
-            for sp in ax.spines.values():
-                sp.set_edgecolor("#1a3a5c")
-            ax.set_title(f"{var_name}  t={t}", color="white", fontsize=10,
-                         fontweight="bold", pad=5)
-            cb = fig.colorbar(im, ax=ax, pad=0.02, fraction=0.046)
-            cb.set_label(unit, color="white", fontsize=7)
-            cb.ax.yaxis.set_tick_params(color="white", labelcolor="white", labelsize=6)
-
-    fig.text(0.5, 0.96,
-             f"Nature Run — {len(positions)} bouées  "
-             f"(seed_ocean={seed_ocean}  seed_buoys={seed_buoys}  nt={nt})",
-             ha="center", color="white", fontsize=13, fontweight="bold")
-
-    out_path = Path(out_dir) / "ocean_overview.png"
-    fig.savefig(out_path, dpi=150, facecolor=BG, bbox_inches="tight")
-    plt.close()
-    print(f"  Figure océan + bouées → {out_path}")
-
-
-def _train_ae_quick(b1, T, S, args, ae_ns):
-    """Entraînement AE minimal."""
-    train_ds, val_ds = build_datasets(T, S, split=0.8,
-                                      n_obs_min=ae_ns.n_obs_min,
-                                      n_obs_max=ae_ns.n_obs_max,
-                                      augment_train=True)
+def _train_ae_quick(b1, fields, channels, sea_mask, args, args1):
+    """Entraînement AE minimal (pour le pipeline ou mode individual)."""
+    train_ds, val_ds = build_datasets(fields, channels, split=0.8,
+                                      sea_mask=sea_mask,
+                                      observed_vars=OBSERVED_VARS,
+                                      n_obs_min=args1.n_obs_min,
+                                      n_obs_max=args1.n_obs_max,
+                                      warn_snr=False)
     loader = DataLoader(train_ds, batch_size=8, shuffle=True)
-    val_ld = DataLoader(val_ds,   batch_size=8, shuffle=False)
-    model  = b1.ObservabilityAE(
-        base_ch=ae_ns.base_ch, latent_ch=ae_ns.latent_ch,
-        dropout_p=ae_ns.dropout_p, cond_dim=ae_ns.cond_dim).to(DEVICE)
+    model  = b1.ObservabilityVAE(
+        in_ch=VAE_IN_CH, out_ch=VAE_OUT_CH,
+        base_ch=args1.base_ch, latent_ch=args1.latent_ch,
+        dropout_p=args1.dropout_p, cond_dim=args1.cond_dim).to(DEVICE)
     optim  = torch.optim.Adam(model.parameters(), lr=3e-4)
-    crit   = b1.AELoss(w_unobs=ae_ns.w_unobs, lambda_grad=ae_ns.lambda_grad,
-                        huber_delta=ae_ns.huber_delta)
-
-    npar = sum(p.numel() for p in model.parameters())
-    print(f"  Modèle AE-UNet (base_ch={ae_ns.base_ch}, latent_ch={ae_ns.latent_ch}, "
-          f"dropout={ae_ns.dropout_p}, cond_dim={ae_ns.cond_dim})")
-    print(f"  Paramètres : {npar:,}")
-    print(f"  Entraînement {ae_ns.epochs} ep | Huber δ={ae_ns.huber_delta} | "
-          f"λ_grad={ae_ns.lambda_grad} | MC-Dropout p={ae_ns.dropout_p} | n_mc_val={ae_ns.n_mc_val}")
-
+    crit   = b1.VAELoss(w_unobs=args1.w_unobs, lambda_grad=args1.lambda_grad,
+                         huber_delta=args1.huber_delta, beta_max=args1.beta_max)
     best_loss = np.inf
     t0 = time.time()
-    for ep in range(1, ae_ns.epochs + 1):
-        model.train()
-        ep_loss = ep_aux = 0.0
-        for x, y, mask in loader:
-            x, y, mask = x.to(DEVICE), y.to(DEVICE), mask.to(DEVICE)
-            pred, z, aux = model(x)
-            loss, l_rec, l_aux = crit(pred, y, mask, aux_preds=aux)
+    model.train()
+    for ep in range(args1.epochs):
+        ep_loss = 0.0
+        for x, y, mask, sea in loader:
+            x, y, mask, sea = (x.to(DEVICE), y.to(DEVICE),
+                               mask.to(DEVICE), sea.to(DEVICE))
+            pred, mu, lv, aux = model(x)
+            loss, *_ = crit(pred, y, mask, mu, lv, beta=0.1, aux_preds=aux,
+                            sea=sea)
             optim.zero_grad(); loss.backward(); optim.step()
             ep_loss += loss.item()
-            ep_aux += l_aux.item()
-        ep_loss /= len(loader); ep_aux /= len(loader)
+        ep_loss /= len(loader)
         best_loss = min(best_loss, ep_loss)
-
-        if ep % 10 == 0 or ep == 1:
-            # RMSE val MC avec stratification par densité
-            model.eval()
-            rmses_all = []
-            rmse_by_d = {"sparse": [], "medium": [], "dense": []}
-            with torch.no_grad():
-                for xv, yv, mv in val_ld:
-                    xv, yv, mv = xv.to(DEVICE), yv.to(DEVICE), mv.to(DEVICE)
-                    preds = torch.stack([model(xv)[0] for _ in range(ae_ns.n_mc_val)])
-                    pm = preds.mean(0)
-                    sq = (pm - yv) ** 2
-                    for b in range(xv.shape[0]):
-                        n_obs_b = int(mv[b].sum().item())
-                        rmse_b = float(torch.sqrt((sq[b] * (1 - mv[b])).mean()).item())
-                        rmses_all.append(rmse_b)
-                        if n_obs_b < 20: rmse_by_d["sparse"].append(rmse_b)
-                        elif n_obs_b < 50: rmse_by_d["medium"].append(rmse_b)
-                        else: rmse_by_d["dense"].append(rmse_b)
-            vr = float(np.mean(rmses_all))
-            sp = np.mean(rmse_by_d["sparse"]) if rmse_by_d["sparse"] else float("nan")
-            me = np.mean(rmse_by_d["medium"]) if rmse_by_d["medium"] else float("nan")
-            de = np.mean(rmse_by_d["dense"])  if rmse_by_d["dense"]  else float("nan")
-            print(f"    ep {ep:3d}/{ae_ns.epochs} | Loss={ep_loss:.4f} | "
-                  f"RMSE={vr:.4f} [sp:{sp:.3f} me:{me:.3f} de:{de:.3f}] | "
-                  f"Laux={ep_aux:.4f}")
-            model.train()
-
-    # RMSE validation finale MC
+        print(f"    ep {ep+1}/{args1.epochs} | Loss={ep_loss:.4f}")
+    # RMSE val MC
     model.eval()
-    rmses = []
+    val_ld = DataLoader(val_ds, batch_size=8, shuffle=False)
+    rmses  = []
+    ch_sq = np.zeros(VAE_OUT_CH); ch_n = 0.0
     with torch.no_grad():
-        for x, y, mask in val_ld:
-            x, y, mask = x.to(DEVICE), y.to(DEVICE), mask.to(DEVICE)
-            preds = torch.stack([model(x)[0] for _ in range(ae_ns.n_mc_val)])
+        for x, y, mask, sea in val_ld:
+            x, y, mask, sea = (x.to(DEVICE), y.to(DEVICE),
+                               mask.to(DEVICE), sea.to(DEVICE))
+            preds = torch.stack([model(x)[0] for _ in range(args1.n_mc_val)])
             pm = preds.mean(0)
+            w_all = (1 - mask) * sea
+            ch_sq += ((pm - y)**2 * w_all).sum(dim=(0, 2, 3)).cpu().numpy()
+            ch_n  += float(w_all.sum().item())
             for b in range(x.shape[0]):
-                rmses.append(float(torch.sqrt(((pm[b] - y[b])**2 * (1 - mask[b])).mean()).item()))
-
+                sq, wb = (pm[b] - y[b])**2, w_all[b]
+                rmses.append(float(torch.sqrt(
+                    (sq*wb).sum() / wb.sum().clamp_min(1.0)).item()))
     val_rmse = float(np.mean(rmses))
+    # RMSE par canal en unités physiques — seule forme interprétable dès
+    # qu'on mélange des °C, des PSU et des m/s.
+    rmse_phys = {c: float(np.sqrt(ch_sq[i] / max(ch_n, 1.0)) * train_ds.std[i])
+                 for i, c in enumerate(channels)}
     elapsed  = round(time.time() - t0, 1)
-    norm = {"T_mean": float(T.mean()), "T_std": float(T.std()),
-            "S_mean": float(S.mean()), "S_std": float(S.std())}
-    torch.save({"model_state": model.state_dict(), "args": vars(ae_ns), "norm": norm},
-               Path(ae_ns.output_dir) / "ae_best.pt")
-    return model, norm, best_loss, val_rmse, elapsed
+    norm = {"T_mean": float(train_ds.mean[0]), "T_std": float(train_ds.std[0]),
+            "S_mean": float(train_ds.mean[1]), "S_std": float(train_ds.std[1])}
+    torch.save({"model_state": model.state_dict(), "args": vars(args1),
+                "norm": norm, "channels": channels, "rmse_phys": rmse_phys,
+                # `stats` est requis par 04_baselines.py pour dénormaliser
+                "stats": {"mean": train_ds.mean, "std": train_ds.std}},
+               Path(args.output_dir) / "vae_best.pt")
+    return model, norm, best_loss, val_rmse, elapsed, rmse_phys
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  Rapport
+#  Rapport commun
 # ══════════════════════════════════════════════════════════════════════════════
 
 SEP = "─" * 68
 
-def _report_header(mode, args, T, positions, ts):
-    return [
+def _report_header(mode, args, T, positions, ts, data_info=None):
+    di = data_info or {}
+    glorys = str(di.get("source", "")).startswith("GLORYS")
+
+    lines = [
         "=" * 68,
-        "  OED-IA SNO Marins — Rapport",
+        "  OED-IA SNO Marins — Rapport de métriques",
         f"  Mode     : {mode}",
         f"  Généré le: {ts}",
         "=" * 68, "",
+        "── DONNÉES ──────────────────────────────────────────────────────────",
+        f"  source      : {di.get('source', 'inconnue')}",
+    ]
+
+    if glorys:
+        lo = di.get("lon_range", [0, 0]); la = di.get("lat_range", [0, 0])
+        lines += [
+            f"  période     : {di.get('date_start')} → {di.get('date_end')}"
+            f"   ({di.get('n_times')} dates)",
+            f"  fenêtre     : lon [{lo[0]:.4f}, {lo[1]:.4f}]   "
+            f"lat [{la[0]:.4f}, {la[1]:.4f}]",
+            f"  grille      : {NX} × {NY} px   ({di.get('dx_km')} km/px)",
+            f"  100 % mer   : {di.get('full_sea')}   "
+            f"(fraction {di.get('sea_fraction')})",
+            f"  niveaux     : {di.get('depths_m')} m",
+            f"  canaux      : {di.get('channels')}",
+            f"  observés    : {di.get('observed_vars')}",
+            f"  désaisonn.  : {di.get('seasonal_removed')}",
+        ]
+
+    ch0 = (di.get("channels") or ["canal 0"])[0]
+    lines += [
+        "",
         "── REPRODUCTIBILITÉ ─────────────────────────────────────────────────",
         f"  seed_ocean  : {args.seed_ocean}",
         f"  seed_buoys  : {args.seed_buoys}",
         f"  nt          : {args.nt}  pas de temps",
         f"  n_buoys     : {len(positions)}  capteurs",
         "",
-        "── NATURE RUN ───────────────────────────────────────────────────────",
-        f"  SST : [{T.min():.2f}, {T.max():.2f}] °C",
+        "── CHAMP ────────────────────────────────────────────────────────────",
+        f"  {ch0} : [{T.min():.2f}, {T.max():.2f}]"
+        + ("   (anomalie désaisonnalisée)" if di.get("seasonal_removed")
+           else "   (valeurs brutes)"),
         "",
-        "── POSITIONS (pixel x, y) ──────────────────────────────────────────",
-    ] + [f"  B{i:02d} : ({px:4d}, {py:4d})" for i, (px, py) in enumerate(positions)]
+    ]
+
+    # Coordonnées géographiques en plus des pixels : une position en pixels
+    # n'est ni déployable sur le terrain ni lisible en présentation.
+    if glorys and di.get("lon_range"):
+        lo = di["lon_range"]; la = di["lat_range"]
+        lon_ax = np.linspace(lo[0], lo[1], NX)
+        lat_ax = np.linspace(la[0], la[1], NY)
+        lines += [
+            "── POSITIONS DES BOUÉES ─────────────────────────────────────────────",
+            "        pixel (x, y)      longitude    latitude",
+        ]
+        for k, (px, py) in enumerate(positions):
+            lines.append(f"  B{k:02d} : ({px:4d}, {py:4d})   "
+                         f"{lon_ax[px]:10.4f}  {lat_ax[py]:10.4f}")
+    else:
+        lines += ["── POSITIONS DES BOUÉES (pixel x, y) ───────────────────────────────"]
+        lines += [f"  B{k:02d} : ({px:4d}, {py:4d})"
+                  for k, (px, py) in enumerate(positions)]
+    return lines
+
 
 def _report_ae(m):
-    return ["", "── BRIQUE 1 — AE-UNet MC-Dropout ────────────────────────────────────",
-            f"  Loss train (best)   : {m['ae_best_loss']:.4f}",
-            f"  RMSE_val (normalisé): {m['ae_rmse_val']:.4f}",
-            f"  RMSE_val physique   : {m['ae_rmse_phys']:.3f} °C",
-            f"  Temps               : {m['ae_time']} s"]
+    return [
+        "", "── BRIQUE 1 — AE-UNet MC-Dropout ────────────────────────────────────",
+        f"  Loss train (best)   : {m['ae_best_loss']:.4f}",
+        f"  RMSE_val (normalisé): {m['ae_rmse_val']:.4f}",
+        "  RMSE_val par canal (unités physiques) :",
+        *[f"      {c:<12} {v:8.4f} "
+          f"{ {'thetao':'°C','so':'PSU','uo':'m/s','vo':'m/s'}.get(c.rsplit('_z',1)[0],'') }"
+          for c, v in m["ae_rmse_by_channel"].items()],
+        f"  Temps               : {m['ae_time']} s",
+    ]
+
 
 def _report_gnn(m):
-    lines = ["", "── BRIQUE 2 — GNN ───────────────────────────────────────────────────",
-             f"  Arêtes graphe          : {m['gnn_edges']}",
-             f"  Score contrib. moy±std : {m['gnn_score_mean']:.3f} ± {m['gnn_score_std']:.3f}",
-             f"  Redondance moyenne     : {m['gnn_redond_mean']:.3f}",
-             f"  Capteurs redondants    : {m['gnn_n_redondant']}  (unicité Q25)",
-             f"  Temps                  : {m['gnn_time']} s"]
+    lines = [
+        "", "── BRIQUE 2 — GNN ───────────────────────────────────────────────────",
+        f"  Arêtes graphe          : {m['gnn_edges']}",
+        f"  Score contrib. moy±std : {m['gnn_score_mean']:.3f} ± {m['gnn_score_std']:.3f}",
+        f"  Redondance moyenne     : {m['gnn_redond_mean']:.3f}",
+        f"  Capteurs redondants    : {m['gnn_n_redondant']}  (unicité Q25)",
+        f"  Temps                  : {m['gnn_time']} s",
+    ]
     if m.get("gnn_redundant_ids"):
         lines.append(f"  IDs redondants         : {m['gnn_redundant_ids']}")
     return lines
 
+
 def _report_rl(m):
-    method = m.get("rl_method", "pareto").upper()
-    return ["", f"── BRIQUE 3 — RL [{method}] ──────────────────────────────────────────",
-            f"  N★ optimal           : {m['rl_n_star']} capteurs",
-            f"  Score info N★        : {m['rl_info_star']:.3f}",
-            f"  Score info max       : {m['rl_info_max']:.3f}",
-            f"  Config légère N      : {m['rl_n_light']} capteurs",
-            f"  Perte info dense→lég : {m['rl_perte_pct']:.1f} %",
-            f"  Temps                : {m['rl_time']} s"]
+    return [
+        "", "── BRIQUE 3 — RL ────────────────────────────────────────────────────",
+        f"  N★ (point de coude)  : {m['rl_n_star']} capteurs",
+        f"  Score info N★        : {m['rl_info_star']:.3f}",
+        f"  Score info max       : {m['rl_info_max']:.3f}",
+        f"  Config légère N      : {m['rl_n_light']} capteurs",
+        f"  Score info légère    : {m['rl_info_light']:.3f}",
+        f"  Perte info dense→lég : {m['rl_perte_pct']:.1f} %",
+        f"  Temps                : {m['rl_time']} s",
+    ]
+
 
 def _report_footer(mode, total, args, metrics, out_dir):
-    lines = ["", "── RÉSUMÉ ───────────────────────────────────────────────────────────",
-             f"  Mode        : {mode}",
-             f"  Temps total : {round(total, 1)} s", "",
-             "── FICHIERS PRODUITS ────────────────────────────────────────────────"]
+    lines = [
+        "", "── RÉSUMÉ ───────────────────────────────────────────────────────────",
+        f"  Mode        : {mode}",
+        f"  Temps total : {round(total, 1)} s",
+        "",
+        "── FICHIERS PRODUITS ────────────────────────────────────────────────",
+    ]
     for f in sorted(Path(out_dir).iterdir()):
         if f.suffix in {".pt", ".png", ".gif", ".txt"}:
             lines.append(f"  {f.name:<46} {f.stat().st_size // 1024:>5} KB")
-    lines += ["", json.dumps({"seed_ocean": args.seed_ocean, "seed_buoys": args.seed_buoys,
-                              "nt": args.nt, "mode": mode}, indent=2), "=" * 68]
+    lines += [
+        "",
+        "── JSON REPRODUCTIBILITÉ ────────────────────────────────────────────",
+        json.dumps({"seed_ocean": args.seed_ocean,
+                    "seed_buoys": args.seed_buoys,
+                    "nt": args.nt,
+                    "n_buoys": len(metrics["positions"]),
+                    "mode": mode}, indent=2),
+        "=" * 68,
+    ]
     return lines
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  MODE INDIVIDUAL
+#  Exécution
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _run_individual(args, T, S, positions, b1, b2, b3,
+def main():
+    args   = parse_args()
+    t0     = time.time()
+    ts     = datetime.now().strftime("%Y%m%d_%H%M%S")
+    out    = Path(args.output_dir); out.mkdir(exist_ok=True)
+    n_buoys = args.n_buoys or N_BUOYS
+
+    print("=" * 68)
+    print(f"  OED-IA SNO Marins  |  mode={args.mode}")
+    print(f"  seed_ocean={args.seed_ocean}  seed_buoys={args.seed_buoys}  nt={args.nt}")
+    print("=" * 68)
+
+    # ── Nature run commun ──────────────────────────────────────────────────────
+    print(f"\n{SEP}\n  Champ océanique\n{SEP}")
+    fields, channels, sea_mask, data_info = load_ocean(args)
+    T, S = fields[:, 0], fields[:, 1]
+    print(f"  source  : {data_info['source']}")
+    print(f"  champ   : {fields.shape}  |  canaux : {channels}")
+    if data_info.get("lon_range"):
+        print(f"  fenêtre : lon [{data_info['lon_range'][0]:.3f}, "
+              f"{data_info['lon_range'][1]:.3f}]  lat "
+              f"[{data_info['lat_range'][0]:.3f}, {data_info['lat_range'][1]:.3f}]"
+              f"  ({data_info['dx_km']} km/px)")
+        print(f"  période : {data_info['date_start']} → {data_info['date_end']}"
+              f"  |  100 % mer : {data_info['full_sea']}")
+
+    init_pos = BuoySampler(NX, NY, n_buoys, sea_mask=sea_mask,
+                           min_dist=MIN_BUOY_DIST, rng=args.seed_buoys).positions
+    print(f"  Réseau initial : {n_buoys} bouées  (seed_buoys={args.seed_buoys}, "
+          f"dist_min={MIN_BUOY_DIST} px)")
+
+    metrics = {"positions": init_pos, "data_info": data_info}
+
+    # ── Chargement des briques ─────────────────────────────────────────────────
+    brick_dir = Path(__file__).parent
+    b1 = load_brick(brick_dir / "01_autoencoder.py")
+    b2 = load_brick(brick_dir / "02_gnn.py")
+    b3 = load_brick(brick_dir / "03_rl.py")
+
+    # Namespace commun AE
+    ae_ns = types.SimpleNamespace(
+        train=True, score=False, figures=False,
+        epochs=args.ae_epochs, batch_size=8, lr=3e-4,
+        base_ch=args.ae_base_ch, latent_ch=32, cond_dim=16, dropout_p=0.15,
+        w_unobs=4.0, lambda_grad=0.5, lambda_spec=0.0, lambda_ts=0.0,
+        huber_delta=0.5, beta_max=0.0, n_obs_min=10, n_obs_max=60,
+        n_mc_val=3, n_mc=20, output_dir=str(out),
+        checkpoint=str(out / "vae_best.pt"))
+
+    # Namespace GNN
+    gnn_ns = types.SimpleNamespace(
+        gnn_epochs=args.gnn_epochs, output_dir=str(out), corr_threshold=0.5)
+
+    # Namespace RL — paramètres identiques au mode standalone
+    # (buffer_size et episode_len doivent être cohérents entre les deux modes)
+    rl_ns = types.SimpleNamespace(
+        rl_steps=args.rl_steps, buffer_size=512, lr=3e-4,
+        output_dir=str(out),
+        grid_x=args.rl_grid_x, grid_y=args.rl_grid_y,
+        n_min=args.rl_n_min, n_max=args.rl_n_max,
+        episode_len=args.rl_episode_len, w_info=1.0, w_budget=0.5,
+        gif_frames=args.gif_frames)
+
+    report_sections = _report_header(args.mode, args, T, init_pos, ts, data_info)
+
+    # ══════════════════════════════════════════════════════════════════════════
+    if args.mode == "individual":
+        _run_individual(args, fields, channels, sea_mask, data_info, init_pos, b1, b2, b3,
+                        ae_ns, gnn_ns, rl_ns, metrics, report_sections, out, ts, t0)
+    else:
+        _run_pipeline(args, fields, channels, sea_mask, data_info, init_pos, b1, b2, b3,
+                      ae_ns, gnn_ns, rl_ns, metrics, report_sections, out, ts, t0)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  MODE INDIVIDUAL : AE → GNN → RL  (chacun sur le réseau initial)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _run_individual(args, fields, channels, sea_mask, data_info, positions, b1, b2, b3,
                     ae_ns, gnn_ns, rl_ns, metrics, report_sections, out, ts, t0):
+
+    T, S = fields[:, 0], fields[:, 1]   # thetao_z0, so_z0
 
     print(f"\n{SEP}\n  MODE INDIVIDUAL — 3 briques indépendantes\n{SEP}")
 
-    # Brique 1 — AE
+    # ── Brique 1 — AE ─────────────────────────────────────────────────────────
     print(f"\n{SEP}\n  BRIQUE 1 — AE-UNet MC-Dropout\n{SEP}")
-    model_ae, norm, best_loss, val_rmse, ae_time = _train_ae_quick(b1, T, S, args, ae_ns)
-    ae_fig_ns = types.SimpleNamespace(**vars(ae_ns), figures=True)
-    ae_fig_ns.output_dir = str(out)
-    model_ae.eval()
-    b1.plot_network_evaluation(model_ae, T, S, norm, ae_fig_ns, positions=positions, n_samples=ae_ns.n_mc)
-    b1.plot_uncertainty_maps(model_ae, T, S, norm, ae_fig_ns, n_samples=ae_ns.n_mc)
-    m_ae = {"ae_best_loss": float(best_loss), "ae_rmse_val": val_rmse,
-            "ae_rmse_phys": val_rmse * float(T.std()), "ae_time": ae_time}
-    metrics.update(m_ae); report_sections += _report_ae(m_ae)
-    print(f"  ✓ AE RMSE_val={val_rmse:.4f} ({val_rmse*T.std():.3f} °C) [{ae_time}s]")
+    model_ae, norm, best_loss, val_rmse, ae_time, rmse_phys = _train_ae_quick(b1, fields, channels, sea_mask, args, ae_ns)
 
-    # Brique 2 — GNN
-    print(f"\n{SEP}\n  BRIQUE 2 — GNN Structure\n{SEP}")
+    ae_fig_ns = types.SimpleNamespace(**{k: v for k, v in vars(ae_ns).items()
+                                         if k != "figures"}, figures=True)
+    ae_fig_ns.output_dir = str(out)
+    ae_fig_ns.sea_mask = sea_mask
+    print("  Figures AE...")
+    model_ae.eval()
+    b1.plot_network_evaluation(model_ae, T, S, norm, ae_fig_ns,
+                                positions=positions, n_samples=ae_ns.n_mc)
+    b1.plot_uncertainty_maps(model_ae, T, S, norm, ae_fig_ns, n_samples=ae_ns.n_mc)
+
+    m_ae = {"ae_best_loss": float(best_loss), "ae_rmse_val": val_rmse,
+            "ae_rmse_by_channel": rmse_phys, "ae_time": ae_time}
+    metrics.update(m_ae)
+    report_sections += _report_ae(m_ae)
+    # val_rmse est en unités normalisées, agrégé sur tous les canaux : le
+    # multiplier par T.std() n'a plus de sens dès qu'on mélange °C, PSU et m/s.
+    print(f"  ✓ AE  RMSE_val={val_rmse:.4f} (normalisé)  |  "
+          f"thetao {rmse_phys['thetao_z0']:.4f} °C, "
+          f"so {rmse_phys['so_z0']:.4f} PSU  [{ae_time}s]")
+    print(f"\n{SEP}\n  BRIQUE 2 — GNN Structure du Réseau\n{SEP}")
     t0_gnn = time.time()
-    corr  = b2.build_spatial_correlation(T, S, positions, n_timestamps=min(80, args.nt))
-    graph = b2.build_graph(positions, corr, corr_threshold=0.5, k_nearest=4, T=T, S=S)
-    tgts  = b2.compute_proxy_targets(positions, corr)
+    corr   = b2.build_spatial_correlation(fields, None, positions, n_timestamps=min(80, args.nt))
+    graph  = b2.build_graph(positions, corr, corr_threshold=0.5, k_nearest=4)
+    tgts   = b2.compute_proxy_targets(positions, corr)
     print(f"  Graphe : {len(positions)} nœuds, {graph['edge_index'].shape[1]} arêtes")
     model_gnn = b2.train_gnn(gnn_ns, graph, tgts)
     scores_gnn, redund, _ = b2.analyze_network(model_gnn, graph, tgts, gnn_ns, T=T)
@@ -325,34 +423,46 @@ def _run_individual(args, T, S, positions, b1, b2, b3,
     unicite  = 1 - redund
     is_redond = unicite < np.percentile(unicite, 25)
     m_gnn = {"gnn_edges": int(graph['edge_index'].shape[1]),
-             "gnn_score_mean": float(scores_gnn.mean()), "gnn_score_std": float(scores_gnn.std()),
-             "gnn_redond_mean": float(redund.mean()), "gnn_n_redondant": int(is_redond.sum()),
-             "gnn_redundant_ids": [int(i) for i in np.where(is_redond)[0]], "gnn_time": gnn_time}
-    metrics.update(m_gnn); report_sections += _report_gnn(m_gnn)
-    print(f"  ✓ GNN {m_gnn['gnn_n_redondant']} redondants [{gnn_time}s]")
+             "gnn_score_mean": float(scores_gnn.mean()),
+             "gnn_score_std":  float(scores_gnn.std()),
+             "gnn_redond_mean": float(redund.mean()),
+             "gnn_n_redondant": int(is_redond.sum()),
+             "gnn_redundant_ids": [int(i) for i in np.where(is_redond)[0]],
+             "gnn_time": gnn_time}
+    metrics.update(m_gnn)
+    report_sections += _report_gnn(m_gnn)
+    print(f"  ✓ GNN  {m_gnn['gnn_n_redondant']} redondants  [{gnn_time}s]")
 
-    # Brique 3 — RL
-    print(f"\n{SEP}\n  BRIQUE 3 — RL [{rl_ns.rl_method.upper()}]\n{SEP}")
+    # ── Brique 3 — RL ─────────────────────────────────────────────────────────
+    print(f"\n{SEP}\n  BRIQUE 3 — RL Optimisation\n{SEP}")
     t0_rl = time.time()
-    env   = b3.OceanNetworkEnv(T, S, grid_x=rl_ns.grid_x, grid_y=rl_ns.grid_y,
-                                n_min=rl_ns.n_min, n_max=rl_ns.n_max, episode_len=rl_ns.episode_len)
-    policy, _ = b3.train_ppo(rl_ns, env)
-    pts, n_star = b3.run_rl_method(env, policy, rl_ns)
-    b3.visualize_two_configs(env, n_star, policy, rl_ns)
+    env   = b3.OceanNetworkEnv(fields, sea_mask=sea_mask,
+                             dx_km=data_info.get('dx_km'),
+                             grid_x=rl_ns.grid_x, grid_y=rl_ns.grid_y,
+                                n_min=rl_ns.n_min, n_max=rl_ns.n_max,
+                                episode_len=rl_ns.episode_len)
+    policy = b3.train_ppo(rl_ns, env)
+    pareto_pts, pareto_mask, n_star = b3.compute_pareto_front(env, policy, rl_ns)
+    b3.visualize_two_configs(env, pareto_pts, n_star, policy, rl_ns)
+    print("  GIF progression...")
     b3.save_rl_gif(env, policy, rl_ns, n_frames=rl_ns.gif_frames)
     rl_time = round(time.time() - t0_rl, 1)
-    info_vals = np.array([p["info_mean"] for p in pts])
-    n_vals    = np.array([p["n_buoys"] for p in pts])
-    n_star    = int(np.clip(n_star, max(2, env.n_min), env.n_max))
-    nl = b3._n_light(n_star)
+    info_vals = np.array([p["info_mean"] for p in pareto_pts])
+    n_vals    = np.array([p["n_buoys"]   for p in pareto_pts])
+    n_star    = int(np.clip(n_star, env.n_min, env.n_max))   # clamp hors-plage
+    n_light   = max(env.n_min, n_star // 2)
+    info_light = float(info_vals[np.argmin(np.abs(n_vals - n_light))])
     info_star  = float(info_vals[np.argmin(np.abs(n_vals - n_star))])
-    info_light = float(info_vals[np.argmin(np.abs(n_vals - nl))]) if len(n_vals) > 0 else 0.0
-    perte_pct  = max(0, (info_star - info_light) / max(info_star, 1e-3) * 100)
-    m_rl = {"rl_n_star": n_star, "rl_info_star": info_star, "rl_info_max": float(info_vals.max()),
-            "rl_n_light": nl, "rl_info_light": info_light, "rl_perte_pct": perte_pct,
-            "rl_time": rl_time, "rl_method": rl_ns.rl_method}
-    metrics.update(m_rl); report_sections += _report_rl(m_rl)
+    perte_pct  = (info_star - info_light) / (info_star + 1e-9) * 100
+    m_rl = {"rl_n_star": int(n_star), "rl_info_star": info_star,
+            "rl_info_max": float(info_vals.max()),
+            "rl_n_light": int(n_light), "rl_info_light": info_light,
+            "rl_perte_pct": perte_pct, "rl_time": rl_time}
+    metrics.update(m_rl)
+    report_sections += _report_rl(m_rl)
+    print(f"  ✓ RL   N★={n_star}  [{rl_time}s]")
 
+    # ── Rapport ───────────────────────────────────────────────────────────────
     total = time.time() - t0
     report_sections += _report_footer("individual", total, args, metrics, str(out))
     write_report(out / f"rapport_individual_{ts}.txt", report_sections)
@@ -360,142 +470,129 @@ def _run_individual(args, T, S, positions, b1, b2, b3,
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  MODE PIPELINE : RL → GNN → AE
+#  MODE PIPELINE : RL → positions optimales → GNN + AE évaluent ce réseau
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _run_pipeline(args, T, S, init_pos, b1, b2, b3,
+def _run_pipeline(args, fields, channels, sea_mask, data_info, init_pos, b1, b2, b3,
                   ae_ns, gnn_ns, rl_ns, metrics, report_sections, out, ts, t0):
+
+    T, S = fields[:, 0], fields[:, 1]   # thetao_z0, so_z0
 
     print(f"\n{SEP}\n  MODE PIPELINE : RL → GNN → AE\n{SEP}")
 
-    # Étape 1 : RL
-    print(f"\n{SEP}\n  ÉTAPE 1/3 — RL [{rl_ns.rl_method.upper()}]\n{SEP}")
+    # ── Étape 1 : RL propose le réseau optimal ─────────────────────────────────
+    print(f"\n{SEP}\n  ÉTAPE 1/3 — RL : recherche du réseau optimal\n{SEP}")
     t0_rl = time.time()
-    env    = b3.OceanNetworkEnv(T, S, grid_x=rl_ns.grid_x, grid_y=rl_ns.grid_y,
-                                 n_min=rl_ns.n_min, n_max=rl_ns.n_max, episode_len=rl_ns.episode_len)
-    policy, _ = b3.train_ppo(rl_ns, env)
-    pts, n_star = b3.run_rl_method(env, policy, rl_ns)
+    env    = b3.OceanNetworkEnv(fields, sea_mask=sea_mask,
+                             dx_km=data_info.get('dx_km'),
+                             grid_x=rl_ns.grid_x, grid_y=rl_ns.grid_y,
+                                 n_min=rl_ns.n_min, n_max=rl_ns.n_max,
+                                 episode_len=rl_ns.episode_len)
+    policy = b3.train_ppo(rl_ns, env)
+    pareto_pts, pareto_mask, n_star = b3.compute_pareto_front(env, policy, rl_ns)
 
-    # Extraction des positions du meilleur checkpoint
-    best_ckpt = torch.load(Path(rl_ns.output_dir) / "rl_best.pt", map_location="cpu", weights_only=False)
+    # ── Extraction AVANT les figures — best_mask du checkpoint ───────────────
+    ckpt_path = Path(rl_ns.output_dir) / "rl_best.pt"
+    best_ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     best_mask = best_ckpt["active_mask"]
-    active_idx   = np.where(best_mask > 0.5)[0] if len(best_mask) > 0 else np.array([], dtype=int)
-    rl_positions = [env.candidate_positions[i] for i in active_idx] if len(active_idx) > 0 else []
+    active_idx   = np.where(best_mask > 0.5)[0]
+    rl_positions = [env.candidate_positions[i] for i in active_idx]
+    env.active_mask = best_mask.copy()
+    info_retained   = float(env._compute_info_reward())
+    print(f"  Réseau RL (best checkpoint) : {len(rl_positions)} bouées actives  info={info_retained:.3f}")
 
-    # Si scalarized, le best_mask peut être vide → utiliser la politique directement
-    if len(rl_positions) == 0:
-        active_idx, info_retained = b3._run_policy_config(env, policy, int(n_star))
-        rl_positions = [env.candidate_positions[i] for i in active_idx]
-        best_mask = env.active_mask.copy()
-    else:
-        env.active_mask = best_mask.copy()
-        info_retained = float(env._compute_info_reward())
-    print(f"  Réseau RL : {len(rl_positions)} bouées | info={info_retained:.3f}")
-
-    b3.visualize_two_configs(env, n_star, policy, rl_ns, best_mask=best_mask)
+    # Figures RL : two_configs montre la config retenue (★), pareto annoté
+    b3.visualize_two_configs(env, pareto_pts, n_star, policy, rl_ns, best_mask=best_mask)
     b3.mark_retained_config_on_pareto(len(rl_positions), info_retained, rl_ns.output_dir)
+    print("  GIF progression...")
     b3.save_rl_gif(env, policy, rl_ns, n_frames=rl_ns.gif_frames)
     rl_time = round(time.time() - t0_rl, 1)
 
-    info_vals = np.array([p["info_mean"] for p in pts])
-    n_vals    = np.array([p["n_buoys"] for p in pts])
-    n_star = int(np.clip(n_star, max(2, env.n_min), env.n_max))
-    nl = b3._n_light(n_star)
-    info_star  = float(info_vals[np.argmin(np.abs(n_vals - n_star))]) if len(n_vals) > 0 else info_retained
-    info_light = float(info_vals[np.argmin(np.abs(n_vals - nl))]) if len(n_vals) > 0 else 0.0
-    perte_pct  = max(0, (info_star - info_light) / max(info_star, 1e-3) * 100)
+    info_vals = np.array([p["info_mean"] for p in pareto_pts])
+    n_vals    = np.array([p["n_buoys"]   for p in pareto_pts])
+    n_star = int(np.clip(n_star, env.n_min, env.n_max))
+    n_light   = max(env.n_min, n_star // 2)
+    info_light = float(info_vals[np.argmin(np.abs(n_vals - n_light))])
+    info_star  = float(info_vals[np.argmin(np.abs(n_vals - n_star))])
+    perte_pct  = (info_star - info_light) / (info_star + 1e-9) * 100
 
-    # Complétion si trop peu de positions pour le GNN
+    # Garantir un minimum de 5 positions pour que le GNN soit valide
+    # (matrice de corrélation, k_nearest=4 exige ≥ 5 nœuds)
     GNN_MIN = 5
     if len(rl_positions) < GNN_MIN:
-        print(f"  [INFO] Réseau RL ({len(rl_positions)}) < {GNN_MIN} — complétion aléatoire")
-        extra_pool = [p for p in env.candidate_positions if p not in rl_positions]
+        print(f"  [INFO] Réseau RL ({len(rl_positions)} pos) < {GNN_MIN} — "
+              f"complétion aléatoire jusqu'à {GNN_MIN}")
+        all_cands = list(env.candidate_positions)
+        extra_pool = [p for p in all_cands if p not in rl_positions]
         extra = list(np.random.default_rng(args.seed_buoys).choice(
             len(extra_pool), GNN_MIN - len(rl_positions), replace=False))
         rl_positions += [extra_pool[e] for e in extra]
 
-    m_rl = {"rl_n_star": n_star, "rl_info_star": info_star, "rl_info_max": float(info_vals.max()) if len(info_vals) else info_star,
-            "rl_n_light": nl, "rl_info_light": info_light, "rl_perte_pct": perte_pct,
-            "rl_time": rl_time, "rl_method": rl_ns.rl_method}
-    metrics.update(m_rl); report_sections += _report_rl(m_rl)
-    report_sections += ["", "── POSITIONS OPTIMALES RL ───────────────────────────────────────────"]
-    report_sections += [f"  R{i:02d} : ({px:4d}, {py:4d})" for i, (px, py) in enumerate(rl_positions)]
+    m_rl = {"rl_n_star": int(n_star), "rl_info_star": info_star,
+            "rl_info_max": float(info_vals.max()),
+            "rl_n_light": int(n_light), "rl_info_light": info_light,
+            "rl_perte_pct": perte_pct, "rl_time": rl_time}
+    metrics.update(m_rl)
+    report_sections += _report_rl(m_rl)
+    print(f"  ✓ RL  N★={n_star}  {len(rl_positions)} positions extraites  [{rl_time}s]")
 
-    # Étape 2 : GNN sur réseau RL
-    print(f"\n{SEP}\n  ÉTAPE 2/3 — GNN\n{SEP}")
+    # Mettre à jour les positions dans le rapport
+    report_sections += [
+        "", "── POSITIONS OPTIMALES RL (pixel x, y) ─────────────────────────────",
+    ] + [f"  R{i:02d} : ({px:4d}, {py:4d})"
+         for i, (px, py) in enumerate(rl_positions)]
+    metrics["rl_positions"] = rl_positions
+
+    # ── Étape 2 : GNN évalue le réseau RL ─────────────────────────────────────
+    print(f"\n{SEP}\n  ÉTAPE 2/3 — GNN : évaluation réseau RL\n{SEP}")
     t0_gnn = time.time()
-    corr  = b2.build_spatial_correlation(T, S, rl_positions, n_timestamps=min(80, args.nt))
-    graph = b2.build_graph(rl_positions, corr, corr_threshold=0.5, k_nearest=4, T=T, S=S)
-    tgts  = b2.compute_proxy_targets(rl_positions, corr)
+    corr   = b2.build_spatial_correlation(fields, None, rl_positions,
+                                           n_timestamps=min(80, args.nt))
+    graph  = b2.build_graph(rl_positions, corr, corr_threshold=0.5, k_nearest=4)
+    tgts   = b2.compute_proxy_targets(rl_positions, corr)
     print(f"  Graphe : {len(rl_positions)} nœuds, {graph['edge_index'].shape[1]} arêtes")
     model_gnn = b2.train_gnn(gnn_ns, graph, tgts)
-    scores_gnn, redund, _ = b2.analyze_network(model_gnn, graph, tgts, gnn_ns, T=T, label="rl_optimal")
+    scores_gnn, redund, _ = b2.analyze_network(
+        model_gnn, graph, tgts, gnn_ns, T=T, label="rl_optimal")
     gnn_time = round(time.time() - t0_gnn, 1)
-    unicite = 1 - redund
+    unicite  = 1 - redund
     is_redond = unicite < np.percentile(unicite, 25)
     m_gnn = {"gnn_edges": int(graph['edge_index'].shape[1]),
-             "gnn_score_mean": float(scores_gnn.mean()), "gnn_score_std": float(scores_gnn.std()),
-             "gnn_redond_mean": float(redund.mean()), "gnn_n_redondant": int(is_redond.sum()),
-             "gnn_redundant_ids": [int(i) for i in np.where(is_redond)[0]], "gnn_time": gnn_time}
-    metrics.update(m_gnn); report_sections += _report_gnn(m_gnn)
+             "gnn_score_mean": float(scores_gnn.mean()),
+             "gnn_score_std":  float(scores_gnn.std()),
+             "gnn_redond_mean": float(redund.mean()),
+             "gnn_n_redondant": int(is_redond.sum()),
+             "gnn_redundant_ids": [int(i) for i in np.where(is_redond)[0]],
+             "gnn_time": gnn_time}
+    metrics.update(m_gnn)
+    report_sections += _report_gnn(m_gnn)
+    print(f"  ✓ GNN  {m_gnn['gnn_n_redondant']} redondants  [{gnn_time}s]")
 
-    # Étape 3 : AE sur réseau RL
-    print(f"\n{SEP}\n  ÉTAPE 3/3 — AE\n{SEP}")
-    model_ae, norm, best_loss, val_rmse, ae_time = _train_ae_quick(b1, T, S, args, ae_ns)
-    ae_fig_ns = types.SimpleNamespace(**vars(ae_ns), figures=True)
+    # ── Étape 3 : AE évalue le réseau RL ──────────────────────────────────────
+    print(f"\n{SEP}\n  ÉTAPE 3/3 — AE : zones lacunaires + bouées proposées\n{SEP}")
+    model_ae, norm, best_loss, val_rmse, ae_time, rmse_phys = _train_ae_quick(b1, fields, channels, sea_mask, args, ae_ns)
+
+    ae_fig_ns = types.SimpleNamespace(**{k: v for k, v in vars(ae_ns).items()
+                                         if k != "figures"}, figures=True)
     ae_fig_ns.output_dir = str(out)
+    ae_fig_ns.sea_mask = sea_mask
+    print("  Figures AE sur réseau RL...")
     model_ae.eval()
-    b1.plot_network_evaluation(model_ae, T, S, norm, ae_fig_ns, positions=rl_positions, n_samples=ae_ns.n_mc)
+    b1.plot_network_evaluation(model_ae, T, S, norm, ae_fig_ns,
+                                positions=rl_positions, n_samples=ae_ns.n_mc)
     b1.plot_uncertainty_maps(model_ae, T, S, norm, ae_fig_ns, n_samples=ae_ns.n_mc)
+
     m_ae = {"ae_best_loss": float(best_loss), "ae_rmse_val": val_rmse,
-            "ae_rmse_phys": val_rmse * float(T.std()), "ae_time": ae_time}
-    metrics.update(m_ae); report_sections += _report_ae(m_ae)
+            "ae_rmse_by_channel": rmse_phys, "ae_time": ae_time}
+    metrics.update(m_ae)
+    report_sections += _report_ae(m_ae)
+    # val_rmse est en unités normalisées, agrégé sur tous les canaux : le
+    # multiplier par T.std() n'a plus de sens dès qu'on mélange °C, PSU et m/s.
+    print(f"  ✓ AE  RMSE_val={val_rmse:.4f} (normalisé)  |  "
+          f"thetao {rmse_phys['thetao_z0']:.4f} °C, "
+          f"so {rmse_phys['so_z0']:.4f} PSU  [{ae_time}s]")
 
-    # ── Optionnel : évaluation config légère (N★/2) avec GNN + AE ────────
-    if getattr(args, 'eval_light', False):
-        print(f"\n{SEP}\n  BONUS — Config légère (N★/2) évaluée par GNN + AE\n{SEP}")
-        n_light_eval = max(2, n_star // 2)
-        if n_light_eval >= n_star:
-            n_light_eval = max(2, n_star - max(3, n_star // 3))
-        # Générer la config légère avec la politique entraînée
-        env.active_mask[:] = 0.0
-        env.active_mask[np.random.choice(env.K, min(n_light_eval, env.K), replace=False)] = 1.0
-        obs_l = env._get_obs()
-        policy.eval()
-        with torch.no_grad():
-            for _ in range(env.ep_len):
-                obs_t = torch.tensor(obs_l, dtype=torch.float32, device=DEVICE).unsqueeze(0)
-                act_l, _, _, _ = policy.get_action(obs_t, deterministic=True)
-                obs_l, _, done_l, _ = env.step(act_l.item())
-                if done_l:
-                    break
-        light_idx = np.where(env.active_mask > 0.5)[0]
-        light_positions = [env.candidate_positions[i] for i in light_idx]
-        light_info = float(env._compute_info_reward())
-        print(f"  Config légère : {len(light_positions)} bouées | info={light_info:.3f}")
-
-        if len(light_positions) >= GNN_MIN:
-            # GNN sur config légère
-            corr_l  = b2.build_spatial_correlation(T, S, light_positions, n_timestamps=min(80, args.nt))
-            graph_l = b2.build_graph(light_positions, corr_l, corr_threshold=0.5, k_nearest=4, T=T, S=S)
-            tgts_l  = b2.compute_proxy_targets(light_positions, corr_l)
-            print(f"  Graphe léger : {len(light_positions)} nœuds, {graph_l['edge_index'].shape[1]} arêtes")
-            model_gnn_l = b2.train_gnn(gnn_ns, graph_l, tgts_l)
-            b2.analyze_network(model_gnn_l, graph_l, tgts_l, gnn_ns, T=T, label="rl_light")
-
-            # AE sur config légère
-            b1.plot_network_evaluation(model_ae, T, S, norm, ae_fig_ns,
-                                       positions=light_positions, n_samples=ae_ns.n_mc)
-            print(f"  ✓ Config légère évaluée : {len(light_positions)} bouées")
-
-            report_sections += [
-                "", "── CONFIG LÉGÈRE (N★/2) ─────────────────────────────────────────────",
-                f"  N bouées        : {len(light_positions)}",
-                f"  Score info      : {light_info:.3f}",
-            ]
-        else:
-            print(f"  [SKIP] Config légère trop petite ({len(light_positions)} < {GNN_MIN})")
-
+    # ── Rapport ───────────────────────────────────────────────────────────────
     total = time.time() - t0
     report_sections += _report_footer("pipeline", total, args, metrics, str(out))
     write_report(out / f"rapport_pipeline_{ts}.txt", report_sections)
@@ -508,86 +605,17 @@ def _run_pipeline(args, T, S, init_pos, b1, b2, b3,
 
 def _print_summary(mode, args, m_ae, m_gnn, m_rl, total):
     print(f"\n{'='*68}")
-    print(f"  ✓ {mode} terminé ({total:.0f}s)")
+    print(f"  ✓ Pipeline {mode}  ({total:.0f}s)")
     print(f"  seed_ocean={args.seed_ocean}  seed_buoys={args.seed_buoys}")
-    print(f"  AE  RMSE_val={m_ae['ae_rmse_val']:.4f} ({m_ae['ae_rmse_phys']:.3f} °C)")
-    print(f"  GNN {m_gnn['gnn_n_redondant']} redondants | score={m_gnn['gnn_score_mean']:.3f}")
-    print(f"  RL  [{m_rl.get('rl_method','pareto').upper()}] N★={m_rl['rl_n_star']} | "
-          f"info={m_rl['rl_info_star']:.3f} | perte {m_rl['rl_perte_pct']:.1f}%")
+    _ru = {"thetao": "°C", "so": "PSU", "uo": "m/s", "vo": "m/s"}
+    print(f"  AE  RMSE_val={m_ae['ae_rmse_val']:.4f} (normalisé) | par canal :")
+    for c, v in m_ae["ae_rmse_by_channel"].items():
+        print(f"        {c:<12} {v:8.4f} {_ru.get(c.rsplit('_z', 1)[0], '')}")
+    print(f"  GNN {m_gnn['gnn_n_redondant']} redondants | "
+          f"score moy={m_gnn['gnn_score_mean']:.3f}")
+    print(f"  RL  N★={m_rl['rl_n_star']} | info={m_rl['rl_info_star']:.3f} | "
+          f"légère N={m_rl['rl_n_light']} (perte {m_rl['rl_perte_pct']:.1f}%)")
     print(f"{'='*68}\n")
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  Main
-# ══════════════════════════════════════════════════════════════════════════════
-
-def main():
-    args   = parse_args()
-    t0     = time.time()
-    ts     = datetime.now().strftime("%Y%m%d_%H%M%S")
-    n_buoys = args.n_buoys or N_BUOYS
-
-    # Répertoire de sortie horodaté avec seeds
-    out = make_output_dir(base=args.output_dir, seed_ocean=args.seed_ocean,
-                          seed_buoys=args.seed_buoys, mode=args.mode)
-
-    # Seed globale
-    set_global_seed(args.seed_ocean)
-
-    print("=" * 68)
-    print(f"  OED-IA SNO Marins | mode={args.mode}")
-    print(f"  seed_ocean={args.seed_ocean}  seed_buoys={args.seed_buoys}  nt={args.nt}")
-    print("=" * 68)
-
-    # Nature run commun
-    print(f"\n{SEP}\n  Nature Run (seed={args.seed_ocean}, nt={args.nt})\n{SEP}")
-    gen  = SyntheticOceanGenerator()
-    T, S = gen.generate_dataset(nt=args.nt, seed=args.seed_ocean)
-    print(f"  T : {T.shape}  [{T.min():.2f}, {T.max():.2f}] °C")
-
-    rng      = np.random.default_rng(args.seed_buoys)
-    init_pos = [(int(rng.integers(0, NX)), int(rng.integers(0, NY))) for _ in range(n_buoys)]
-    print(f"  Réseau initial : {n_buoys} bouées (seed_buoys={args.seed_buoys})")
-
-    # Figure d'illustration océan + bouées
-    plot_ocean_overview(T, S, init_pos, str(out),
-                        seed_ocean=args.seed_ocean, seed_buoys=args.seed_buoys)
-
-    metrics = {"positions": init_pos}
-
-    # Chargement des briques
-    brick_dir = Path(__file__).parent
-    b1 = load_brick(brick_dir / "01_autoencoder.py")
-    b2 = load_brick(brick_dir / "02_gnn.py")
-    b3 = load_brick(brick_dir / "03_rl.py")
-
-    # Namespaces
-    ae_ns = types.SimpleNamespace(
-        epochs=args.ae_epochs, batch_size=8, lr=3e-4,
-        base_ch=args.ae_base_ch, latent_ch=32, cond_dim=16, dropout_p=0.15,
-        w_unobs=4.0, lambda_grad=0.5, huber_delta=0.5,
-        n_obs_min=10, n_obs_max=60, n_mc_val=3, n_mc=20,
-        output_dir=str(out), checkpoint=str(out / "ae_best.pt"),
-        seed_ocean=args.seed_ocean, seed_buoys=args.seed_buoys)
-
-    gnn_ns = types.SimpleNamespace(
-        gnn_epochs=args.gnn_epochs, output_dir=str(out), corr_threshold=0.5)
-
-    rl_ns = types.SimpleNamespace(
-        rl_steps=args.rl_steps, buffer_size=512, lr=3e-4, output_dir=str(out),
-        grid_x=args.rl_grid_x, grid_y=args.rl_grid_y,
-        n_min=args.rl_n_min, n_max=args.rl_n_max,
-        episode_len=args.rl_episode_len, w_info=1.0, w_budget=0.5,
-        gif_frames=args.gif_frames, rl_method=args.rl_method)
-
-    report_sections = _report_header(args.mode, args, T, init_pos, ts)
-
-    if args.mode == "individual":
-        _run_individual(args, T, S, init_pos, b1, b2, b3,
-                        ae_ns, gnn_ns, rl_ns, metrics, report_sections, out, ts, t0)
-    else:
-        _run_pipeline(args, T, S, init_pos, b1, b2, b3,
-                      ae_ns, gnn_ns, rl_ns, metrics, report_sections, out, ts, t0)
 
 
 if __name__ == "__main__":

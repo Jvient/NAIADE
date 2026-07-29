@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Outputs / résultats
+outputs/
+
+# Environnements locaux
+.env
+.venv/
+venv/
+
+# Cache données
+data/cache/

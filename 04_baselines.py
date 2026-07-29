@@ -1,39 +1,39 @@
 r"""
-╔══════════════════════════════════════════════════════════════════════════════╗
-║  NAIADE — Brique 4 : BASELINES de placement de capteurs                     ║
-║                                                                              ║
-║  Sans point de comparaison, un réseau proposé par RL n'est pas évaluable :   ║
-║  « info = 0.09 » ne dit rien tant qu'on ignore ce que donnerait un tirage    ║
-║  aléatoire. Ce module implémente quatre méthodes de référence et les compare ║
-║  au RL sur une métrique INDÉPENDANTE.                                        ║
-║                                                                              ║
-║  ── Le point méthodologique central ────────────────────────────────────────  ║
-║  Évaluer les baselines avec la récompense du MDP ferait gagner le RL par     ║
-║  construction : c'est la fonction qu'il a explicitement maximisée. On évalue ║
-║  donc tout le monde avec la RMSE de reconstruction de l'autoencodeur sur     ║
-║  les pixels NON OBSERVÉS — une métrique qu'aucune méthode n'a optimisée      ║
-║  directement. La récompense du MDP reste calculée à titre indicatif, pour    ║
-║  montrer justement l'écart entre les deux points de vue.                     ║
-║                                                                              ║
-║  ── Méthodes ──────────────────────────────────────────────────────────────  ║
-║  random    Tirage uniforme en mer. Le plancher. Répété n_repeat fois pour    ║
-║            obtenir une moyenne et un écart-type — un RL qui ne bat pas       ║
-║            random ± 1σ n'a rien appris.                                      ║
-║  variance  Les n pixels de plus forte variance temporelle. Piège classique : ║
-║            sans contrainte d'espacement, tous les capteurs s'agglutinent     ║
-║            dans la zone la plus active. On impose donc min_dist.             ║
-║  eof_qr    Placement optimal par pivots QR sur la base EOF                   ║
-║            (Manohar, Brunton, Kutz & Brunton 2018, IEEE Control Syst. Mag.). ║
-║            C'est LA référence du domaine pour le placement parcimonieux :    ║
-║            si NAIADE ne la bat pas, la salle le demandera.                   ║
-║  coverage  Échantillonnage du point le plus éloigné (farthest-point).        ║
-║            Baseline purement géométrique, souvent étonnamment solide.        ║
-║  rl        Réseau issu de la brique 3, chargé depuis rl_best.pt.             ║
-║                                                                              ║
-║  Usage :                                                                      ║
-║      python 04_baselines.py --checkpoint outputs/vae_best.pt \                ║
-║             --rl_checkpoint outputs/rl_best.pt --output_dir outputs           ║
-╚══════════════════════════════════════════════════════════════════════════════╝
+
+  NAIADE  Brique 4 : BASELINES de placement de capteurs                     
+                                                                              
+  Sans point de comparaison, un réseau proposé par RL n'est pas évaluable :   
+   info = 0.09  ne dit rien tant qu'on ignore ce que donnerait un tirage    
+  aléatoire. Ce module implémente quatre méthodes de référence et les compare 
+  au RL sur une métrique INDÉPENDANTE.                                        
+                                                                              
+   Le point méthodologique central   
+  Évaluer les baselines avec la récompense du MDP ferait gagner le RL par     
+  construction : c'est la fonction qu'il a explicitement maximisée. On évalue 
+  donc tout le monde avec la RMSE de reconstruction de l'autoencodeur sur     
+  les pixels NON OBSERVÉS  une métrique qu'aucune méthode n'a optimisée      
+  directement. La récompense du MDP reste calculée à titre indicatif, pour    
+  montrer justement l'écart entre les deux points de vue.                     
+                                                                              
+   Méthodes   
+  random    Tirage uniforme en mer. Le plancher. Répété n_repeat fois pour    
+            obtenir une moyenne et un écart-type  un RL qui ne bat pas       
+            random  1σ n'a rien appris.                                      
+  variance  Les n pixels de plus forte variance temporelle. Piège classique : 
+            sans contrainte d'espacement, tous les capteurs s'agglutinent     
+            dans la zone la plus active. On impose donc min_dist.             
+  eof_qr    Placement optimal par pivots QR sur la base EOF                   
+            (Manohar, Brunton, Kutz & Brunton 2018, IEEE Control Syst. Mag.). 
+            C'est LA référence du domaine pour le placement parcimonieux :    
+            si NAIADE ne la bat pas, la salle le demandera.                   
+  coverage  Échantillonnage du point le plus éloigné (farthest-point).        
+            Baseline purement géométrique, souvent étonnamment solide.        
+  rl        Réseau issu de la brique 3, chargé depuis rl_best.pt.             
+                                                                              
+  Usage :                                                                      
+      python 04_baselines.py --checkpoint outputs/vae_best.pt \                
+             --rl_checkpoint outputs/rl_best.pt --output_dir outputs           
+
 """
 
 import argparse
@@ -55,9 +55,9 @@ from data.dataset import BuoySampler
 UNITS = {"thetao": "°C", "so": "PSU", "uo": "m/s", "vo": "m/s"}
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# 
 #  Utilitaires
-# ══════════════════════════════════════════════════════════════════════════════
+# 
 
 def _sea_indices(sea_mask):
     xs, ys = np.where(sea_mask)
@@ -71,7 +71,7 @@ def _greedy_with_spacing(order, idx, n, min_dist):
 
     Sans cette contrainte, les méthodes gloutonnes basées sur un score local
     (variance notamment) sélectionnent n pixels voisins dans le même tourbillon :
-    le réseau est formellement « optimal » et pratiquement inutilisable.
+    le réseau est formellement  optimal  et pratiquement inutilisable.
     """
     chosen = []
     for i in order:
@@ -91,9 +91,9 @@ def _greedy_with_spacing(order, idx, n, min_dist):
     return [(int(p[0]), int(p[1])) for p in chosen]
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# 
 #  Méthodes de placement
-# ══════════════════════════════════════════════════════════════════════════════
+# 
 
 def place_random(fields, sea_mask, n, rng=None, min_dist=0):
     """Tirage uniforme parmi les pixels océaniques."""
@@ -108,7 +108,7 @@ def place_variance(fields, sea_mask, n, min_dist=MIN_BUOY_DIST,
 
     La variance est calculée sur les canaux NORMALISÉS puis moyennée : sinon
     la température (O(0.1) en °C²) écrase totalement les courants (O(1e-4)
-    en m²/s²) et le critère se réduit à « où la SST bouge le plus ».
+    en m²/s²) et le critère se réduit à  où la SST bouge le plus .
     """
     F = fields
     if observed_only:
@@ -135,19 +135,19 @@ def _chan_var(i):
 
 def place_eof_qr(fields, sea_mask, n, n_modes=None):
     """
-    Placement par pivots QR sur la base EOF — Manohar et al. (2018).
+    Placement par pivots QR sur la base EOF  Manohar et al. (2018).
 
     Principe
     --------
-    1. Matrice d'états X : (n_pixels_mer, nt · n_canaux_observés), centrée.
-    2. SVD → U, base spatiale (EOF/POD).
+    1. Matrice d'états X : (n_pixels_mer, nt  n_canaux_observés), centrée.
+    2. SVD  U, base spatiale (EOF/POD).
     3. QR avec pivotage de colonnes sur Uᵣᵀ : les r premiers pivots sont les
        lignes (donc les pixels) qui rendent la sous-matrice la mieux
-       conditionnée — c'est-à-dire les capteurs qui reconstruisent le mieux
+       conditionnée  c'est-à-dire les capteurs qui reconstruisent le mieux
        le champ dans le sous-espace dominant.
 
     Sur-échantillonnage : quand n > r, on pivote sur UᵣUᵣᵀ, comme dans
-    l'article. C'est la référence standard du domaine — la baseline à battre.
+    l'article. C'est la référence standard du domaine  la baseline à battre.
     """
     from scipy.linalg import qr
 
@@ -183,7 +183,7 @@ def place_coverage(fields, sea_mask, n, rng=None):
 
     Baseline purement géométrique : aucune information sur la physique, juste
     une couverture spatiale maximale. Elle est fréquemment difficile à battre,
-    ce qui en fait un test exigeant — si le RL ne la dépasse pas, c'est qu'il
+    ce qui en fait un test exigeant  si le RL ne la dépasse pas, c'est qu'il
     n'exploite pas la dynamique du champ.
     """
     rng = np.random.default_rng(rng)
@@ -216,22 +216,28 @@ def load_rl_positions(rl_checkpoint, fields, sea_mask, args):
         raise ValueError(
             f"\n  active_mask de taille {len(mask)} mais {len(cands)} candidats "
             f"reconstruits avec grid_x={args.grid_x}, grid_y={args.grid_y}."
-            f"\n  → relancer avec les MÊMES --grid_x / --grid_y que la brique 3.")
+            f"\n   relancer avec les MÊMES --grid_x / --grid_y que la brique 3.")
     return [cands[i] for i in np.where(mask > 0.5)[0]]
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  Évaluation — métrique indépendante
-# ══════════════════════════════════════════════════════════════════════════════
+# 
+#  Évaluation  métrique indépendante
+# 
 
 @torch.no_grad()
 def evaluate_positions(model, fields_n, positions, sea_mask, channels, std,
-                       obs_idx, noise_norm, t_indices, n_mc=8):
+                       obs_idx, noise_norm, t_indices, n_mc=8, eval_idx=None):
     """
     RMSE de reconstruction sur les pixels NON OBSERVÉS et EN MER.
 
-    `fields_n` doit déjà être normalisé avec les statistiques du modèle.
-    Renvoie un dict {canal: rmse_physique} + la RMSE agrégée normalisée.
+    `eval_idx` : indices des canaux entrant dans le SCORE AGRÉGÉ. None = tous.
+        C'est le levier clé de l'analyse par variable : sur un champ de surface
+        spatialement cohérent, la RMSE agrégée sur tous les canaux est plate
+        (le placement importe peu). En restreignant le score aux courants
+        (uo/vo)  la variable réellement sous-contrainte par un réseau T/S 
+        on teste si le placement discrimine là où ça compte.
+
+    Renvoie ({canal: rmse_physique}, score_agrégé_normalisé_sur_eval_idx).
     """
     mask = np.zeros((NX, NY), dtype=np.float32)
     for (x, y) in positions:
@@ -255,26 +261,27 @@ def evaluate_positions(model, fields_n, positions, sea_mask, channels, std,
         denom += float(w.sum().item())
 
     rmse_n = (sq / max(denom, 1.0)).sqrt().cpu().numpy()
+    agg_idx = list(range(len(channels))) if eval_idx is None else eval_idx
     return ({c: float(rmse_n[i] * std[i]) for i, c in enumerate(channels)},
-            float(np.mean(rmse_n)))
+            float(np.mean(rmse_n[agg_idx])))
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# 
 #  Comparaison
-# ══════════════════════════════════════════════════════════════════════════════
+# 
 
 def run_comparison(args):
     print("=" * 70)
-    print("  Brique 4 — Baselines de placement de capteurs")
+    print("  Brique 4  Baselines de placement de capteurs")
     print("=" * 70)
 
-    # ── Données ──────────────────────────────────────────────────────────────
+    #  Données 
     fields, channels, sea_mask, data_info = load_ocean(args)
     global _CHANNELS_CACHE
     _CHANNELS_CACHE = list(channels)
     print(f"\n  {data_info['source']} | {fields.shape} | canaux={channels}")
 
-    # ── Modèle AE (métrique d'évaluation) ────────────────────────────────────
+    #  Modèle AE (métrique d'évaluation) 
     ck = torch.load(args.checkpoint, map_location=DEVICE, weights_only=False)
     sys.path.insert(0, str(Path(__file__).parent))
     import importlib.util
@@ -291,7 +298,7 @@ def run_comparison(args):
     model.eval()
 
     if "stats" not in ck:
-        raise KeyError("Le checkpoint AE ne contient pas 'stats' — "
+        raise KeyError("Le checkpoint AE ne contient pas 'stats'  "
                        "réentraîner la brique 1 après la migration.")
     mean = np.asarray(ck["stats"]["mean"], dtype=np.float32)
     std = np.asarray(ck["stats"]["std"], dtype=np.float32)
@@ -306,11 +313,11 @@ def run_comparison(args):
     rng_eval = np.random.default_rng(args.seed_eval)
     t_idx = rng_eval.choice(len(fields), min(args.n_eval, len(fields)),
                             replace=False)
-    print(f"  Évaluation : {len(t_idx)} dates × {args.n_mc} passes MC-Dropout")
+    print(f"  Évaluation : {len(t_idx)} dates  {args.n_mc} passes MC-Dropout")
     print(f"  Métrique   : RMSE de reconstruction AE sur pixels non observés")
     print(f"               (indépendante de la récompense du MDP)\n")
 
-    # ── Réseau RL, s'il existe ───────────────────────────────────────────────
+    #  Réseau RL, s'il existe 
     rl_positions = None
     if args.rl_checkpoint and Path(args.rl_checkpoint).exists():
         try:
@@ -318,7 +325,7 @@ def run_comparison(args):
                                              sea_mask, args)
             print(f"  Réseau RL chargé : {len(rl_positions)} bouées")
         except Exception as e:
-            print(f"  ⚠ Réseau RL non chargé : {e}")
+            print(f"   Réseau RL non chargé : {e}")
 
     n_list = sorted(set(args.n_sensors))
     if rl_positions and len(rl_positions) not in n_list:
@@ -326,9 +333,24 @@ def run_comparison(args):
 
     results = {}
 
+    #  Canaux entrant dans le score agrégé du verdict 
+    if args.eval_channels:
+        eval_idx = [channels.index(c) for c in args.eval_channels
+                    if c in channels]
+        missing = [c for c in args.eval_channels if c not in channels]
+        if missing:
+            raise ValueError(f"Canaux inconnus : {missing}. "
+                             f"Disponibles : {channels}")
+        print(f"  Score agrégé restreint aux canaux : {args.eval_channels}")
+        print(f"               (les autres restent affichés mais ne comptent "
+              f"pas dans le verdict)\n")
+    else:
+        eval_idx = None
+
     def _eval(pos):
         return evaluate_positions(model, fields_n, pos, sea_mask, channels,
-                                  std, obs_idx, noise_norm, t_idx, args.n_mc)
+                                  std, obs_idx, noise_norm, t_idx, args.n_mc,
+                                  eval_idx=eval_idx)
 
     def _eval_repeated(pos, k):
         """
@@ -337,8 +359,8 @@ def run_comparison(args):
         Les positions sont déterministes, mais l'évaluation ne l'est pas :
         MC-Dropout et bruit d'observation sont tirés à chaque passe. Sans
         cette dispersion, on compare des méthodes déterministes à un chiffre
-        unique et on conclut sur des écarts qui ne sortent pas du bruit —
-        typiquement, un « le RL gagne de 1 % » qui ne veut rien dire.
+        unique et on conclut sur des écarts qui ne sortent pas du bruit 
+        typiquement, un  le RL gagne de 1 %  qui ne veut rien dire.
         """
         rs, aggs = [], []
         for _ in range(k):
@@ -348,10 +370,10 @@ def run_comparison(args):
                 float(np.mean(aggs)), float(np.std(aggs)))
 
     for n in n_list:
-        print(f"  ── N = {n} capteurs " + "─" * 40)
+        print(f"   N = {n} capteurs " + "" * 40)
         entry = {}
 
-        # random : moyenne ± écart-type sur n_repeat tirages
+        # random : moyenne  écart-type sur n_repeat tirages
         rs, aggs = [], []
         for k in range(args.n_repeat):
             pos = place_random(fields, sea_mask, n, rng=1000 + k,
@@ -364,7 +386,7 @@ def run_comparison(args):
             "agg": float(np.mean(aggs)), "agg_std": float(np.std(aggs)),
             "n": n}
         print(f"    random    agg={entry['random']['agg']:.4f} "
-              f"± {entry['random']['agg_std']:.4f}  (n={args.n_repeat} tirages)")
+              f" {entry['random']['agg_std']:.4f}  (n={args.n_repeat} tirages)")
 
         for name, fn in [("variance", place_variance),
                          ("eof_qr", place_eof_qr),
@@ -374,7 +396,7 @@ def run_comparison(args):
                 r, a, sd = _eval_repeated(pos, args.n_eval_repeat)
                 entry[name] = {"rmse": r, "agg": a, "agg_std": sd, "n": n,
                                "positions": [list(p) for p in pos]}
-                print(f"    {name:<9} agg={a:.4f} ± {sd:.4f}")
+                print(f"    {name:<9} agg={a:.4f}  {sd:.4f}")
             except Exception as e:
                 print(f"    {name:<9} échec : {e}")
 
@@ -382,15 +404,15 @@ def run_comparison(args):
             r, a, sd = _eval_repeated(rl_positions, args.n_eval_repeat)
             entry["rl"] = {"rmse": r, "agg": a, "agg_std": sd, "n": n,
                            "positions": [list(p) for p in rl_positions]}
-            print(f"    rl        agg={a:.4f} ± {sd:.4f}")
+            print(f"    rl        agg={a:.4f}  {sd:.4f}")
 
         results[str(n)] = entry
 
-    # ── Verdict ──────────────────────────────────────────────────────────────
+    #  Verdict 
     print("\n" + "=" * 70)
     print("  VERDICT")
     print("=" * 70)
-    _verdict(results, channels, rl_positions)
+    _verdict(results, channels, rl_positions, args.eval_channels)
 
     out = Path(args.output_dir); out.mkdir(parents=True, exist_ok=True)
     with open(out / "baselines_comparison.json", "w") as f:
@@ -398,13 +420,13 @@ def run_comparison(args):
                    "data_info": data_info,
                    "metric": "AE reconstruction RMSE on unobserved sea pixels",
                    "n_eval": len(t_idx), "n_mc": args.n_mc}, f, indent=2)
-    print(f"\n  JSON → {out}/baselines_comparison.json")
+    print(f"\n  JSON  {out}/baselines_comparison.json")
 
-    _plot(results, channels, out, data_info)
+    _plot(results, channels, out, data_info, args.eval_channels)
     return results
 
 
-def _verdict(results, channels, rl_positions):
+def _verdict(results, channels, rl_positions, eval_channels=None):
     """Compare le RL aux baselines et tranche explicitement."""
     for n, entry in results.items():
         if "rl" not in entry:
@@ -415,16 +437,16 @@ def _verdict(results, channels, rl_positions):
                   if k not in ("random", "rl")}
 
         print(f"\n  N = {n} capteurs")
-        print(f"    RL vs aléatoire : {rl:.4f} vs {rnd:.4f} ± {rnd_sd:.4f}")
+        print(f"    RL vs aléatoire : {rl:.4f} vs {rnd:.4f}  {rnd_sd:.4f}")
         if rl < rnd - rnd_sd:
             gain = 100 * (rnd - rl) / rnd
-            print(f"      ✓ le RL bat l'aléatoire de {gain:.1f} % "
+            print(f"       le RL bat l'aléatoire de {gain:.1f} % "
                   f"(au-delà de 1σ)")
         elif rl < rnd:
             print("      ~ le RL est meilleur mais DANS le bruit du tirage "
-                  "aléatoire — non concluant")
+                  "aléatoire  non concluant")
         else:
-            print("      ✗ le RL ne bat PAS un tirage aléatoire")
+            print("       le RL ne bat PAS un tirage aléatoire")
 
         if others:
             best = min(others, key=others.get)
@@ -434,20 +456,20 @@ def _verdict(results, channels, rl_positions):
             # Incertitude combinée des deux mesures
             comb = float(np.sqrt(b_sd**2 + rl_sd**2))
             print(f"    Meilleure baseline : {best} "
-                  f"({b_val:.4f} ± {b_sd:.4f})")
+                  f"({b_val:.4f}  {b_sd:.4f})")
             diff = b_val - rl
             if diff > comb:
-                print(f"      ✓ le RL la dépasse de {100*diff/b_val:.1f} % "
+                print(f"       le RL la dépasse de {100*diff/b_val:.1f} % "
                       f"(écart {diff:.4f} > incertitude combinée {comb:.4f})")
             elif diff > 0:
                 print(f"      ~ le RL est devant de {100*diff/b_val:.1f} % mais "
                       f"l'écart ({diff:.4f}) est INFÉRIEUR à l'incertitude "
                       f"combinée ({comb:.4f})")
-                print(f"        → statistiquement non concluant : ne pas "
+                print(f"         statistiquement non concluant : ne pas "
                       f"présenter cet écart comme un gain")
             else:
-                print(f"      ✗ {best} reste meilleure que le RL de "
-                      f"{100*(-diff)/rl:.1f} % — "
+                print(f"       {best} reste meilleure que le RL de "
+                      f"{100*(-diff)/rl:.1f} %  "
                       f"c'est le résultat à expliquer, pas à cacher")
 
     if not any("rl" in e for e in results.values()):
@@ -455,7 +477,7 @@ def _verdict(results, channels, rl_positions):
         print("  ou vérifier --grid_x / --grid_y.")
 
 
-def _plot(results, channels, out, data_info):
+def _plot(results, channels, out, data_info, eval_channels=None):
     methods = ["random", "variance", "eof_qr", "coverage", "rl"]
     labels = {"random": "Aléatoire", "variance": "Variance max",
               "eof_qr": "EOF + pivots QR", "coverage": "Couverture",
@@ -509,17 +531,19 @@ def _plot(results, channels, out, data_info):
         ax.tick_params(colors="white"); ax.set_facecolor("#050d1a")
         ax.grid(alpha=0.2)
 
-    fig.suptitle("Placement de capteurs — NAIADE vs baselines\n"
-                 "métrique : RMSE de reconstruction AE sur pixels non observés",
+    scope = (f"score agrégé sur {eval_channels}" if eval_channels
+             else "score agrégé sur tous les canaux")
+    fig.suptitle("Placement de capteurs  NAIADE vs baselines\n"
+                 f"métrique : RMSE de reconstruction AE sur pixels non observés  {scope}",
                  color="white", fontweight="bold")
     fig.tight_layout()
     fig.savefig(out / "baselines_comparison.png", dpi=140,
                 facecolor=BG, bbox_inches="tight")
     plt.close()
-    print(f"  Figure → {out}/baselines_comparison.png")
+    print(f"  Figure  {out}/baselines_comparison.png")
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# 
 
 def parse_args():
     p = argparse.ArgumentParser(description="Baselines de placement de capteurs")
@@ -529,13 +553,17 @@ def parse_args():
     p.add_argument("--n_sensors", type=int, nargs="+",
                    default=[5, 10, 20, 30, 40])
     p.add_argument("--n_repeat", type=int, default=10,
-                   help="Tirages aléatoires pour la moyenne ± écart-type")
+                   help="Tirages aléatoires pour la moyenne  écart-type")
     p.add_argument("--n_eval", type=int, default=20, help="Dates d'évaluation")
     p.add_argument("--n_eval_repeat", type=int, default=4,
                    help="Répétitions d'évaluation des méthodes déterministes, "
                         "pour obtenir une barre d'erreur")
     p.add_argument("--n_mc", type=int, default=8)
     p.add_argument("--seed_eval", type=int, default=123)
+    p.add_argument("--eval_channels", type=str, nargs="+", default=None,
+                   help="Restreint le score agrégé à ces canaux "
+                        "(ex. uo_z0 vo_z0). Défaut : tous. Permet de tester si "
+                        "le placement discrimine sur la variable difficile.")
     p.add_argument("--grid_x", type=int, default=16)
     p.add_argument("--grid_y", type=int, default=24)
     p.add_argument("--nt", type=int, default=None)
@@ -546,3 +574,4 @@ def parse_args():
 
 if __name__ == "__main__":
     run_comparison(parse_args())
+

@@ -655,22 +655,13 @@ implements.
 
 ```bibtex
 @software{naiade,
-  author  = {<Author>},
+  author  = {JM.VIENT},
   title   = {NAIADE: AI methods for Optimal Experimental Design
              of marine observing networks},
   year    = {2026},
   url     = {https://github.com/Jvient/NAIADE}
 }
 
-@techreport{oed_ia_sno_marins,
-  author      = {<Author>},
-  title       = {Conception et optimisation des réseaux d'observation :
-                 méthodologies IA pour l'Optimal Experimental Design.
-                 Application aux SNO marins MOOSE, PIRATA, COOL/OISO},
-  institution = {CNRS-INSU},
-  type        = {Proposition — feuille de route INSU, domaines OA, SIC, TS},
-  year        = {2026}
-}
 ```
 
 ---

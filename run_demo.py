@@ -56,6 +56,13 @@ def parse_args():
     p.add_argument("--rl_episode_len", type=int, default=20)
     p.add_argument("--gif_frames",  type=int, default=40)
     p.add_argument("--output_dir",  type=str, default="outputs")
+    # Source de données
+    p.add_argument("--data",        choices=["synthetic", "glorys"],
+                   default="synthetic",
+                   help="Nature run : synthétique ou GLORYS12 prétraité")
+    p.add_argument("--glorys_cache", type=str, default="data/glorys_cache")
+    p.add_argument("--time_step",   type=int, default=3,
+                   help="Sous-échantillonnage temporel des splits GLORYS")
     return p.parse_args()
 
 
@@ -142,10 +149,25 @@ def plot_ocean_overview(T, S, positions, out_dir, seed_ocean=42, seed_buoys=7):
 
 def _train_ae_quick(b1, T, S, args, ae_ns):
     """Entraînement AE minimal."""
-    train_ds, val_ds = build_datasets(T, S, split=0.8,
-                                      n_obs_min=ae_ns.n_obs_min,
-                                      n_obs_max=ae_ns.n_obs_max,
-                                      augment_train=True)
+    glorys  = getattr(args, "_glorys", None)
+    ocean_t = None
+    if glorys is not None:
+        from dataset_glorys import GlorysOEDDataset, identity_norm
+        train_ds = GlorysOEDDataset(glorys, "train",
+                                    n_obs_min=ae_ns.n_obs_min,
+                                    n_obs_max=ae_ns.n_obs_max,
+                                    step=args.time_step)
+        val_ds   = GlorysOEDDataset(glorys, "val",
+                                    n_obs_min=ae_ns.n_obs_min,
+                                    n_obs_max=ae_ns.n_obs_max,
+                                    step=args.time_step)
+        ocean_t  = glorys.ocean_torch(DEVICE)
+        print(f"  Datasets GLORYS : train {len(train_ds)} j | val {len(val_ds)} j")
+    else:
+        train_ds, val_ds = build_datasets(T, S, split=0.8,
+                                          n_obs_min=ae_ns.n_obs_min,
+                                          n_obs_max=ae_ns.n_obs_max,
+                                          augment_train=True)
     loader = DataLoader(train_ds, batch_size=8, shuffle=True)
     val_ld = DataLoader(val_ds,   batch_size=8, shuffle=False)
     model  = b1.ObservabilityAE(
@@ -170,7 +192,7 @@ def _train_ae_quick(b1, T, S, args, ae_ns):
         for x, y, mask in loader:
             x, y, mask = x.to(DEVICE), y.to(DEVICE), mask.to(DEVICE)
             pred, z, aux = model(x)
-            loss, l_rec, l_aux = crit(pred, y, mask, aux_preds=aux)
+            loss, l_rec, l_aux = crit(pred, y, mask, aux_preds=aux, ocean=ocean_t)
             optim.zero_grad(); loss.backward(); optim.step()
             ep_loss += loss.item()
             ep_aux += l_aux.item()
@@ -190,7 +212,9 @@ def _train_ae_quick(b1, T, S, args, ae_ns):
                     sq = (pm - yv) ** 2
                     for b in range(xv.shape[0]):
                         n_obs_b = int(mv[b].sum().item())
-                        rmse_b = float(torch.sqrt((sq[b] * (1 - mv[b])).mean()).item())
+                        w = (1 - mv[b]) if ocean_t is None else (1 - mv[b]) * ocean_t[0]
+                        rmse_b = float(torch.sqrt(
+                            (sq[b] * w).sum() / (w.sum() * sq.shape[1] + 1e-9)).item())
                         rmses_all.append(rmse_b)
                         if n_obs_b < 20: rmse_by_d["sparse"].append(rmse_b)
                         elif n_obs_b < 50: rmse_by_d["medium"].append(rmse_b)
@@ -213,12 +237,18 @@ def _train_ae_quick(b1, T, S, args, ae_ns):
             preds = torch.stack([model(x)[0] for _ in range(ae_ns.n_mc_val)])
             pm = preds.mean(0)
             for b in range(x.shape[0]):
-                rmses.append(float(torch.sqrt(((pm[b] - y[b])**2 * (1 - mask[b])).mean()).item()))
+                w = (1 - mask[b]) if ocean_t is None else (1 - mask[b]) * ocean_t[0]
+                rmses.append(float(torch.sqrt(
+                    (((pm[b] - y[b])**2) * w).sum() / (w.sum() * pm.shape[1] + 1e-9)).item()))
 
     val_rmse = float(np.mean(rmses))
     elapsed  = round(time.time() - t0, 1)
-    norm = {"T_mean": float(T.mean()), "T_std": float(T.std()),
-            "S_mean": float(S.mean()), "S_std": float(S.std())}
+    if glorys is not None:
+        from dataset_glorys import identity_norm
+        norm = identity_norm(glorys)
+    else:
+        norm = {"T_mean": float(T.mean()), "T_std": float(T.std()),
+                "S_mean": float(S.mean()), "S_std": float(S.std())}
     torch.save({"model_state": model.state_dict(), "args": vars(ae_ns), "norm": norm},
                Path(ae_ns.output_dir) / "ae_best.pt")
     return model, norm, best_loss, val_rmse, elapsed
@@ -305,12 +335,19 @@ def _run_individual(args, T, S, positions, b1, b2, b3,
     ae_fig_ns = types.SimpleNamespace(**vars(ae_ns), figures=True)
     ae_fig_ns.output_dir = str(out)
     model_ae.eval()
-    b1.plot_network_evaluation(model_ae, T, S, norm, ae_fig_ns, positions=positions, n_samples=ae_ns.n_mc)
-    b1.plot_uncertainty_maps(model_ae, T, S, norm, ae_fig_ns, n_samples=ae_ns.n_mc)
+    glorys = getattr(args, "_glorys", None)
+    if glorys is not None:   # figures sur le split val (pas les données train)
+        T_fig, S_fig = glorys.get_arrays("val", ("T", "S"), normalized=True,
+                                         step=args.time_step)
+        phys_std = norm["phys"]["T"]["std"]
+    else:
+        T_fig, S_fig, phys_std = T, S, float(T.std())
+    b1.plot_network_evaluation(model_ae, T_fig, S_fig, norm, ae_fig_ns, positions=positions, n_samples=ae_ns.n_mc)
+    b1.plot_uncertainty_maps(model_ae, T_fig, S_fig, norm, ae_fig_ns, n_samples=ae_ns.n_mc)
     m_ae = {"ae_best_loss": float(best_loss), "ae_rmse_val": val_rmse,
-            "ae_rmse_phys": val_rmse * float(T.std()), "ae_time": ae_time}
+            "ae_rmse_phys": val_rmse * phys_std, "ae_time": ae_time}
     metrics.update(m_ae); report_sections += _report_ae(m_ae)
-    print(f"  ✓ AE RMSE_val={val_rmse:.4f} ({val_rmse*T.std():.3f} °C) [{ae_time}s]")
+    print(f"  ✓ AE RMSE_val={val_rmse:.4f} ({val_rmse*phys_std:.3f} °C) [{ae_time}s]")
 
     # Brique 2 — GNN
     print(f"\n{SEP}\n  BRIQUE 2 — GNN Structure\n{SEP}")
@@ -335,7 +372,8 @@ def _run_individual(args, T, S, positions, b1, b2, b3,
     print(f"\n{SEP}\n  BRIQUE 3 — RL [{rl_ns.rl_method.upper()}]\n{SEP}")
     t0_rl = time.time()
     env   = b3.OceanNetworkEnv(T, S, grid_x=rl_ns.grid_x, grid_y=rl_ns.grid_y,
-                                n_min=rl_ns.n_min, n_max=rl_ns.n_max, episode_len=rl_ns.episode_len)
+                                n_min=rl_ns.n_min, n_max=rl_ns.n_max, episode_len=rl_ns.episode_len,
+                                ocean_mask=getattr(args, "_ocean", None))
     policy, _ = b3.train_ppo(rl_ns, env)
     pts, n_star = b3.run_rl_method(env, policy, rl_ns)
     b3.visualize_two_configs(env, n_star, policy, rl_ns)
@@ -372,7 +410,8 @@ def _run_pipeline(args, T, S, init_pos, b1, b2, b3,
     print(f"\n{SEP}\n  ÉTAPE 1/3 — RL [{rl_ns.rl_method.upper()}]\n{SEP}")
     t0_rl = time.time()
     env    = b3.OceanNetworkEnv(T, S, grid_x=rl_ns.grid_x, grid_y=rl_ns.grid_y,
-                                 n_min=rl_ns.n_min, n_max=rl_ns.n_max, episode_len=rl_ns.episode_len)
+                                 n_min=rl_ns.n_min, n_max=rl_ns.n_max, episode_len=rl_ns.episode_len,
+                                 ocean_mask=getattr(args, "_ocean", None))
     policy, _ = b3.train_ppo(rl_ns, env)
     pts, n_star = b3.run_rl_method(env, policy, rl_ns)
 
@@ -445,10 +484,17 @@ def _run_pipeline(args, T, S, init_pos, b1, b2, b3,
     ae_fig_ns = types.SimpleNamespace(**vars(ae_ns), figures=True)
     ae_fig_ns.output_dir = str(out)
     model_ae.eval()
-    b1.plot_network_evaluation(model_ae, T, S, norm, ae_fig_ns, positions=rl_positions, n_samples=ae_ns.n_mc)
-    b1.plot_uncertainty_maps(model_ae, T, S, norm, ae_fig_ns, n_samples=ae_ns.n_mc)
+    glorys = getattr(args, "_glorys", None)
+    if glorys is not None:   # figures sur le split val (pas les données train)
+        T_fig, S_fig = glorys.get_arrays("val", ("T", "S"), normalized=True,
+                                         step=args.time_step)
+        phys_std = norm["phys"]["T"]["std"]
+    else:
+        T_fig, S_fig, phys_std = T, S, float(T.std())
+    b1.plot_network_evaluation(model_ae, T_fig, S_fig, norm, ae_fig_ns, positions=rl_positions, n_samples=ae_ns.n_mc)
+    b1.plot_uncertainty_maps(model_ae, T_fig, S_fig, norm, ae_fig_ns, n_samples=ae_ns.n_mc)
     m_ae = {"ae_best_loss": float(best_loss), "ae_rmse_val": val_rmse,
-            "ae_rmse_phys": val_rmse * float(T.std()), "ae_time": ae_time}
+            "ae_rmse_phys": val_rmse * phys_std, "ae_time": ae_time}
     metrics.update(m_ae); report_sections += _report_ae(m_ae)
 
     # ── Optionnel : évaluation config légère (N★/2) avec GNN + AE ────────
@@ -484,7 +530,7 @@ def _run_pipeline(args, T, S, init_pos, b1, b2, b3,
             b2.analyze_network(model_gnn_l, graph_l, tgts_l, gnn_ns, T=T, label="rl_light")
 
             # AE sur config légère
-            b1.plot_network_evaluation(model_ae, T, S, norm, ae_fig_ns,
+            b1.plot_network_evaluation(model_ae, T_fig, S_fig, norm, ae_fig_ns,
                                        positions=light_positions, n_samples=ae_ns.n_mc)
             print(f"  ✓ Config légère évaluée : {len(light_positions)} bouées")
 
@@ -540,13 +586,30 @@ def main():
     print("=" * 68)
 
     # Nature run commun
-    print(f"\n{SEP}\n  Nature Run (seed={args.seed_ocean}, nt={args.nt})\n{SEP}")
-    gen  = SyntheticOceanGenerator()
-    T, S = gen.generate_dataset(nt=args.nt, seed=args.seed_ocean)
-    print(f"  T : {T.shape}  [{T.min():.2f}, {T.max():.2f}] °C")
-
-    rng      = np.random.default_rng(args.seed_buoys)
-    init_pos = [(int(rng.integers(0, NX)), int(rng.integers(0, NY))) for _ in range(n_buoys)]
+    global NX, NY
+    glorys = None
+    ocean  = None
+    if args.data == "glorys":
+        from dataset_glorys import GlorysData, sample_ocean_positions
+        print(f"\n{SEP}\n  Nature Run GLORYS12 (cache={args.glorys_cache})\n{SEP}")
+        glorys = GlorysData(args.glorys_cache)
+        NX, NY = glorys.nlat, glorys.nlon
+        ocean  = glorys.ocean.astype(np.float32)
+        # Briques 2/3 : anomalies normalisées du split TRAIN ;
+        # figures AE : split VAL (pas de fuite d'évaluation).
+        T, S = glorys.get_arrays("train", ("T", "S"), normalized=True,
+                                 step=args.time_step)
+        print(f"  T : {T.shape} (anomalies normalisées, split train, "
+              f"step={args.time_step}) | océan {100*ocean.mean():.1f} %")
+        rng      = np.random.default_rng(args.seed_buoys)
+        init_pos = sample_ocean_positions(ocean, n_buoys, rng=rng)
+    else:
+        print(f"\n{SEP}\n  Nature Run (seed={args.seed_ocean}, nt={args.nt})\n{SEP}")
+        gen  = SyntheticOceanGenerator()
+        T, S = gen.generate_dataset(nt=args.nt, seed=args.seed_ocean)
+        print(f"  T : {T.shape}  [{T.min():.2f}, {T.max():.2f}] °C")
+        rng      = np.random.default_rng(args.seed_buoys)
+        init_pos = [(int(rng.integers(0, NX)), int(rng.integers(0, NY))) for _ in range(n_buoys)]
     print(f"  Réseau initial : {n_buoys} bouées (seed_buoys={args.seed_buoys})")
 
     # Figure d'illustration océan + bouées
@@ -555,11 +618,17 @@ def main():
 
     metrics = {"positions": init_pos}
 
-    # Chargement des briques
+    # Chargement des briques + propagation de la source de données
     brick_dir = Path(__file__).parent
     b1 = load_brick(brick_dir / "01_autoencoder.py")
     b2 = load_brick(brick_dir / "02_gnn.py")
     b3 = load_brick(brick_dir / "03_rl.py")
+    if glorys is not None:
+        for b in (b1, b2, b3):
+            b.NX, b.NY = NX, NY
+            b.OCEAN    = ocean
+            b.GLORYS   = glorys
+    args._glorys, args._ocean = glorys, ocean
 
     # Namespaces
     ae_ns = types.SimpleNamespace(
@@ -568,7 +637,9 @@ def main():
         w_unobs=4.0, lambda_grad=0.5, huber_delta=0.5,
         n_obs_min=10, n_obs_max=60, n_mc_val=3, n_mc=20,
         output_dir=str(out), checkpoint=str(out / "ae_best.pt"),
-        seed_ocean=args.seed_ocean, seed_buoys=args.seed_buoys)
+        seed_ocean=args.seed_ocean, seed_buoys=args.seed_buoys,
+        data=args.data, glorys_cache=args.glorys_cache,
+        time_step=args.time_step)
 
     gnn_ns = types.SimpleNamespace(
         gnn_epochs=args.gnn_epochs, output_dir=str(out), corr_threshold=0.5)

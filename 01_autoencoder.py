@@ -39,6 +39,54 @@ except ModuleNotFoundError:
 
 
 # =============================================================================
+#  SOURCE DE DONNÉES — synthétique (défaut) ou GLORYS12 (--data glorys)
+# =============================================================================
+# En mode GLORYS, NX/NY (globaux du module) prennent la taille de la grille
+# réelle et OCEAN devient le masque océan (float 0/1). Toutes les fonctions du
+# module lisent ces globaux à l'appel — le reste du code est inchangé.
+
+OCEAN = None          # np.ndarray (NX, NY) en mode glorys, sinon None
+GLORYS = None         # objet GlorysData en mode glorys, sinon None
+
+
+def setup_data_source(args):
+    """Configure la source de données du module. Retourne GlorysData ou None."""
+    global NX, NY, OCEAN, GLORYS
+    if getattr(args, "data", "synthetic") == "glorys":
+        from dataset_glorys import GlorysData
+        GLORYS = GlorysData(getattr(args, "glorys_cache", "data/glorys_cache"))
+        NX, NY = GLORYS.nlat, GLORYS.nlon
+        OCEAN = GLORYS.ocean.astype(np.float32)
+        print(f"  Source : GLORYS12 ({NX}x{NY}, océan "
+              f"{100 * OCEAN.mean():.1f} %)")
+        return GLORYS
+    return None
+
+
+def _rand_positions(rng, n):
+    """n positions aléatoires — restreintes à l'océan en mode GLORYS."""
+    if OCEAN is not None:
+        from dataset_glorys import sample_ocean_positions
+        return sample_ocean_positions(OCEAN, n, rng=rng)
+    return [(int(rng.integers(0, NX)), int(rng.integers(0, NY))) for _ in range(n)]
+
+
+def _obs_noise_norm(norm):
+    """Écart-types du bruit d'observation en unités normalisées.
+    GLORYS : fournis par identity_norm() ; synthétique : comportement historique."""
+    return (norm.get("obs_ns_T", OBS_NOISE_STD / (norm["T_std"] + 1e-9)),
+            norm.get("obs_ns_S", OBS_NOISE_STD / (norm["S_std"] + 1e-9)))
+
+
+def _unobs_mean_np(sq, mask):
+    """Moyenne de sq (C, NX, NY) sur les pixels non observés (océan seul si défini)."""
+    w = (1.0 - mask)[None] if mask.ndim == 2 else (1.0 - mask)
+    if OCEAN is not None:
+        w = w * OCEAN[None]
+    return float((sq * w).sum() / (w.sum() * sq.shape[0] + 1e-9))
+
+
+# =============================================================================
 #  BLOCS DE BASE
 # =============================================================================
 
@@ -266,21 +314,37 @@ class AELoss(nn.Module):
         abs_diff = diff.abs()
         return torch.where(abs_diff < d, 0.5 * diff**2, d * (abs_diff - 0.5 * d))
 
-    def _recon_loss(self, pred, target, mask):
+    def _recon_loss(self, pred, target, mask, ocean=None):
         err = self._huber(pred - target)
-        return (self.w_obs * (err * mask).mean()
-                + self.w_unobs * (err * (1 - mask)).mean())
+        if ocean is None:
+            return (self.w_obs * (err * mask).mean()
+                    + self.w_unobs * (err * (1 - mask)).mean())
+        # Mode GLORYS : moyennes sur les pixels océan uniquement.
+        # mask (B,1,H,W) et ocean (1,1,H,W) broadcastent sur err (B,C,H,W).
+        C = pred.shape[1]
+        m_obs = mask * ocean
+        m_un  = (1 - mask) * ocean
+        l_obs = (err * m_obs).sum() / (m_obs.sum() * C + 1e-9)
+        l_un  = (err * m_un ).sum() / (m_un.sum()  * C + 1e-9)
+        return self.w_obs * l_obs + self.w_unobs * l_un
 
     @staticmethod
     def _spatial_grad(f):
         return f[..., 1:, :] - f[..., :-1, :], f[..., :, 1:] - f[..., :, :-1]
 
-    def forward(self, pred, target, mask, aux_preds=None):
-        loss_recon = self._recon_loss(pred, target, mask)
+    def forward(self, pred, target, mask, aux_preds=None, ocean=None):
+        loss_recon = self._recon_loss(pred, target, mask, ocean)
 
         pgx, pgy = self._spatial_grad(pred)
         tgx, tgy = self._spatial_grad(target)
-        loss_grad = self._huber(pgx - tgx).mean() + self._huber(pgy - tgy).mean()
+        if ocean is None:
+            loss_grad = self._huber(pgx - tgx).mean() + self._huber(pgy - tgy).mean()
+        else:
+            # Gradient valide seulement entre deux pixels océan adjacents
+            ogx = ocean[..., 1:, :] * ocean[..., :-1, :]
+            ogy = ocean[..., :, 1:] * ocean[..., :, :-1]
+            loss_grad = ((self._huber(pgx - tgx) * ogx).sum() / (ogx.sum() * pred.shape[1] + 1e-9)
+                         + (self._huber(pgy - tgy) * ogy).sum() / (ogy.sum() * pred.shape[1] + 1e-9))
 
         loss_aux = torch.tensor(0.0, device=pred.device)
         if aux_preds is not None:
@@ -288,7 +352,7 @@ class AELoss(nn.Module):
             for aux, w in zip(aux_preds, self.aux_weights):
                 aux_up  = F.interpolate(aux, size=(H, W), mode="bilinear", align_corners=False)
                 mask_ds = F.interpolate(mask, size=(H, W), mode="nearest")
-                loss_aux = loss_aux + w * self._recon_loss(aux_up, target, mask_ds)
+                loss_aux = loss_aux + w * self._recon_loss(aux_up, target, mask_ds, ocean)
 
         total = loss_recon + self.lambda_grad * loss_grad + loss_aux
         return total, loss_recon, loss_aux
@@ -305,15 +369,34 @@ def train(args):
 
     set_global_seed(args.seed_ocean)
 
-    print("\n[1/4] Génération du nature run...")
-    gen = SyntheticOceanGenerator()
-    T, S = gen.generate_dataset(nt=NT)
-    print(f"  T: {T.shape}  [{T.min():.1f}, {T.max():.1f}] °C")
+    data = setup_data_source(args)
+    ocean_t = None
+    if data is not None:
+        print("\n[1/4] Chargement du nature run GLORYS12 (splits par années)...")
+        from dataset_glorys import GlorysOEDDataset, identity_norm
+        train_ds = GlorysOEDDataset(data, "train",
+                                    n_obs_min=args.n_obs_min,
+                                    n_obs_max=args.n_obs_max,
+                                    step=args.time_step)
+        val_ds   = GlorysOEDDataset(data, "val",
+                                    n_obs_min=args.n_obs_min,
+                                    n_obs_max=args.n_obs_max,
+                                    step=max(1, args.time_step))
+        norm_ckpt = identity_norm(data)
+        ocean_t = data.ocean_torch(DEVICE)
+        print(f"  train : {len(train_ds)} jours | val : {len(val_ds)} jours "
+              f"| grille {NX}x{NY}")
+    else:
+        print("\n[1/4] Génération du nature run...")
+        gen = SyntheticOceanGenerator()
+        T, S = gen.generate_dataset(nt=NT)
+        print(f"  T: {T.shape}  [{T.min():.1f}, {T.max():.1f}] °C")
 
-    train_ds, val_ds = build_datasets(T, S, split=0.8,
-                                      n_obs_min=args.n_obs_min,
-                                      n_obs_max=args.n_obs_max,
-                                      augment_train=True)
+        train_ds, val_ds = build_datasets(T, S, split=0.8,
+                                          n_obs_min=args.n_obs_min,
+                                          n_obs_max=args.n_obs_max,
+                                          augment_train=True)
+        norm_ckpt = None   # rempli après (stats du train_ds synthétique)
     train_ld = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=0)
     val_ld   = DataLoader(val_ds,   batch_size=args.batch_size, shuffle=False, num_workers=0)
 
@@ -347,7 +430,7 @@ def train(args):
         for x, y, mask in train_ld:
             x, y, mask = x.to(DEVICE), y.to(DEVICE), mask.to(DEVICE)
             pred, z, aux_preds = model(x)
-            loss, _, l_aux = criterion(pred, y, mask, aux_preds)
+            loss, _, l_aux = criterion(pred, y, mask, aux_preds, ocean=ocean_t)
             optimizer.zero_grad(); loss.backward()
             nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
@@ -357,7 +440,7 @@ def train(args):
         n = len(train_ld)
         ep_loss /= n; ep_aux /= n
 
-        # Validation MC-moyennée
+        # Validation MC-moyennée (pixels non observés, océan seul si GLORYS)
         model.eval()
         val_rmses = []
         with torch.no_grad():
@@ -367,7 +450,11 @@ def train(args):
                 pred_mean = preds.mean(0)
                 sq = (pred_mean - y) ** 2
                 for b in range(x.shape[0]):
-                    val_rmses.append(float(torch.sqrt((sq[b] * (1 - mask[b])).mean()).item()))
+                    w = (1 - mask[b])
+                    if ocean_t is not None:
+                        w = w * ocean_t[0]
+                    mse = (sq[b] * w).sum() / (w.sum() * sq.shape[1] + 1e-9)
+                    val_rmses.append(float(torch.sqrt(mse).item()))
         val_rmse = float(np.mean(val_rmses))
 
         history["train_loss"].append(ep_loss)
@@ -381,11 +468,13 @@ def train(args):
 
         if val_rmse < best_val:
             best_val = val_rmse
+            norm_save = norm_ckpt if norm_ckpt is not None else {
+                "T_mean": train_ds.T_mean, "T_std": train_ds.T_std,
+                "S_mean": train_ds.S_mean, "S_std": train_ds.S_std}
             torch.save({
                 "model_state": model.state_dict(),
                 "args":  vars(args),
-                "norm":  {"T_mean": train_ds.T_mean, "T_std": train_ds.T_std,
-                          "S_mean": train_ds.S_mean, "S_std": train_ds.S_std}
+                "norm":  norm_save,
             }, out_dir / "ae_best.pt")
 
     print(f"\n  Meilleur RMSE val (non-obs) : {best_val:.4f}")
@@ -422,8 +511,7 @@ def _compute_rmse_mc(model, T_n_t, S_n_t, positions, norm, n_mc=8):
     """RMSE (pixels non observés) sur un seul instant, moyenne sur n_mc tirages."""
     mask = np.zeros((NX, NY), dtype=np.float32)
     T_obs = np.zeros_like(mask); S_obs = np.zeros_like(mask)
-    ns_T = OBS_NOISE_STD / (norm["T_std"] + 1e-9)
-    ns_S = OBS_NOISE_STD / (norm["S_std"] + 1e-9)
+    ns_T, ns_S = _obs_noise_norm(norm)
     for (x, y) in positions:
         mask[x, y] = 1.0
         T_obs[x, y] = T_n_t[x, y] + np.random.normal(0, ns_T)
@@ -433,7 +521,7 @@ def _compute_rmse_mc(model, T_n_t, S_n_t, positions, norm, n_mc=8):
     pred = rm[0].cpu().numpy()
     y_true = np.stack([T_n_t, S_n_t])
     sq = (pred - y_true) ** 2
-    return float(np.sqrt((sq * (1 - mask[None])).mean()))
+    return float(np.sqrt(_unobs_mean_np(sq, mask)))
 
 
 # =============================================================================
@@ -465,8 +553,7 @@ def plot_network_evaluation(model, T, S, norm, args,
     # Réseau de référence
     if positions is None:
         rng = np.random.default_rng(getattr(args, "seed_buoys", 42))
-        positions = [(int(rng.integers(0, NX)), int(rng.integers(0, NY)))
-                     for _ in range(N_BUOYS)]
+        positions = _rand_positions(rng, N_BUOYS)
     positions = list(positions)
     n_sensors = len(positions)
 
@@ -513,6 +600,8 @@ def plot_network_evaluation(model, T, S, norm, args,
     for k_prop in range(n_propose):
         # Candidats : top-variance parmi les pixels non observés, sous-échantillonnés
         var_map = combined_sigma * (1 - mask_aug)  # 0 aux capteurs existants
+        if OCEAN is not None:
+            var_map = var_map * OCEAN                  # 0 sur la terre
         flat_idx = np.argsort(var_map.ravel())[::-1]
         # Sous-échantillonner en gardant un espacement minimal (~8 px)
         candidates = []
@@ -542,7 +631,10 @@ def plot_network_evaluation(model, T, S, norm, args,
                 np.stack([T_t * mask_test, S_t * mask_test, mask_test])[None]).to(DEVICE)
             _, rs_test, _ = model.reconstruct_with_uncertainty(x_test, n_samples=n_mc_fast)
             # Critère A-optimal : trace de la variance (somme des variances pixel)
-            total_var = float(rs_test[0].sum().cpu())
+            rs_np = rs_test[0].cpu().numpy()
+            if OCEAN is not None:
+                rs_np = rs_np * OCEAN[None]
+            total_var = float(rs_np.sum())
             if total_var < best_var:
                 best_var = total_var
                 best_pos = (cx, cy)
@@ -670,7 +762,9 @@ def plot_uncertainty_maps(model, T, S, norm, args, n_samples=60):
     for (_, n_obs) in configs:
         np.random.seed(n_obs * 7)
         flat = np.zeros(NX * NY, dtype=np.float32)
-        flat[np.random.choice(NX*NY, n_obs, replace=False)] = 1.0
+        pool = (np.where(OCEAN.ravel() > 0.5)[0] if OCEAN is not None
+                else np.arange(NX * NY))
+        flat[np.random.choice(pool, n_obs, replace=False)] = 1.0
         mask = flat.reshape(NX, NY)
         x_in = torch.from_numpy(np.stack([T_n[t]*mask, S_n[t]*mask, mask])[None]).to(DEVICE)
         rm, rs, _ = model.reconstruct_with_uncertainty(x_in, n_samples=n_samples)
@@ -736,15 +830,22 @@ def score(args):
     model.eval()
     print(f"  Modèle chargé : {args.checkpoint}")
 
-    gen = SyntheticOceanGenerator()
-    T, S = gen.generate_dataset(nt=200)
-    norm = ckpt["norm"]
+    if GLORYS is not None:
+        from dataset_glorys import identity_norm
+        T, S = GLORYS.get_arrays("test", ("T", "S"), normalized=True,
+                                 step=getattr(args, "time_step", 1))
+        norm = identity_norm(GLORYS)
+        print(f"  Données : GLORYS split test ({len(T)} jours)")
+    else:
+        gen = SyntheticOceanGenerator()
+        T, S = gen.generate_dataset(nt=200)
+        norm = ckpt["norm"]
 
     rng = np.random.default_rng(args.seed_buoys)
-    positions = [(int(rng.integers(0, NX)), int(rng.integers(0, NY))) for _ in range(N_BUOYS)]
+    positions = _rand_positions(rng, N_BUOYS)
 
     print("\n  Leave-One-Out...")
-    t_idx = np.random.choice(len(T), 10, replace=False)
+    t_idx = np.random.choice(len(T), min(10, len(T)), replace=False)
     rmse_full = np.mean([_compute_rmse_mc(model, (T[t]-norm["T_mean"])/norm["T_std"],
                                           (S[t]-norm["S_mean"])/norm["S_std"], positions, norm) for t in t_idx])
     print(f"  RMSE réseau complet : {rmse_full:.4f}")
@@ -761,6 +862,187 @@ def score(args):
     with open(out_dir / "ae_loo_scores.json", "w") as f:
         json.dump(loo_scores, f, indent=2)
     print(f"  LOO scores → {out_dir}/ae_loo_scores.json")
+
+
+# =============================================================================
+#  GÉNÉRATION DE CIBLES LOO — supervision de la Brique 2 (GNN)
+# =============================================================================
+#  Objectif : produire, pour M configurations de réseau aléatoires, le score
+#  de contribution marginale de chaque capteur :
+#      delta_i = RMSE(réseau \ {i}) − RMSE(réseau complet)
+#  mesuré par l'AE. Ces cibles remplacent le proxy corrélation de la Brique 2
+#  (circulaire : le proxy était une fonction des features d'entrée du GNN).
+#
+#  Variance du signal : retirer 1 capteur sur ~30 donne un delta minuscule,
+#  facilement noyé dans le bruit. Deux réductions de variance sont appliquées
+#  (Common Random Numbers) :
+#    1. champs de bruit d'observation pré-tirés par instant → identiques
+#       entre config complète et configs LOO ;
+#    2. torch.manual_seed(base + k) avant CHAQUE passe MC-Dropout → mêmes
+#       masques de dropout entre config complète et configs LOO.
+#  La différence full/LOO ne reflète alors QUE le retrait du capteur.
+
+
+@torch.no_grad()
+def _eval_config_rmse_crn(model, T_n, S_n, positions, noise_T, noise_S,
+                          n_mc=8, mc_seed=1234):
+    """RMSE non-observé (océan seul si défini), CRN, moyenné sur les instants.
+
+    T_n, S_n           : (n_t, NX, NY) champs normalisés (instants d'évaluation)
+    noise_T, noise_S   : (n_t, NX, NY) bruits d'observation pré-tirés
+    """
+    n_t = T_n.shape[0]
+    mask = np.zeros((NX, NY), dtype=np.float32)
+    for (i, j) in positions:
+        mask[i, j] = 1.0
+    m = mask[None]                                        # (1, NX, NY)
+    x_in = torch.from_numpy(np.stack([
+        (T_n + noise_T) * m, (S_n + noise_S) * m,
+        np.repeat(m, n_t, axis=0)], axis=1).astype(np.float32)).to(DEVICE)
+
+    cond = model._get_cond(x_in)
+    z, skips = model.encode(x_in)
+    preds = []
+    for k in range(n_mc):
+        torch.manual_seed(mc_seed + k)                    # CRN dropout
+        preds.append(model.decode(z, skips, cond, x_in[:, 2:3])[0])
+    pred = torch.stack(preds).mean(0).cpu().numpy()       # (n_t, 2, NX, NY)
+
+    sq = (pred - np.stack([T_n, S_n], axis=1)) ** 2      # (n_t, 2, NX, NY)
+    w = (1.0 - mask)[None, None]                          # (1, 1, NX, NY)
+    if OCEAN is not None:
+        w = w * OCEAN[None, None]
+    # Moyenne sur pixels non observés (océan), canaux et instants
+    denom = w.sum() * sq.shape[0] * sq.shape[1]
+    return float(np.sqrt((sq * w).sum() / (denom + 1e-9)))
+
+
+@torch.no_grad()
+def generate_loo_targets(args, model, norm):
+    """Génère outputs/ae_loo_targets.json : M configurations aléatoires,
+    delta_rmse LOO par capteur, pour la supervision de la Brique 2."""
+    print("=" * 62)
+    print("  Brique 1 — Génération de cibles LOO (supervision GNN)")
+    print("=" * 62)
+
+    rng = np.random.default_rng(args.seed_buoys)
+    ns_T, ns_S = _obs_noise_norm(norm)
+
+    # Champs d'évaluation : split VAL en mode GLORYS (l'AE est entraîné sur
+    # train ; les cibles pour le GNN viennent de données non vues).
+    if GLORYS is not None:
+        T, S = GLORYS.get_arrays("val", ("T", "S"), normalized=True,
+                                 step=max(1, args.time_step))
+        src_lbl = f"GLORYS val ({len(T)} jours)"
+    else:
+        gen = SyntheticOceanGenerator()
+        Tr, Sr = gen.generate_dataset(nt=200, seed=args.seed_ocean + 1)
+        T = ((Tr - norm["T_mean"]) / norm["T_std"]).astype(np.float32)
+        S = ((Sr - norm["S_mean"]) / norm["S_std"]).astype(np.float32)
+        src_lbl = "synthétique (seed+1, 200 pas)"
+
+    n_t = min(args.loo_t, len(T))
+    t_idx = rng.choice(len(T), n_t, replace=False)
+    T_ev, S_ev = T[t_idx], S[t_idx]
+
+    # Bruits d'observation pré-tirés (CRN : partagés full / LOO)
+    noise_T = rng.standard_normal(T_ev.shape).astype(np.float32) * ns_T
+    noise_S = rng.standard_normal(S_ev.shape).astype(np.float32) * ns_S
+
+    print(f"  Champs      : {src_lbl} | {n_t} instants d'évaluation")
+    print(f"  Configs     : {args.n_configs} réseaux "
+          f"[{args.cfg_n_min}-{args.cfg_n_max} capteurs] | n_mc={args.loo_mc}")
+    n_eval = args.n_configs * (1 + (args.cfg_n_min + args.cfg_n_max) // 2)
+    print(f"  ~{n_eval} évaluations réseau (CRN : bruit obs + dropout)")
+
+    configs = []
+    import time as _time
+    t0 = _time.time()
+    for c in range(args.n_configs):
+        n_sens = int(rng.integers(args.cfg_n_min, args.cfg_n_max + 1))
+        positions = _rand_positions(rng, n_sens)
+        mc_seed = 10_000 + 97 * c                          # fixe par config
+
+        rmse_full = _eval_config_rmse_crn(model, T_ev, S_ev, positions,
+                                          noise_T, noise_S,
+                                          n_mc=args.loo_mc, mc_seed=mc_seed)
+        deltas = []
+        for i in range(n_sens):
+            sub = positions[:i] + positions[i + 1:]
+            rmse_loo = _eval_config_rmse_crn(model, T_ev, S_ev, sub,
+                                             noise_T, noise_S,
+                                             n_mc=args.loo_mc, mc_seed=mc_seed)
+            deltas.append(float(rmse_loo - rmse_full))
+
+        configs.append({"positions": [list(map(int, p)) for p in positions],
+                        "rmse_full": float(rmse_full),
+                        "delta_rmse": deltas})
+        el = _time.time() - t0
+        eta = el / (c + 1) * (args.n_configs - c - 1)
+        print(f"  config {c + 1:3d}/{args.n_configs} | N={n_sens:2d} "
+              f"| RMSE_full={rmse_full:.4f} "
+              f"| delta [{min(deltas):+.4f}, {max(deltas):+.4f}] "
+              f"| ETA {eta:5.0f}s")
+
+    # ── Fiabilité test-retest : plafond de performance de l'émulateur ──────
+    # Re-score quelques configurations avec des tirages CRN INDÉPENDANTS
+    # (autres instants, autres bruits d'obs, autres seeds dropout). Le
+    # Spearman entre les deux estimations LOO borne ce qu'un émulateur
+    # parfait peut atteindre : aucun GNN ne peut prédire mieux que la
+    # répétabilité de la cible elle-même.
+    reliability = None
+    if args.reliability > 0 and len(configs) > 0:
+        from scipy.stats import spearmanr
+        n_rel = min(args.reliability, len(configs))
+        print(f"\n  Fiabilité test-retest ({n_rel} configs re-scorées, "
+              f"tirages indépendants)...")
+        t_idx2 = rng.choice(len(T), n_t, replace=False)
+        T_e2, S_e2 = T[t_idx2], S[t_idx2]
+        nT2 = rng.standard_normal(T_e2.shape).astype(np.float32) * ns_T
+        nS2 = rng.standard_normal(S_e2.shape).astype(np.float32) * ns_S
+        rhos = []
+        for c in rng.choice(len(configs), n_rel, replace=False):
+            cfg = configs[int(c)]
+            positions = [tuple(p) for p in cfg["positions"]]
+            mc2 = 50_000 + 131 * int(c)
+            rf2 = _eval_config_rmse_crn(model, T_e2, S_e2, positions,
+                                        nT2, nS2, n_mc=args.loo_mc,
+                                        mc_seed=mc2)
+            d2 = []
+            for i in range(len(positions)):
+                sub = positions[:i] + positions[i + 1:]
+                rl2 = _eval_config_rmse_crn(model, T_e2, S_e2, sub,
+                                            nT2, nS2, n_mc=args.loo_mc,
+                                            mc_seed=mc2)
+                d2.append(rl2 - rf2)
+            rho = spearmanr(cfg["delta_rmse"], d2).statistic
+            rhos.append(float(rho))
+            print(f"    config {int(c):3d} (N={len(positions):2d}) : "
+                  f"Spearman run1/run2 = {rho:+.3f}")
+        reliability = {"spearman_mean": float(np.mean(rhos)),
+                       "spearman_all": rhos, "n_configs": n_rel}
+        print(f"  → Plafond d'émulation (répétabilité moyenne) : "
+              f"Spearman ≈ {np.mean(rhos):.3f}")
+        print(f"    (si l'émulateur GNN atteint ce niveau, il a tout appris ;")
+        print(f"     si ce plafond est bas, augmenter --loo_t / --loo_mc)")
+
+    out = {"meta": {"data": getattr(args, "data", "synthetic"),
+                    "checkpoint": args.checkpoint,
+                    "seed_ocean": args.seed_ocean,
+                    "seed_buoys": args.seed_buoys,
+                    "n_t": int(n_t), "loo_mc": int(args.loo_mc),
+                    "nx": int(NX), "ny": int(NY),
+                    "reliability": reliability},
+           "configs": configs}
+    out_path = Path(args.output_dir) / "ae_loo_targets.json"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(out_path, "w") as f:
+        json.dump(out, f)
+    all_d = np.concatenate([c["delta_rmse"] for c in configs])
+    print(f"\n  {len(configs)} configs, {len(all_d)} capteurs scorés "
+          f"| delta moyen {all_d.mean():+.5f} (σ {all_d.std():.5f})")
+    print(f"  Cibles LOO → {out_path}")
+    return out_path
 
 
 # =============================================================================
@@ -790,19 +1072,42 @@ def parse_args():
     p.add_argument("--n_obs_max",    type=int,   default=80)
     p.add_argument("--n_mc_val",     type=int,   default=15)
     p.add_argument("--n_mc",         type=int,   default=60)
+    # Génération de cibles LOO (supervision Brique 2)
+    p.add_argument("--gen_targets",  action="store_true",
+                   help="Génère ae_loo_targets.json (M configs, LOO CRN)")
+    p.add_argument("--n_configs",    type=int,   default=40,
+                   help="Nombre de configurations réseau aléatoires")
+    p.add_argument("--cfg_n_min",    type=int,   default=15)
+    p.add_argument("--cfg_n_max",    type=int,   default=45)
+    p.add_argument("--loo_t",        type=int,   default=12,
+                   help="Instants d'évaluation par configuration")
+    p.add_argument("--loo_mc",       type=int,   default=8,
+                   help="Passes MC-Dropout par évaluation (CRN)")
+    p.add_argument("--reliability",  type=int,   default=4,
+                   help="Nb de configs re-scorées (test-retest, plafond "
+                        "de bruit des cibles) ; 0 pour désactiver")
+    # Source de données
+    p.add_argument("--data",         choices=["synthetic", "glorys"],
+                   default="synthetic",
+                   help="Nature run : synthétique ou GLORYS12 prétraité")
+    p.add_argument("--glorys_cache", type=str,   default="data/glorys_cache")
+    p.add_argument("--time_step",    type=int,   default=1,
+                   help="Sous-échantillonnage temporel des splits GLORYS")
     return p.parse_args()
 
 
 if __name__ == "__main__":
     args = parse_args()
-    if not any([args.train, args.score, args.figures]):
-        print("Usage: python 01_autoencoder.py --train [--figures] [--score]")
+    if not any([args.train, args.score, args.figures, args.gen_targets]):
+        print("Usage: python 01_autoencoder.py --train [--figures] [--score] [--gen_targets]")
         sys.exit(0)
+
+    setup_data_source(args)
 
     if args.train:
         train(args)
 
-    if args.score or args.figures:
+    if args.score or args.figures or args.gen_targets:
         ckpt  = torch.load(args.checkpoint, map_location=DEVICE, weights_only=False)
         model = ObservabilityAE(
             base_ch=ckpt["args"]["base_ch"],
@@ -814,8 +1119,16 @@ if __name__ == "__main__":
         norm = ckpt["norm"]
 
         set_global_seed(args.seed_ocean)
-        gen = SyntheticOceanGenerator()
-        T, S = gen.generate_dataset(nt=200, seed=args.seed_ocean)
+        if GLORYS is not None:
+            from dataset_glorys import identity_norm
+            norm = identity_norm(GLORYS)
+            if args.figures:
+                T, S = GLORYS.get_arrays("test", ("T", "S"), normalized=True,
+                                         step=args.time_step)
+                print(f"  Données figures : GLORYS split test ({len(T)} jours)")
+        elif args.figures:
+            gen = SyntheticOceanGenerator()
+            T, S = gen.generate_dataset(nt=200, seed=args.seed_ocean)
 
         if args.figures:
             print("\n  Figure 1 : Évaluation réseau (zones lacunaires + LOO)...")
@@ -825,3 +1138,6 @@ if __name__ == "__main__":
 
         if args.score:
             score(args)
+
+        if args.gen_targets:
+            generate_loo_targets(args, model, norm)

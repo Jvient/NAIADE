@@ -30,6 +30,48 @@ try:
 except ModuleNotFoundError:
     from data.dataset import SyntheticOceanGenerator
 
+# ── Source de données : synthétique (défaut) ou GLORYS12 (--data glorys) ─────
+# En mode GLORYS, NX/NY/OCEAN (globaux du module) sont mis à jour ; les
+# distances pixel de build_graph restent valides car dans la boîte tropicale
+# la maille 1/12° est quasi isotrope (~9,2 km/pixel en lat comme en lon).
+
+OCEAN  = None
+GLORYS = None
+
+
+def setup_data_source(args):
+    global NX, NY, OCEAN, GLORYS
+    if getattr(args, "data", "synthetic") == "glorys":
+        from dataset_glorys import GlorysData
+        GLORYS = GlorysData(getattr(args, "glorys_cache", "data/glorys_cache"))
+        NX, NY = GLORYS.nlat, GLORYS.nlon
+        OCEAN = GLORYS.ocean.astype(np.float32)
+        print(f"  Source : GLORYS12 ({NX}x{NY}, océan {100*OCEAN.mean():.1f} %)")
+        return GLORYS
+    return None
+
+
+def _rand_positions(rng, n):
+    if OCEAN is not None:
+        from dataset_glorys import sample_ocean_positions
+        return sample_ocean_positions(OCEAN, n, rng=rng)
+    return [(int(rng.integers(0, NX)), int(rng.integers(0, NY))) for _ in range(n)]
+
+
+def _snap_to_ocean(positions):
+    """Rabat les positions (i, j) données par l'utilisateur sur l'océan."""
+    if OCEAN is None or GLORYS is None:
+        return positions
+    out = []
+    for (i, j) in positions:
+        i = int(np.clip(i, 0, NX - 1)); j = int(np.clip(j, 0, NY - 1))
+        if OCEAN[i, j] < 0.5:
+            la, lo = GLORYS.ij_to_latlon(i, j)
+            i, j = GLORYS.latlon_to_ij(la, lo, require_ocean=True)
+            print(f"  [snap] position terre -> océan : ({i},{j})")
+        out.append((i, j))
+    return out
+
 # ── Import PyTorch Geometric ───────────────────────────────────────────────────
 try:
     from torch_geometric.data import Data
@@ -82,6 +124,72 @@ def build_spatial_correlation(T, S, positions, n_timestamps=200):
     return np.corrcoef(series)
 
 
+def _compute_node_features(positions, corr_matrix, degree_counts, T=None, S=None):
+    """Features nodaux (10 dim), partagés entre build_graph et inductive_eval :
+      [x_norm, y_norm, corr_max, degré_norm,
+       var_T_locale, var_S_locale, grad_mean, dist_bord_norm,
+       d_nn_norm, n_capteurs_log]
+    d_nn (distance au capteur le plus proche) est le prédicteur géométrique
+    le plus direct de la contribution marginale ; n_capteurs contextualise
+    les cibles standardisées par configuration.
+    """
+    from scipy.spatial import KDTree
+
+    n = len(positions)
+    pos_arr = np.array(positions, dtype=np.float32)
+    x_norm = pos_arr[:, 0:1] / NX
+    y_norm = pos_arr[:, 1:2] / NY
+
+    cm = np.array(corr_matrix, dtype=np.float32).copy()
+    np.fill_diagonal(cm, 0)
+    corr_max_vals = np.abs(cm).max(axis=1, keepdims=True)
+
+    degree_norm = (degree_counts.reshape(-1, 1)
+                   / (degree_counts.max() + 1e-9)).astype(np.float32)
+
+    if T is not None and S is not None:
+        var_T = np.zeros((n, 1), dtype=np.float32)
+        var_S = np.zeros((n, 1), dtype=np.float32)
+        grad_mean = np.zeros((n, 1), dtype=np.float32)
+        for k, (px, py) in enumerate(positions):
+            x0, x1 = max(0, px - 2), min(NX, px + 3)
+            y0, y1 = max(0, py - 2), min(NY, py + 3)
+            var_T[k] = T[:, x0:x1, y0:y1].var()
+            var_S[k] = S[:, x0:x1, y0:y1].var()
+            grads = []
+            for t_i in range(0, min(len(T), 50), 10):
+                gx = np.gradient(T[t_i], axis=0)[x0:x1, y0:y1]
+                gy = np.gradient(T[t_i], axis=1)[x0:x1, y0:y1]
+                grads.append(np.sqrt(gx ** 2 + gy ** 2).mean())
+            grad_mean[k] = np.mean(grads)
+        var_T = (var_T - var_T.mean()) / (var_T.std() + 1e-9)
+        var_S = (var_S - var_S.mean()) / (var_S.std() + 1e-9)
+        grad_mean = (grad_mean - grad_mean.mean()) / (grad_mean.std() + 1e-9)
+    else:
+        var_T = np.zeros((n, 1), dtype=np.float32)
+        var_S = np.zeros((n, 1), dtype=np.float32)
+        grad_mean = np.zeros((n, 1), dtype=np.float32)
+
+    dist_border = np.zeros((n, 1), dtype=np.float32)
+    for k, (px, py) in enumerate(positions):
+        dist_border[k] = min(px, NX - 1 - px, py, NY - 1 - py)
+    dist_border = dist_border / (max(NX, NY) / 2)
+
+    # Distance au plus proche capteur (normalisée par la demi-diagonale)
+    d_nn = np.zeros((n, 1), dtype=np.float32)
+    if n > 1:
+        tree = KDTree(pos_arr)
+        dd, _ = tree.query(pos_arr, k=2)
+        d_nn[:, 0] = dd[:, 1] / (np.sqrt(NX ** 2 + NY ** 2) / 2)
+
+    # Taille du réseau (globale, identique pour tous les nœuds du graphe)
+    n_feat = np.full((n, 1), np.log1p(n) / np.log(100.0), dtype=np.float32)
+
+    return np.hstack([x_norm, y_norm, corr_max_vals, degree_norm,
+                      var_T, var_S, grad_mean, dist_border,
+                      d_nn, n_feat]).astype(np.float32)
+
+
 def build_graph(positions, corr_matrix, corr_threshold=0.5, k_nearest=4,
                 T=None, S=None):
     """
@@ -123,51 +231,10 @@ def build_graph(positions, corr_matrix, corr_threshold=0.5, k_nearest=4,
     edge_index = torch.tensor([src_list, dst_list], dtype=torch.long)
     edge_attr  = torch.tensor(attr_list, dtype=torch.float).unsqueeze(-1)
 
-    # ── Features nodaux enrichis ──────────────────────────────────────────────
-    x_norm = pos_arr[:, 0:1] / NX
-    y_norm = pos_arr[:, 1:2] / NY
-    corr_max = np.array([corr_matrix[i].copy() for i in range(n)])
-    np.fill_diagonal(corr_max, 0)
-    corr_max_vals = corr_max.max(axis=1, keepdims=True)
-    degree = np.bincount(src_list, minlength=n).reshape(-1, 1).astype(np.float32)
-    degree_norm = degree / (degree.max() + 1e-9)
-
-    # Features dynamiques (si T et S fournis)
-    if T is not None and S is not None:
-        var_T = np.zeros((n, 1), dtype=np.float32)
-        var_S = np.zeros((n, 1), dtype=np.float32)
-        grad_mean = np.zeros((n, 1), dtype=np.float32)
-        for k, (px, py) in enumerate(positions):
-            # Variance temporelle locale (fenêtre 5×5)
-            x0, x1 = max(0, px-2), min(NX, px+3)
-            y0, y1 = max(0, py-2), min(NY, py+3)
-            var_T[k] = T[:, x0:x1, y0:y1].var()
-            var_S[k] = S[:, x0:x1, y0:y1].var()
-            # Gradient moyen du champ (norme) sur quelques instants
-            grads = []
-            for t_i in range(0, min(len(T), 50), 10):
-                gx = np.gradient(T[t_i], axis=0)[x0:x1, y0:y1]
-                gy = np.gradient(T[t_i], axis=1)[x0:x1, y0:y1]
-                grads.append(np.sqrt(gx**2 + gy**2).mean())
-            grad_mean[k] = np.mean(grads)
-        # Normalisation
-        var_T = (var_T - var_T.mean()) / (var_T.std() + 1e-9)
-        var_S = (var_S - var_S.mean()) / (var_S.std() + 1e-9)
-        grad_mean = (grad_mean - grad_mean.mean()) / (grad_mean.std() + 1e-9)
-    else:
-        var_T = np.zeros((n, 1), dtype=np.float32)
-        var_S = np.zeros((n, 1), dtype=np.float32)
-        grad_mean = np.zeros((n, 1), dtype=np.float32)
-
-    # Distance au bord du domaine (min des 4 distances)
-    dist_border = np.zeros((n, 1), dtype=np.float32)
-    for k, (px, py) in enumerate(positions):
-        dist_border[k] = min(px, NX - 1 - px, py, NY - 1 - py)
-    dist_border = dist_border / (max(NX, NY) / 2)  # normalisé ~[0, 1]
-
+    # ── Features nodaux (fonction partagée avec l'évaluation inductive) ──────
+    degree = np.bincount(src_list, minlength=n).astype(np.float32)
     x_nodes = torch.tensor(
-        np.hstack([x_norm, y_norm, corr_max_vals, degree_norm,
-                   var_T, var_S, grad_mean, dist_border]),
+        _compute_node_features(positions, corr_matrix, degree, T, S),
         dtype=torch.float)
 
     return {
@@ -304,6 +371,233 @@ def train_gnn(args, graph_dict, targets):
 
     print(f"  ✓ Checkpoint → {out_dir}/gnn_best.pt")
     return model
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  CIBLES AE (LOO) — supervision non circulaire, entraînement multi-graphes
+# ══════════════════════════════════════════════════════════════════════════════
+#  Le proxy corrélation (compute_proxy_targets) est CIRCULAIRE : c'est une
+#  fonction de la matrice de corrélation, elle-même à l'origine des features
+#  et des arêtes du graphe. Le GNN ne peut alors rien apprendre d'autre que
+#  ses entrées. Les cibles AE (delta RMSE LOO, Brique 1 --gen_targets)
+#  cassent cette circularité : le GNN apprend à ÉMULER la contribution
+#  marginale mesurée par l'AE, et le SAGE inductif devient un véritable
+#  émulateur de "gain d'information" pour capteurs hypothétiques.
+#
+#  Entraînement : M graphes (un par configuration réseau), split 80/20 PAR
+#  CONFIGURATION ENTIÈRE — le test mesure la généralisation à des réseaux
+#  jamais vus, pas à des nœuds tenus à l'écart d'un graphe déjà vu.
+
+
+def load_ae_targets(path):
+    """Charge ae_loo_targets.json (Brique 1). Retourne (meta, configs)."""
+    import json
+    with open(path) as f:
+        d = json.load(f)
+    meta = d["meta"]
+    if meta.get("nx") != NX or meta.get("ny") != NY:
+        raise ValueError(
+            f"Grille des cibles ({meta.get('nx')}x{meta.get('ny')}) != "
+            f"grille courante ({NX}x{NY}) — régénérer avec --gen_targets "
+            f"sur la même source de données")
+    return meta, d["configs"]
+
+
+def build_graphs_from_configs(configs, T, S, args):
+    """(graph_dict, target_tensor) par configuration.
+
+    Cibles standardisées PAR CONFIGURATION : t_i = (delta_i - mu_c) / sigma_c.
+    Les deltas LOO bruts varient d'un ordre de grandeur selon N capteurs et
+    l'état du réseau ; la standardisation rend la tâche comparable entre
+    graphes (le GNN prédit la contribution RELATIVE au sein du réseau).
+    """
+    graphs, tgts = [], []
+    for c, cfg in enumerate(configs):
+        positions = [tuple(p) for p in cfg["positions"]]
+        corr = build_spatial_correlation(T, S, positions,
+                                         n_timestamps=min(200, len(T)))
+        g = build_graph(positions, corr,
+                        corr_threshold=args.corr_threshold,
+                        k_nearest=args.k_nearest, T=T, S=S)
+        d = np.asarray(cfg["delta_rmse"], dtype=np.float32)
+        t = (d - d.mean()) / (d.std() + 1e-8)
+        graphs.append(g)
+        tgts.append(torch.tensor(t, dtype=torch.float))
+        if (c + 1) % 10 == 0 or c == len(configs) - 1:
+            print(f"    graphe {c + 1:3d}/{len(configs)} "
+                  f"({len(positions)} nœuds)")
+    return graphs, tgts
+
+
+def _split_configs(n, frac_train=0.8, seed=0):
+    rng = np.random.default_rng(seed)
+    perm = rng.permutation(n)
+    n_tr = max(1, int(frac_train * n))
+    return perm[:n_tr].tolist(), perm[n_tr:].tolist()
+
+
+def _pairwise_rank_loss(pred, target, n_pairs=256, margin=0.2, min_gap=0.3):
+    """Loss de ranking par paires (hinge). Robuste au bruit des cibles :
+    seules les paires dont l'écart de cible dépasse min_gap (unités
+    standardisées) sont contraintes — les paires ambiguës sont ignorées."""
+    n = pred.shape[0]
+    if n < 2:
+        return pred.sum() * 0.0
+    i = torch.randint(0, n, (n_pairs,), device=pred.device)
+    j = torch.randint(0, n, (n_pairs,), device=pred.device)
+    gap = target[i] - target[j]
+    keep = gap.abs() > min_gap
+    if keep.sum() == 0:
+        return pred.sum() * 0.0
+    s = torch.sign(gap)[keep]
+    d = (pred[i] - pred[j])[keep]
+    return F.relu(margin - s * d).mean()
+
+
+def _train_multi(model, graphs, tgts, idx_tr, idx_te, epochs, out_path,
+                 lr=1e-3, label="GAT", loss_mode="mse", patience=60):
+    """Boucle d'entraînement commune GAT/SAGE sur M graphes.
+
+    - eval du test-configs à CHAQUE époque, early stopping (patience) ;
+    - le MEILLEUR état (test MSE min) est rechargé avant de retourner —
+      c'est lui qui est sauvegardé et utilisé pour la validation/analyse.
+    - loss_mode="rank" : hinge de ranking par paires + ancrage MSE léger
+      (le Spearman est la métrique décisionnelle en OED : quels capteurs
+      valent le plus / le moins).
+    """
+    import copy
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-4)
+    best, best_ep, best_state = np.inf, 0, None
+    dev = [(g["x"].to(DEVICE), g["edge_index"].to(DEVICE), t.to(DEVICE))
+           for g, t in zip(graphs, tgts)]
+
+    def _fwd(m, x, ei):
+        out = m(x, ei)
+        return out[0] if isinstance(out, tuple) else out
+
+    def _loss(p, y):
+        if loss_mode == "rank":
+            return 0.2 * F.mse_loss(p, y) + _pairwise_rank_loss(p, y)
+        return F.mse_loss(p, y)
+
+    for epoch in range(1, epochs + 1):
+        model.train()
+        tr_loss = 0.0
+        for k in np.random.permutation(idx_tr):
+            x, ei, y = dev[k]
+            loss = _loss(_fwd(model, x, ei), y)
+            optimizer.zero_grad(); loss.backward(); optimizer.step()
+            tr_loss += loss.item()
+        tr_loss /= max(1, len(idx_tr))
+
+        model.eval()
+        with torch.no_grad():
+            te_loss = float(np.mean([
+                F.mse_loss(_fwd(model, dev[k][0], dev[k][1]),
+                           dev[k][2]).item()
+                for k in idx_te])) if idx_te else tr_loss
+        if te_loss < best:
+            best, best_ep = te_loss, epoch
+            best_state = copy.deepcopy(model.state_dict())
+
+        if epoch % 20 == 0 or epoch == 1:
+            print(f"  [{label}] ép {epoch:3d} | Train={tr_loss:.4f} "
+                  f"| Test(configs) MSE={te_loss:.4f} "
+                  f"| best={best:.4f}@ép{best_ep}")
+        if epoch - best_ep >= patience:
+            print(f"  [{label}] early stopping (pas d'amélioration "
+                  f"depuis {patience} ép) — meilleur : {best:.4f}@ép{best_ep}")
+            break
+
+    if best_state is not None:
+        model.load_state_dict(best_state)      # ← modèle retourné = MEILLEUR
+    torch.save(model.state_dict(), out_path)
+    print(f"  ✓ Checkpoint (meilleur test MSE={best:.4f}) → {out_path}")
+    return model
+
+
+def train_on_ae_targets(args, graphs, tgts):
+    """Entraîne GAT + SAGE sur les cibles AE. Retourne (gat, sage, split)."""
+    idx_tr, idx_te = _split_configs(len(graphs), seed=args.seed_buoys)
+    print(f"\n── Entraînement sur cibles AE : {len(idx_tr)} configs train, "
+          f"{len(idx_te)} configs test (split par réseau entier) ──")
+    out_dir = Path(args.output_dir); out_dir.mkdir(parents=True, exist_ok=True)
+
+    loss_mode = getattr(args, "gnn_loss", "mse")
+    gat = OceanNetworkGAT(in_dim=graphs[0]["x"].shape[1]).to(DEVICE)
+    gat = _train_multi(gat, graphs, tgts, idx_tr, idx_te,
+                       args.gnn_epochs, out_dir / "gnn_best.pt",
+                       label="GAT", loss_mode=loss_mode)
+
+    sage = GraphSAGEInductive(in_dim=graphs[0]["x"].shape[1]).to(DEVICE)
+    sage = _train_multi(sage, graphs, tgts, idx_tr, idx_te,
+                        args.gnn_epochs, out_dir / "sage_best.pt",
+                        label="SAGE", loss_mode=loss_mode)
+    return gat, sage, (idx_tr, idx_te)
+
+
+@torch.no_grad()
+def plot_target_validation(models, graphs, tgts, idx_te, args, meta=None):
+    """Figure clé : le GNN émule-t-il le LOO de l'AE sur des réseaux
+    jamais vus ? Scatter préd. vs cible + R² + Spearman, GAT et SAGE."""
+    from scipy.stats import spearmanr
+    out_dir = Path(args.output_dir)
+    BG = "#0a1628"
+
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5.2), facecolor=BG)
+    stats = {}
+    for ax, (name, model) in zip(axes, models.items()):
+        model.eval()
+        preds, trues = [], []
+        for k in idx_te:
+            g, y = graphs[k], tgts[k]
+            out = model(g["x"].to(DEVICE), g["edge_index"].to(DEVICE))
+            p = (out[0] if isinstance(out, tuple) else out).cpu().numpy()
+            preds.append(p); trues.append(y.numpy())
+        p = np.concatenate(preds); t = np.concatenate(trues)
+        ss_res = ((p - t) ** 2).sum()
+        ss_tot = ((t - t.mean()) ** 2).sum() + 1e-12
+        r2 = 1 - ss_res / ss_tot
+        rho = spearmanr(p, t).statistic
+        stats[name] = {"r2": float(r2), "spearman": float(rho),
+                       "n": int(len(t))}
+
+        ax.set_facecolor("#050d1a")
+        for sp in ax.spines.values(): sp.set_edgecolor("#2a4a7a")
+        ax.scatter(t, p, s=14, c="#6baed6", alpha=0.65,
+                   edgecolors="black", linewidths=0.3)
+        lim = max(abs(t).max(), abs(p).max()) * 1.1
+        ax.plot([-lim, lim], [-lim, lim], "--", color="#fc8d59", lw=1)
+        ax.set_xlim(-lim, lim); ax.set_ylim(-lim, lim)
+        ax.set_xlabel("Cible AE : Δ RMSE LOO (standardisé)",
+                      color="white", fontsize=9)
+        ax.set_ylabel(f"Prédiction {name}", color="white", fontsize=9)
+        ax.set_title(f"{name} — configs test (jamais vues)\n"
+                     f"R²={r2:.3f}  |  Spearman ρ={rho:.3f}  |  n={len(t)}",
+                     color="white", fontsize=10, fontweight="bold")
+        ax.tick_params(colors="white", labelsize=7)
+        ax.grid(alpha=0.2, color="white")
+
+    rel = (meta or {}).get("reliability")
+    subtitle = "Validation : le GNN émule le score LOO de l'AE"
+    if rel:
+        subtitle += (f"   |   plafond de bruit des cibles : "
+                     f"Spearman ≈ {rel['spearman_mean']:.3f} "
+                     f"(test-retest, {rel['n_configs']} configs)")
+    fig.suptitle(subtitle, color="white", fontsize=11, fontweight="bold")
+    fig.tight_layout(rect=[0, 0, 1, 0.94])
+    out = out_dir / "gnn_target_validation.png"
+    fig.savefig(out, dpi=140, facecolor=BG, bbox_inches="tight")
+    plt.close(fig)
+
+    import json
+    with open(out_dir / "gnn_target_validation.json", "w") as f:
+        json.dump(stats, f, indent=2)
+    print(f"  ✓ Validation émulation → {out}")
+    for name, s in stats.items():
+        print(f"    {name:4s} : R²={s['r2']:.3f} | Spearman={s['spearman']:.3f} "
+              f"| n={s['n']}")
+    return stats
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -505,10 +799,14 @@ def analyze_network(model, graph_dict, targets, args, T=None, label=""):
 #  ÉVALUATION INDUCTIVE (nouveaux capteurs)
 # ══════════════════════════════════════════════════════════════════════════════
 
-def inductive_eval(sage_model, graph_dict, new_positions, args):
+def inductive_eval(sage_model, graph_dict, new_positions, args, T=None, S=None):
     """
     Évalue des capteurs hypothétiques avec GraphSAGE pré-entraîné.
     Les nouveaux nœuds sont connectés aux k plus proches voisins existants.
+    Si T/S sont fournis, TOUTES les features (y compris corrélations,
+    variance locale, d_nn) sont recalculées sur le réseau étendu —
+    l'évaluation reflète alors le réseau tel qu'il serait après ajout,
+    dans la même distribution de features que l'entraînement.
     """
     from scipy.spatial import KDTree
 
@@ -518,19 +816,7 @@ def inductive_eval(sage_model, graph_dict, new_positions, args):
     existing_pos = graph_dict["positions"]
     n_existing = len(existing_pos)
     all_positions = existing_pos + new_positions
-
-    # Features pour les nouveaux nœuds (8 dim, inconnus remplis à 0)
     in_dim = graph_dict["x"].shape[1]
-    new_feat_list = []
-    for x_p, y_p in new_positions:
-        f = [x_p / NX, y_p / NY, 0.5, 0.0]  # pos, corr_max=0.5, degree=0
-        f += [0.0] * (in_dim - 4)             # var_T, var_S, grad, dist_bord inconnus
-        # Distance au bord (celle-ci on peut la calculer)
-        if in_dim >= 8:
-            f[7] = min(x_p, NX-1-x_p, y_p, NY-1-y_p) / (max(NX, NY) / 2)
-        new_feat_list.append(f)
-    new_feat = torch.tensor(new_feat_list, dtype=torch.float)
-    x_ext = torch.cat([graph_dict["x"], new_feat], dim=0)
 
     # Connexion des nouveaux nœuds aux k plus proches existants
     pos_arr = np.array(all_positions, dtype=np.float32)
@@ -545,6 +831,26 @@ def inductive_eval(sage_model, graph_dict, new_positions, args):
     edge_ext = torch.tensor(
         [graph_dict["edge_index"][0].tolist() + new_src,
          graph_dict["edge_index"][1].tolist() + new_dst], dtype=torch.long)
+
+    if T is not None and S is not None:
+        # Features complètes recalculées sur le réseau étendu
+        corr_ext = build_spatial_correlation(T, S, all_positions,
+                                             n_timestamps=min(200, len(T)))
+        deg_ext = np.bincount(edge_ext[0].numpy(),
+                              minlength=len(all_positions)).astype(np.float32)
+        feats = _compute_node_features(all_positions, corr_ext, deg_ext, T, S)
+        x_ext = torch.tensor(feats[:, :in_dim], dtype=torch.float)
+    else:
+        # Fallback : features partielles (position, bord), inconnus à 0
+        new_feat_list = []
+        for x_p, y_p in new_positions:
+            f = [x_p / NX, y_p / NY, 0.5, 0.0]
+            f += [0.0] * (in_dim - 4)
+            if in_dim >= 8:
+                f[7] = min(x_p, NX - 1 - x_p, y_p, NY - 1 - y_p) / (max(NX, NY) / 2)
+            new_feat_list.append(f)
+        x_ext = torch.cat([graph_dict["x"],
+                           torch.tensor(new_feat_list, dtype=torch.float)], dim=0)
 
     sage_model.eval()
     with torch.no_grad():
@@ -588,6 +894,18 @@ def parse_args():
     p.add_argument("--gnn_epochs",     type=int,   default=200)
     p.add_argument("--output_dir",     type=str,   default="outputs")
     p.add_argument("--n_buoys",        type=int,   default=N_BUOYS)
+    p.add_argument("--data",           choices=["synthetic", "glorys"],
+                   default="synthetic")
+    p.add_argument("--glorys_cache",   type=str,   default="data/glorys_cache")
+    p.add_argument("--time_step",      type=int,   default=3,
+                   help="Sous-échantillonnage temporel du split train GLORYS")
+    p.add_argument("--targets",        choices=["proxy", "ae"], default="proxy",
+                   help="Supervision : proxy corrélation (historique, circulaire)"
+                        " ou cibles LOO de l'AE (Brique 1 --gen_targets)")
+    p.add_argument("--targets_file",   type=str,
+                   default="outputs/ae_loo_targets.json")
+    p.add_argument("--gnn_loss",       choices=["mse", "rank"], default="mse",
+                   help="rank : hinge par paires, robuste au bruit des cibles")
     return p.parse_args()
 
 
@@ -604,12 +922,19 @@ if __name__ == "__main__":
     print(" Brique 2 — GNN : Structure du Réseau d'Observation")
     print("═" * 60)
 
-    print(f"\n[1/3] Nature run (seed={args.seed_ocean}, nt=500)...")
-    gen = SyntheticOceanGenerator()
-    T, S = gen.generate_dataset(nt=500, seed=args.seed_ocean)
+    data = setup_data_source(args)
+    if data is not None:
+        print(f"\n[1/3] Nature run GLORYS12 (split train, step={args.time_step})...")
+        T, S = data.get_arrays("train", ("T", "S"), normalized=True,
+                               step=args.time_step)
+        print(f"      {len(T)} jours — grille {NX}x{NY}")
+    else:
+        print(f"\n[1/3] Nature run (seed={args.seed_ocean}, nt=500)...")
+        gen = SyntheticOceanGenerator()
+        T, S = gen.generate_dataset(nt=500, seed=args.seed_ocean)
 
     rng = np.random.default_rng(args.seed_buoys)
-    positions = [(int(rng.integers(0, NX)), int(rng.integers(0, NY))) for _ in range(args.n_buoys)]
+    positions = _rand_positions(rng, args.n_buoys)
 
     print(f"\n[2/3] Corrélation spatiale...")
     corr_matrix = build_spatial_correlation(T, S, positions, n_timestamps=300)
@@ -625,8 +950,23 @@ if __name__ == "__main__":
     model_sage = None
 
     if args.train:
-        model_gat = train_gnn(args, graph_dict, targets)
-        model_sage = train_sage(args, graph_dict, targets)
+        if args.targets == "ae":
+            print(f"\n[cibles AE] chargement : {args.targets_file}")
+            meta, configs = load_ae_targets(args.targets_file)
+            print(f"[cibles AE] {len(configs)} configurations réseau "
+                  f"(données='{meta.get('data')}', n_t={meta.get('n_t')}, "
+                  f"n_mc={meta.get('loo_mc')})")
+            print("[cibles AE] construction des graphes par configuration...")
+            graphs_cfg, tgts_cfg = build_graphs_from_configs(configs, T, S, args)
+            model_gat, model_sage, (idx_tr, idx_te) = \
+                train_on_ae_targets(args, graphs_cfg, tgts_cfg)
+            if idx_te:
+                plot_target_validation({"GAT": model_gat, "SAGE": model_sage},
+                                       graphs_cfg, tgts_cfg, idx_te, args,
+                                       meta=meta)
+        else:
+            model_gat = train_gnn(args, graph_dict, targets)
+            model_sage = train_sage(args, graph_dict, targets)
 
     if args.analyze:
         if model_gat is None:
@@ -650,6 +990,7 @@ if __name__ == "__main__":
             new_positions = ast.literal_eval(args.new_positions)
         except Exception:
             new_positions = [(10, 20), (80, 150), (130, 40)]
-        inductive_eval(model_sage, graph_dict, new_positions, args)
+        new_positions = _snap_to_ocean(new_positions)
+        inductive_eval(model_sage, graph_dict, new_positions, args, T=T, S=S)
 
     print("\n  ✓ Brique 2 terminée.")

@@ -1,55 +1,56 @@
 """
-Nature run 2D+T de surface — SST / SSS / SSH — et échantillonnage bouées.
+2D+T surface nature run -- SST / SSS / SSH -- and buoy sampling.
 
-Version 3 — Modèle dynamique plutôt que superposition de motifs
-================================================================
-La version 2 fabriquait la SST en additionnant des motifs analytiques
-(gyre + gaussiennes + bruit) redessinés à chaque pas de temps. Résultat :
-pas de cohérence temporelle à petite échelle, pas de filamentation, pas de
-lien entre le courant et le traceur.
+Version 3 -- a dynamical model rather than a superposition of patterns
+=====================================================================
+Version 2 built SST by adding analytical patterns (gyre + Gaussians + noise)
+redrawn at every time step. The result had no small-scale temporal coherence,
+no filamentation, and no link between the current and the tracer.
 
-Ici l'océan est produit par un vrai petit modèle :
+Here the ocean is produced by an actual small model:
 
-    1.  Fonction de courant géostrophique psi(x,y,t)
-            psi = double gyre + jet méandreux + tourbillons + perturbation
-        d'où u = -dpsi/dy, v = +dpsi/dx  (non divergent par construction)
-        et la hauteur de mer SSH = f0 * psi / g.
+    1.  Geostrophic streamfunction psi(x,y,t)
+            psi = double gyre + meandering jet + eddies + perturbation
+        hence u = -dpsi/dy, v = +dpsi/dx  (non-divergent by construction)
+        and sea surface height SSH = f0 * psi / g.
 
-    2.  Traceurs SST et SSS ADVECTÉS par ce courant :
+    2.  SST and SSS tracers ADVECTED by that flow:
             dC/dt + u.grad(C) = -(C - C_clim(y,t))/tau + kappa * lap(C)
-        schéma semi-lagrangien (interpolation Catmull-Rom) + rappel implicite.
+        semi-Lagrangian scheme (Catmull-Rom interpolation) + implicit restoring.
 
-    3.  Les fronts, filaments et gradients ne sont pas dessinés : ils
-        émergent de la compétition entre le brassage par le courant et le
-        rappel vers la climatologie. C'est ce qui donne la texture réaliste.
+    3.  Fronts, filaments and gradients are not drawn: they EMERGE from the
+        competition between stirring by the flow and restoring towards
+        climatology. That is what gives the field its realistic texture.
 
-    4.  Les tourbillons vivent dans psi (pas dans la SST), se déplacent avec
-        le courant grande échelle + dérive beta vers l'ouest, naissent
-        préférentiellement le long du jet (instabilité barocline) et meurent.
+    4.  Eddies live in psi (not in SST), are advected by the large-scale flow
+        plus westward beta drift, are born preferentially along the jet
+        (baroclinic instability), and decay.
 
-    5.  SST et SSS ont des temps de rappel DIFFÉRENTS (flux de chaleur ~40 j
-        contre flux d'eau douce ~150 j). Leurs échelles de décorrélation
-        temporelle diffèrent donc — ce qui est précisément l'information qui
-        justifie de dimensionner un réseau variable par variable.
+    5.  SST and SSS have DIFFERENT restoring timescales (heat flux ~40 days
+        against freshwater flux ~150 days). Their temporal decorrelation
+        scales therefore differ -- which is precisely the information that
+        justifies sizing a network variable by variable.
 
-Grandeurs physiques dimensionnées (km, jours, m/s, °C, psu, m) — voir config.py.
+All quantities are dimensional (km, days, m/s, degC, psu, m) -- see config.py.
 
-API inchangée :
+Unchanged API:
     SyntheticOceanGenerator().generate_dataset(nt, seed) -> (T, S)
-Nouveautés :
-    .generate_full(nt, seed) -> dict complet (T, S, SSH, U, V, ZETA, SIGMA0)
-    .diagnostics()           -> échelles de décorrélation, EKE, corrélation T-S
+New:
+    .generate_full(nt, seed) -> full dict (T, S, SSH, U, V, ZETA, SIGMA0)
+    .diagnostics()           -> decorrelation scales, EKE, T-S correlation
 """
 import numpy as np
 from numpy.fft import fft2, ifft2, fftfreq
 from pathlib import Path
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # allow `python data/dataset.py`
 import torch
 from torch.utils.data import Dataset
 from config import *
 
 
 # =============================================================================
-#  Constantes physiques
+#  Physical constants
 # =============================================================================
 OMEGA_EARTH = 7.2921e-5      # rad/s
 R_EARTH     = 6.371e6        # m
@@ -58,7 +59,7 @@ DAY         = 86400.0        # s
 
 
 def sigma0(T, S):
-    """Densité potentielle de surface (EOS-80, p=0) moins 1000 kg/m3."""
+    """Surface potential density (EOS-80, p = 0) minus 1000 kg/m3."""
     T = np.asarray(T, dtype=np.float64); S = np.asarray(S, dtype=np.float64)
     rho_w = (999.842594 + 6.793952e-2*T - 9.095290e-3*T**2
              + 1.001685e-4*T**3 - 1.120083e-6*T**4 + 6.536332e-9*T**5)
@@ -70,7 +71,7 @@ def sigma0(T, S):
 
 
 # =============================================================================
-#  Interpolation bicubique Catmull-Rom (périodique en x, bornée en y)
+#  Catmull-Rom bicubic interpolation (periodic in x, clamped in y)
 # =============================================================================
 
 def _cr_weights(f):
@@ -83,12 +84,12 @@ def _cr_weights(f):
 
 class _Stencil:
     """
-    Pochoir d'interpolation bicubique Catmull-Rom précalculé.
+    Precomputed Catmull-Rom bicubic interpolation stencil.
 
-    Les indices et les poids ne dépendent que des points de départ, pas du
-    champ interpolé : on les construit une fois par pas de temps et on les
-    applique à SST, SSS, u, v. C'est ce qui rend le semi-lagrangien
-    abordable en numpy pur (x périodique, y borné).
+    Indices and weights depend only on the departure points, not on the field
+    being interpolated: they are built once per time step and applied to SST,
+    SSS, u and v. This is what makes the semi-Lagrangian scheme affordable in
+    pure numpy (periodic in x, clamped in y).
     """
     __slots__ = ("idx", "w", "shape")
 
@@ -112,12 +113,12 @@ class _Stencil:
 
 
 def _interp_bicubic(F, xi, yi):
-    """Interpolation ponctuelle (usage occasionnel / rétro-compatibilité)."""
+    """One-off interpolation (occasional use / backward compatibility)."""
     return _Stencil(xi, yi, *F.shape).apply(F)
 
 
 def _laplacian(F):
-    """Laplacien 5 points : périodique en x, Neumann (flux nul) en y."""
+    """5-point Laplacian: periodic in x, Neumann (zero flux) in y."""
     lap = np.roll(F, 1, axis=0) + np.roll(F, -1, axis=0) - 2.0 * F
     Fy = np.empty((F.shape[0], F.shape[1] + 2), dtype=F.dtype)
     Fy[:, 1:-1] = F; Fy[:, 0] = F[:, 0]; Fy[:, -1] = F[:, -1]
@@ -126,7 +127,7 @@ def _laplacian(F):
 
 
 def _grad(F, dx, dy):
-    """Gradient centré : périodique en x, décentré aux bords en y."""
+    """Centred gradient: periodic in x, one-sided at the y boundaries."""
     dFdx = (np.roll(F, -1, axis=0) - np.roll(F, 1, axis=0)) / (2 * dx)
     dFdy = np.empty_like(F)
     dFdy[:, 1:-1] = (F[:, 2:] - F[:, :-2]) / (2 * dy)
@@ -136,16 +137,16 @@ def _grad(F, dx, dy):
 
 
 # =============================================================================
-#  Générateur
+#  Generator
 # =============================================================================
 
 class SyntheticOceanGenerator:
     """
-    Nature run OSSE : SST / SSS / SSH sur un canal zonal de LX_KM x LY_KM.
+    OSSE nature run: SST / SSS / SSH over a zonal channel of Lx x Ly.
 
-    L'appel `generate_dataset(nt, seed)` est entièrement déterministe : le
-    seed contrôle la population de tourbillons, les méandres du jet et le
-    bruit stochastique. Deux appels avec le même seed donnent le même océan.
+    `generate_dataset(nt, seed)` is fully deterministic: the seed controls the
+    eddy population, the jet meanders and the stochastic noise. Two calls with
+    the same seed give the same ocean.
     """
 
     def __init__(self, nx=NX, ny=NY, dx_km=DX_KM, lat0=LAT0,
@@ -157,29 +158,29 @@ class SyntheticOceanGenerator:
         self.lat0 = lat0
         self.n_eddies = n_eddies
 
-        # Paramètres de Coriolis sur plan beta
+        # Coriolis parameters on a beta plane
         phi      = np.deg2rad(lat0)
         self.f0  = 2 * OMEGA_EARTH * np.sin(phi)
         self.beta = 2 * OMEGA_EARTH * np.cos(phi) / R_EARTH
 
-        # Grilles métriques (X zonal = axe 0, Y méridien = axe 1)
+        # Metric grids (X zonal = axis 0, Y meridional = axis 1)
         self.xg = (np.arange(nx) + 0.5) * self.dx
         self.yg = (np.arange(ny) + 0.5) * self.dy
         self.X, self.Y = np.meshgrid(self.xg, self.yg, indexing="ij")
-        self.Yf = self.Y / self.Ly                      # y normalisé [0,1]
+        self.Yf = self.Y / self.Ly                      # y normalised to [0, 1]
 
-        # Atténuation près des parois : psi -> const aux bords donc v -> 0
+        # Taper near the walls: psi -> const at the boundaries, hence v -> 0
         Lw = 5 * self.dx
         self.wall = np.tanh(self.Y / Lw) * np.tanh((self.Ly - self.Y) / Lw)
 
-        # Grille d'indices (points d'arrivée du semi-lagrangien)
+        # Index grid (arrival points of the semi-Lagrangian scheme)
         self._ix = np.repeat(np.arange(nx, dtype=np.float64)[:, None], ny, axis=1)
         self._iy = np.repeat(np.arange(ny, dtype=np.float64)[None, :], nx, axis=0)
 
         self._seed(seed)
 
     # -------------------------------------------------------------------------
-    #  Initialisation stochastique
+    #  Stochastic initialisation
     # -------------------------------------------------------------------------
     def _seed(self, seed):
         self.rng = np.random.default_rng(seed)
@@ -188,7 +189,7 @@ class SyntheticOceanGenerator:
         self.psi_pert = np.zeros((self.nx, self.ny))
 
     def _init_jet(self):
-        """Méandres du jet : 3 modes zonaux entiers (domaine périodique en x)."""
+        """Jet meanders: 3 integer zonal modes (domain is periodic in x)."""
         self.jet_modes = []
         for m, amp_km, per_d in zip((1, 2, 3), (55.0, 32.0, 18.0), (140., 85., 45.)):
             self.jet_modes.append({
@@ -199,9 +200,9 @@ class SyntheticOceanGenerator:
             })
 
     def _spawn_eddy(self, t=0.0, newborn=True):
-        """Naissance d'un tourbillon : préférentiellement le long du jet."""
+        """Eddy birth: preferentially along the jet."""
         cx = self.rng.uniform(0, self.Lx)
-        if self.rng.random() < 0.50:                     # pincement du méandre
+        if self.rng.random() < 0.50:                     # meander pinch-off
             side = self.rng.choice([-1.0, 1.0])
             cy = self._jet_axis_1d(cx, t) + side * self.rng.uniform(0.6, 2.2) * EDDY_R_KM[1]*1e3
         else:
@@ -222,10 +223,10 @@ class SyntheticOceanGenerator:
                        for _ in range(self.n_eddies)]
 
     # -------------------------------------------------------------------------
-    #  Fonction de courant
+    #  Streamfunction
     # -------------------------------------------------------------------------
     def _jet_axis_1d(self, x, t):
-        """Latitude de l'axe du jet en un point x (m) à l'instant t (jours)."""
+        """Latitude of the jet axis at a point x (m) and time t (days)."""
         y = JET_LAT_FRAC * self.Ly
         for md in self.jet_modes:
             y += md["amp"] * np.sin(2*np.pi*md["m"]*x/self.Lx
@@ -251,14 +252,14 @@ class SyntheticOceanGenerator:
                 continue
             A  = ed["sign"] * ed["V"] * ed["R"] * np.sqrt(np.e) * env
             dx = self.X - ed["cx"]
-            dx -= self.Lx * np.round(dx / self.Lx)               # périodique en x
+            dx -= self.Lx * np.round(dx / self.Lx)               # periodic in x
             dy = self.Y - ed["cy"]
             psi += A * np.exp(-(dx**2 + dy**2) / (2 * ed["R"]**2))
         return psi * self.wall
 
     def _step_eddies(self, t, dt_d, u, v):
-        """Advection des tourbillons par le courant + dérive beta vers l'ouest."""
-        c_beta = -self.beta * (RD_KM * 1e3) ** 2                 # m/s (< 0 = ouest)
+        """Eddy advection by the flow + westward beta drift."""
+        c_beta = -self.beta * (RD_KM * 1e3) ** 2                 # m/s (< 0 = westward)
         for k, ed in enumerate(self.eddies):
             if t - ed["t0"] > ed["life"]:
                 self.eddies[k] = self._spawn_eddy(t, newborn=True)
@@ -270,21 +271,21 @@ class SyntheticOceanGenerator:
                                      0.06 * self.Ly, 0.94 * self.Ly))
 
     def _step_pert(self, dt_d):
-        """Perturbation méso-échelle non résolue : Ornstein-Uhlenbeck en temps,
-        spectre k^-3 en espace (turbulence géostrophique 2D)."""
+        """Unresolved mesoscale perturbation: Ornstein-Uhlenbeck in time,
+        k^-3 spectrum in space (2D geostrophic turbulence)."""
         a = np.exp(-dt_d / PERT_TAU_DAYS)
         b = np.sqrt(1 - a*a)
         self.psi_pert = a * self.psi_pert + b * self._colored_field(3.0)
 
     def _colored_field(self, alpha):
-        """Champ aléatoire de spectre k^-alpha, variance unité, filtré aux
-        échelles < 4 mailles."""
+        """Random field with a k^-alpha spectrum, unit variance, filtered
+        below the 4-grid-cell scale."""
         kx = fftfreq(self.nx); ky = fftfreq(self.ny)
         KX, KY = np.meshgrid(kx, ky, indexing="ij")
         K = np.sqrt(KX**2 + KY**2); K[0, 0] = 1e-9
         amp = K ** (-alpha / 2.0)
         amp[0, 0] = 0.0
-        amp *= np.exp(-(K / 0.25) ** 4)                # coupure sous-maille
+        amp *= np.exp(-(K / 0.25) ** 4)                # sub-grid cutoff
         z = (self.rng.standard_normal((self.nx, self.ny))
              + 1j * self.rng.standard_normal((self.nx, self.ny)))
         f = np.real(ifft2(z * amp))
@@ -298,20 +299,20 @@ class SyntheticOceanGenerator:
         return psi, -dpy, dpx                          # psi, u, v
 
     # -------------------------------------------------------------------------
-    #  Climatologies de rappel
+    #  Restoring climatologies
     # -------------------------------------------------------------------------
     def _T_clim(self, t):
-        """Gradient méridien (chaud au sud) + cycle saisonnier amorti au nord."""
+        """Meridional gradient (warm to the south) + seasonal cycle damped northward."""
         merid = SST_GRADIENT * (0.5 - self.Yf)
         seas  = SST_SEASONAL_AMP * np.sin(2*np.pi*(t - SEASON_PHASE_DAYS)/365.25)
         return SST_MEAN + merid + seas * (1.0 + 0.35*(0.5 - self.Yf))
 
     def _S_clim(self, t):
         """
-        Maximum subtropical de salinité (évaporation) aligné sur le gradient de
-        T -> corrélation T-S positive, cohérente avec la compensation de densité.
-        Un panache dessalé côtier (nord-ouest) casse la dégénérescence : la
-        corrélation T-S devient spatialement variable, comme dans l'océan réel.
+        Subtropical salinity maximum (evaporation) aligned with the T gradient
+        -> positive T-S correlation, consistent with density compensation.
+        A coastal fresh plume (north-west) breaks the degeneracy: the T-S
+        correlation becomes spatially variable, as in the real ocean.
         """
         aligned = SSS_GRADIENT * (0.5 - self.Yf)
         plume   = -SSS_PLUME_AMP * np.exp(
@@ -322,19 +323,18 @@ class SyntheticOceanGenerator:
         return SSS_MEAN + rho*aligned + np.sqrt(1 - rho**2)*plume + seas
 
     # -------------------------------------------------------------------------
-    #  Intégration
+    #  Integration
     # -------------------------------------------------------------------------
     def _departure_stencil(self, u, v, dt_s):
         """
-        Pochoir des points de départ pour un pas semi-lagrangien.
-        Le champ de vitesse étant gelé sur le pas de sortie, ce pochoir est
-        identique pour tous les sous-pas et pour tous les traceurs : on le
-        construit une seule fois.
+        Departure-point stencil for one semi-Lagrangian step.
+        Since the velocity field is frozen over the output step, this stencil
+        is identical for every substep and every tracer: it is built once.
         """
         ix, iy = self._ix, self._iy
         cx = u * (dt_s / self.dx)
         cy = v * (dt_s / self.dy)
-        # itération du point milieu (trajectoire d'ordre 2)
+        # midpoint iteration (second-order trajectory)
         mid = _Stencil(ix - 0.5*cx,
                        np.clip(iy - 0.5*cy, 0, self.ny - 1), self.nx, self.ny)
         cx = mid.apply(u) * (dt_s / self.dx)
@@ -346,7 +346,7 @@ class SyntheticOceanGenerator:
         dt_out = DT_DAYS
         nsub   = max(1, int(N_SUBSTEPS))
         dt_s   = dt_out * DAY / nsub
-        kdt    = KAPPA * dt_s / self.dx**2               # nombre de diffusion
+        kdt    = KAPPA * dt_s / self.dx**2               # diffusion number
         rT     = dt_s / (TAU_T_DAYS * DAY)
         rS     = dt_s / (TAU_S_DAYS * DAY)
 
@@ -385,18 +385,18 @@ class SyntheticOceanGenerator:
                 np.stack(V_out).astype(np.float32))
 
     # -------------------------------------------------------------------------
-    #  API publique
+    #  Public API
     # -------------------------------------------------------------------------
     def generate_full(self, nt=NT, seed=None, spinup_days=None):
         """
-        Nature run complet. Retourne un dict :
-            T (°C), S (psu), SSH (m), U, V (m/s), ZETA (s-1), SIGMA0 (kg/m3)
-        toutes de forme (nt, nx, ny), plus les métadonnées du domaine.
+        Full nature run. Returns a dict:
+            T (degC), S (psu), SSH (m), U, V (m/s), ZETA (s-1), SIGMA0 (kg/m3)
+        all shaped (nt, nx, ny), plus the domain metadata.
         """
         self._seed(seed)
         spinup = int(SPINUP_DAYS if spinup_days is None else spinup_days)
 
-        # État initial = climatologie + petite perturbation cohérente
+        # Initial state = climatology + a small coherent perturbation
         self.T = self._T_clim(-spinup * DT_DAYS) + 0.25 * self._colored_field(3.0)
         self.S = self._S_clim(-spinup * DT_DAYS) + 0.03 * self._colored_field(3.0)
 
@@ -418,23 +418,23 @@ class SyntheticOceanGenerator:
         return self.last_run
 
     def generate_dataset(self, nt=NT, seed=None):
-        """Compatibilité pipeline : retourne (SST, SSS) de forme (nt, nx, ny)."""
+        """Pipeline compatibility: returns (SST, SSS) shaped (nt, nx, ny)."""
         run = self.generate_full(nt=nt, seed=seed)
         return run["T"], run["S"]
 
     # -------------------------------------------------------------------------
     def diagnostics(self, run=None):
-        """Échelles caractéristiques du nature run (utiles pour dimensionner
-        l'espacement et la fréquence d'échantillonnage d'un réseau)."""
+        """Characteristic scales of the nature run (useful for sizing the
+        spacing and sampling frequency of a network)."""
         r = run or getattr(self, "last_run", None)
         if r is None:
-            raise RuntimeError("Appeler generate_full() d'abord.")
+            raise RuntimeError("Call generate_full() first.")
         T, S, U, V = r["T"], r["S"], r["U"], r["V"]
         dxkm = r["dx_m"] / 1e3
 
         def decorr_time(C, deseason=False):
             A = C - C.mean(axis=0, keepdims=True)
-            if deseason:                       # retire le signal grande echelle
+            if deseason:                       # remove the large-scale signal
                 A = A - A.mean(axis=(1, 2), keepdims=True)
             A = A / (A.std(axis=0, keepdims=True) + 1e-9)
             nlag = min(90, len(C)//3)
@@ -443,8 +443,8 @@ class SyntheticOceanGenerator:
             return float(below[0] * r["dt_days"]) if len(below) else float(nlag)
 
         def decorr_len(C):
-            """Echelle de decorrelation zonale des anomalies (moyenne zonale
-            retiree, sinon la structure grande echelle domine)."""
+            """Zonal decorrelation scale of the anomalies (the zonal mean is
+            removed, otherwise the large-scale structure dominates)."""
             F0 = C[len(C)//2]
             A = F0 - F0.mean(axis=0, keepdims=True)
             Fh = np.fft.rfft(A, axis=0)
@@ -459,37 +459,36 @@ class SyntheticOceanGenerator:
         return {
             "SST_mean": float(T.mean()), "SST_std": float(T.std()),
             "SSS_mean": float(S.mean()), "SSS_std": float(S.std()),
-            "SST_range_saison": float(np.ptp(T.mean(axis=(1, 2)))),
-            "tau_decorr_SST_j": decorr_time(T),
-            "tau_decorr_SSS_j": decorr_time(S),
-            "tau_SST_mesoech_j": decorr_time(T, deseason=True),
-            "tau_SSS_mesoech_j": decorr_time(S, deseason=True),
+            "SST_seasonal_range_degC": float(np.ptp(T.mean(axis=(1, 2)))),
+            "tau_decorr_SST_days": decorr_time(T),
+            "tau_decorr_SSS_days": decorr_time(S),
+            "tau_SST_mesoscale_days": decorr_time(T, deseason=True),
+            "tau_SSS_mesoscale_days": decorr_time(S, deseason=True),
             "L_decorr_SST_km":  decorr_len(T),
             "L_decorr_SSS_km":  decorr_len(S),
-            "vitesse_rms_m_s":  float(np.sqrt((U**2 + V**2).mean())),
-            "vitesse_p99_m_s":  float(np.percentile(np.sqrt(U**2 + V**2), 99)),
-            "EKE_moy_m2_s2":    float(eke.mean()),
+            "speed_rms_m_s":  float(np.sqrt((U**2 + V**2).mean())),
+            "speed_p99_m_s":  float(np.percentile(np.sqrt(U**2 + V**2), 99)),
+            "EKE_mean_m2_s2":    float(eke.mean()),
             "Rossby_p99":       float(np.percentile(np.abs(r["ZETA"]), 99) / abs(r["f0"])),
-            "corr_TS_globale":  float(np.corrcoef(T.ravel(), S.ravel())[0, 1]),
-            "corr_TS_anom_med": float(np.median(rho_map)),
+            "corr_TS_global":  float(np.corrcoef(T.ravel(), S.ravel())[0, 1]),
+            "corr_TS_anomaly_median": float(np.median(rho_map)),
         }
 
 
 # =============================================================================
-#  Utilitaires d'analyse partagés par les 3 briques
+#  Analysis utilities shared by the three bricks
 # =============================================================================
 
 def mesoscale_anomaly(F):
     """
-    Retire la moyenne de domaine à chaque pas de temps.
+    Remove the domain mean at every time step.
 
-    Pourquoi c'est indispensable ici : le cycle saisonnier est un mode
-    quasi uniforme sur tout le domaine. Si on le laisse, deux bouées
-    situées à 1000 km l'une de l'autre affichent une corrélation > 0.8
-    simplement parce qu'elles voient toutes les deux l'été arriver — le
-    graphe du GNN devient une quasi-clique et la carte de variance du RL
-    s'aplatit. Après retrait, il ne reste que la variabilité mésoéchelle,
-    qui est celle que le réseau doit effectivement échantillonner.
+    Why this is indispensable here: the seasonal cycle is a near-uniform mode
+    over the whole domain. Keep it and two buoys 1000 km apart show a
+    correlation above 0.8 simply because both see summer arrive -- the GNN
+    graph becomes a near-clique and the RL variance map flattens out. Once it
+    is removed only mesoscale variability is left, which is what the network
+    actually has to sample.
     """
     F = np.asarray(F)
     return F - F.mean(axis=(1, 2), keepdims=True)
@@ -498,14 +497,14 @@ def mesoscale_anomaly(F):
 def local_variance_map(T, S, positions, half_win=2, deseason=DESEASON_ANALYSIS,
                        w_T=0.6, w_S=0.4):
     """
-    Variance locale mésoéchelle autour de chaque position, pour SST et SSS.
+    Local mesoscale variance around each position, for SST and SSS.
 
-    Les deux variances sont standardisées SÉPARÉMENT avant d'être combinées :
-    var(SST) ~ 3 °C² et var(SSS) ~ 0.03 psu², un mélange direct
-    0.6·var_T + 0.4·var_S réduit la contribution de la salinité à moins de
-    0.1 % de la variance du mélange, c'est-à-dire à rien du tout.
+    The two variances are standardised SEPARATELY before being combined:
+    var(SST) ~ 3 degC^2 against var(SSS) ~ 0.03 psu^2, so a direct mix of
+    0.6*var_T + 0.4*var_S drops the salinity contribution below 0.1% of the
+    mixture variance -- that is, to nothing at all.
 
-    Retourne (mix, vT_std, vS_std) — mix standardisé, moyenne 0, écart-type 1.
+    Returns (mix, vT_raw, vS_raw); mix is standardised to mean 0, std 1.
     """
     Tw, Sw = (mesoscale_anomaly(T), mesoscale_anomaly(S)) if deseason else (T, S)
     nx, ny = T.shape[1], T.shape[2]
@@ -526,8 +525,8 @@ def local_variance_map(T, S, positions, half_win=2, deseason=DESEASON_ANALYSIS,
 def sensor_series(T, S, positions, deseason=DESEASON_ANALYSIS,
                   w_T=0.6, w_S=0.4, t_idx=None):
     """
-    Série temporelle standardisée vue par chaque capteur (mélange T/S).
-    Base commune de la matrice de corrélation du GNN.
+    Standardised time series seen by each sensor (T/S mixture).
+    Common basis for the GNN correlation matrix.
     """
     Tw, Sw = (mesoscale_anomaly(T), mesoscale_anomaly(S)) if deseason else (T, S)
     if t_idx is None:
@@ -544,16 +543,16 @@ def sensor_series(T, S, positions, deseason=DESEASON_ANALYSIS,
 def sample_separated_positions(nx, ny, n, min_sep_km=MIN_BUOY_SEP_KM,
                                rng=None, dx_km=DX_KM, max_tries=200):
     """
-    Tire n positions en pixels séparées d'au moins `min_sep_km`.
+    Draw n pixel positions separated by at least `min_sep_km`.
 
-    Deux bouées trop proches sont redondantes par construction (elles voient
-    la même structure mésoéchelle) et, sur la grille candidate du RL, elles
-    sont interdites. Les réseaux de référence des briques AE et GNN doivent
-    respecter la même contrainte, sinon on compare des réseaux réalisables à
-    des réseaux qui ne le sont pas.
+    Two buoys that are too close are redundant by construction (they see the
+    same mesoscale structure) and, on the RL candidate grid, they are
+    forbidden. The reference networks of the AE and GNN bricks must obey the
+    same constraint, otherwise feasible networks are compared against
+    infeasible ones.
 
-    Tirage par rejet, puis relâchement progressif de la contrainte si le
-    domaine ne peut pas accueillir n positions (avertissement explicite).
+    Rejection sampling, then progressive relaxation of the constraint if the
+    domain cannot host n positions (with an explicit warning).
     """
     rng = rng or np.random.default_rng()
     sep = float(min_sep_km) / float(dx_km)          # en pixels
@@ -567,16 +566,16 @@ def sample_separated_positions(nx, ny, n, min_sep_km=MIN_BUOY_SEP_KM,
                 pts.append(c)
         if len(pts) >= n:
             return pts[:n]
-        sep *= 0.8                                   # domaine trop contraint
-    print(f"  [ATTENTION] séparation {min_sep_km} km inatteignable pour "
-          f"{n} bouées : appliquée à {sep*dx_km:.0f} km")
+        sep *= 0.8                                   # domain too constrained
+    print(f"  [WARNING] {min_sep_km} km separation unreachable for {n} buoys: "
+          f"relaxed to {sep*dx_km:.0f} km")
     while len(pts) < n:
         pts.append((int(rng.integers(0, nx)), int(rng.integers(0, ny))))
     return pts[:n]
 
 
 # =============================================================================
-#  Échantillonneur de bouées
+#  Buoy sampler
 # =============================================================================
 
 class BuoySampler:
@@ -616,7 +615,7 @@ class BuoySampler:
 
 
 # =============================================================================
-#  Dataset PyTorch — masque stochastique  (inchangé)
+#  PyTorch dataset -- stochastic observation mask
 # =============================================================================
 
 class OceanOEDDataset(Dataset):
@@ -627,17 +626,17 @@ class OceanOEDDataset(Dataset):
         self.nx, self.ny = T.shape[1], T.shape[2]
         self.n_obs_min = n_obs_min
         self.n_obs_max = n_obs_max
-        # Bruit instrumental par variable, en unités physiques.
-        # (auparavant un scalaire unique divisé par T_std était appliqué aux
-        #  DEUX canaux : le canal SSS recevait un bruit calibré sur la
-        #  température, sans rapport avec sa propre dynamique)
+        # Per-variable instrumental noise, in physical units.
+        # (previously a single scalar divided by T_std was applied to BOTH
+        #  channels: the SSS channel received noise calibrated on temperature,
+        #  unrelated to its own dynamic range)
         if noise_std is None:
             self.noise_T, self.noise_S = OBS_NOISE_T, OBS_NOISE_S
         elif np.isscalar(noise_std):
             self.noise_T = self.noise_S = float(noise_std)
         else:
             self.noise_T, self.noise_S = map(float, noise_std)
-        self.noise_std = self.noise_T          # compat rétro
+        self.noise_std = self.noise_T          # legacy alias
         self.augment   = augment
 
         if normalize:
@@ -661,9 +660,10 @@ class OceanOEDDataset(Dataset):
         mask  = self._random_mask(n_obs)
         T_t, S_t = self.T[t], self.S[t]
 
-        # Augmentation : seul le flip zonal est licite (canal périodique en x).
-        # Un flip méridien inverserait le gradient nord-sud imposé par le
-        # forçage climatologique -> champ physiquement incohérent.
+        # Augmentation: only the zonal flip is legitimate (the channel is
+        # periodic in x). A meridional flip would reverse the north-south
+        # gradient imposed by the climatological forcing -> physically
+        # inconsistent field.
         if self.augment and np.random.rand() > 0.5:
             T_t = T_t[::-1].copy(); S_t = S_t[::-1].copy()
             mask = mask[::-1].copy()
@@ -690,16 +690,16 @@ def build_datasets(T, S, split=0.8, augment_train=False, **kwargs):
 
 def plot_nature_run(run, out_path="outputs/ocean_nature_run.png", S_arr=None):
     """
-    Figure diagnostique du nature run.
-    Accepte soit le dict de generate_full(), soit l'ancienne signature
-    plot_nature_run(T_arr, S_arr, out_path).
+    Diagnostic figure for the nature run.
+    Accepts either the dict returned by generate_full(), or the legacy
+    signature plot_nature_run(T_arr, S_arr, out_path).
     """
     import matplotlib; matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     import matplotlib.gridspec as gridspec
     from matplotlib.colors import LinearSegmentedColormap
 
-    if not isinstance(run, dict):                      # rétro-compatibilité
+    if not isinstance(run, dict):                      # backward compatibility
         run = {"T": run, "S": S_arr, "dx_m": DX_KM*1e3, "dt_days": DT_DAYS}
 
     T_arr, S_arr = run["T"], run["S"]
@@ -739,50 +739,50 @@ def plot_nature_run(run, out_path="outputs/ocean_nature_run.png", S_arr=None):
     vS = (np.percentile(S_arr, 0.5), np.percentile(S_arr, 99.5))
     snaps = [0, nt//3, 2*nt//3]
 
-    # ── Ligne 1 : SST à 3 instants + variabilité ──────────────────────────────
+    # -- Row 1: SST at three times + variability --------------------------------
     for col, t in enumerate(snaps):
         ax = fig.add_subplot(gs[0, col])
         im = show(ax, T_arr[t], cmap=ocean_cmap, vmin=vT[0], vmax=vT[1])
-        styled(ax, f"SST — jour {t}", im, "°C")
+        styled(ax, f"SST -- day {t}", im, "°C")
 
     ax = fig.add_subplot(gs[0, 3])
     im = show(ax, T_arr.std(axis=0), cmap="plasma")
-    styled(ax, "Variabilité SST (σ temporel)", im, "°C")
+    styled(ax, "SST variability (temporal sigma)", im, "°C")
 
-    # ── Ligne 2 : dynamique ───────────────────────────────────────────────────
+    # -- Row 2: dynamics --------------------------------------------------------
     ax = fig.add_subplot(gs[1, 0])
     if "SSH" in run:
         H = run["SSH"][snaps[1]]
         im = show(ax, H, cmap="RdYlBu_r")
         xs = np.linspace(0, NX_*dxkm, NX_); ys = np.linspace(0, NY_*dxkm, NY_)
         ax.contour(xs, ys, H.T, levels=14, colors="#101820", linewidths=0.5, alpha=0.55)
-        styled(ax, f"SSH + lignes de courant géostrophique — j{snaps[1]}", im, "m")
+        styled(ax, f"SSH + geostrophic streamlines -- day {snaps[1]}", im, "m")
     else:
         im = show(ax, S_arr[0], cmap=sal_cmap, vmin=vS[0], vmax=vS[1])
-        styled(ax, "SSS — jour 0", im, "psu")
+        styled(ax, "SSS -- day 0", im, "psu")
 
     ax = fig.add_subplot(gs[1, 1])
     if "ZETA" in run:
         Ro = run["ZETA"][snaps[1]] / run["f0"]
         lim = np.percentile(np.abs(Ro), 99)
         im = show(ax, Ro, cmap="RdBu_r", vmin=-lim, vmax=lim)
-        styled(ax, "Vorticité relative ζ/f (nombre de Rossby)", im, "ζ/f")
+        styled(ax, "Relative vorticity zeta/f (Rossby number)", im, "ζ/f")
     else:
         im = show(ax, T_arr.mean(0), cmap=ocean_cmap)
-        styled(ax, "SST moyenne", im, "°C")
+        styled(ax, "Mean SST", im, "°C")
 
     ax = fig.add_subplot(gs[1, 2])
     gx, gy = np.gradient(T_arr[snaps[1]], dxkm*1e3*1e-2, dxkm*1e3*1e-2)  # °C/100km
     gmag = np.sqrt(gx**2 + gy**2)
     im = show(ax, gmag, cmap="hot", vmin=0, vmax=np.percentile(gmag, 99))
-    styled(ax, f"|∇SST| — j{snaps[1]}  (fronts & filaments)", im, "°C/100 km")
+    styled(ax, f"|grad SST| -- day {snaps[1]}  (fronts & filaments)", im, "°C/100 km")
 
     ax = fig.add_subplot(gs[1, 3])
     im = show(ax, S_arr[snaps[1]], cmap=sal_cmap, vmin=vS[0], vmax=vS[1])
-    styled(ax, f"SSS — jour {snaps[1]}", im, "psu")
+    styled(ax, f"SSS -- day {snaps[1]}", im, "psu")
 
-    # ── Ligne 3 : diagnostics statistiques ────────────────────────────────────
-    ax = fig.add_subplot(gs[2, 0]); frame(ax, "Spectre radial SST")
+    # -- Row 3: statistical diagnostics -----------------------------------------
+    ax = fig.add_subplot(gs[2, 0]); frame(ax, "SST radial spectrum")
     A = T_arr[snaps[1]] - T_arr[snaps[1]].mean()
     P = np.abs(fft2(A))**2
     FX, FY = np.meshgrid(fftfreq(NX_, dxkm), fftfreq(NY_, dxkm), indexing="ij")
@@ -805,7 +805,7 @@ def plot_nature_run(run, out_path="outputs/ocean_nature_run.png", S_arr=None):
     ax.legend(fontsize=7, labelcolor="white", facecolor=BG, edgecolor=EDGE)
     ax.grid(True, alpha=0.2, color="white", which="both")
 
-    ax = fig.add_subplot(gs[2, 1]); frame(ax, "Autocorrélation spatiale (zonale)")
+    ax = fig.add_subplot(gs[2, 1]); frame(ax, "Spatial autocorrelation (zonal)")
     for F, c, lbl in [(T_arr[snaps[1]], "#fc8d59", "SST"), (S_arr[snaps[1]], "#6baed6", "SSS")]:
         Aa = F - F.mean(axis=0, keepdims=True)
         Fh = np.fft.rfft(Aa, axis=0)
@@ -820,10 +820,10 @@ def plot_nature_run(run, out_path="outputs/ocean_nature_run.png", S_arr=None):
     ax.legend(fontsize=7, labelcolor="white", facecolor=BG, edgecolor=EDGE)
     ax.grid(True, alpha=0.2, color="white")
 
-    ax = fig.add_subplot(gs[2, 2]); frame(ax, "Autocorrélation temporelle (anomalies)")
+    ax = fig.add_subplot(gs[2, 2]); frame(ax, "Temporal autocorrelation (anomalies)")
     nlag = min(90, nt//3)
     for F, c, lbl in [(T_arr, "#fc8d59", "SST"), (S_arr, "#6baed6", "SSS")]:
-        for des, ls, sfx in [(False, "-", ""), (True, "--", " (désaison.)")]:
+        for des, ls, sfx in [(False, "-", ""), (True, "--", " (deseasoned)")]:
             Aa = F - F.mean(axis=0, keepdims=True)
             if des:
                 Aa = Aa - Aa.mean(axis=(1, 2), keepdims=True)
@@ -833,11 +833,11 @@ def plot_nature_run(run, out_path="outputs/ocean_nature_run.png", S_arr=None):
                     color=c, lw=1.6, ls=ls, alpha=1.0 if not des else 0.8,
                     label=lbl + sfx)
     ax.axhline(1/np.e, color="white", ls="--", lw=0.8, alpha=0.6)
-    ax.set_xlabel("décalage (jours)", color="white", fontsize=7)
+    ax.set_xlabel("lag (days)", color="white", fontsize=7)
     ax.legend(fontsize=6, labelcolor="white", facecolor=BG, edgecolor=EDGE)
     ax.grid(True, alpha=0.2, color="white")
 
-    ax = fig.add_subplot(gs[2, 3]); frame(ax, "Diagramme T–S + isopycnes σ$_0$")
+    ax = fig.add_subplot(gs[2, 3]); frame(ax, "T-S diagram + sigma$_0$ isopycnals")
     sub = (slice(None, None, max(1, nt//60)), slice(None, 4), slice(None, 4))
     tt = T_arr[::max(1, nt//60), ::4, ::4].ravel()
     ss = S_arr[::max(1, nt//60), ::4, ::4].ravel()
@@ -852,19 +852,19 @@ def plot_nature_run(run, out_path="outputs/ocean_nature_run.png", S_arr=None):
     ax.set_xlabel("SSS (psu)", color="white", fontsize=7)
     ax.set_ylabel("SST (°C)", color="white", fontsize=7)
 
-    # ── Ligne 4 : séries, distributions, corrélation, réseau ──────────────────
-    ax = fig.add_subplot(gs[3, 0]); frame(ax, "Séries SST — 3 points + moyenne domaine")
+    # -- Row 4: time series, distributions, correlation, network ----------------
+    ax = fig.add_subplot(gs[3, 0]); frame(ax, "SST time series -- 3 points + domain mean")
     days = np.arange(nt) * run.get("dt_days", 1.0)
-    for (x, y, c, lbl) in [(NX_//5, NY_//4, "#ff6b6b", "sud"),
+    for (x, y, c, lbl) in [(NX_//5, NY_//4, "#ff6b6b", "south"),
                            (NX_//2, NY_//2, "#ffd93d", "jet"),
-                           (4*NX_//5, 4*NY_//5, "#6bcb77", "nord")]:
+                           (4*NX_//5, 4*NY_//5, "#6bcb77", "north")]:
         ax.plot(days, T_arr[:, x, y], color=c, lw=1.0, alpha=0.9, label=lbl)
-    ax.plot(days, T_arr.mean(axis=(1, 2)), color="white", lw=2.0, label="moyenne")
-    ax.set_xlabel("jours", color="white", fontsize=7)
+    ax.plot(days, T_arr.mean(axis=(1, 2)), color="white", lw=2.0, label="domain mean")
+    ax.set_xlabel("days", color="white", fontsize=7)
     ax.legend(fontsize=6.5, labelcolor="white", facecolor=BG, edgecolor=EDGE, ncol=2)
     ax.grid(True, alpha=0.2, color="white")
 
-    ax = fig.add_subplot(gs[3, 1]); frame(ax, "Distributions SST / SSS")
+    ax = fig.add_subplot(gs[3, 1]); frame(ax, "SST / SSS distributions")
     ax.hist(T_arr.ravel(), bins=70, color="#fc8d59", alpha=0.75, density=True, label="SST")
     ax2t = ax.twinx(); ax2t.set_facecolor(PANEL)
     ax2t.hist(S_arr.ravel(), bins=70, color="#6baed6", alpha=0.55, density=True, label="SSS")
@@ -878,7 +878,7 @@ def plot_nature_run(run, out_path="outputs/ocean_nature_run.png", S_arr=None):
     Ta = T_arr - T_arr.mean(0); Sa = S_arr - S_arr.mean(0)
     corr = (Ta*Sa).mean(0) / (T_arr.std(0)*S_arr.std(0) + 1e-9)
     im = show(ax, corr, cmap="RdBu_r", vmin=-1, vmax=1)
-    styled(ax, "Corrélation T–S des anomalies\n(le panache dessalé découple T et S au nord)", im, "ρ")
+    styled(ax, "T-S correlation of anomalies\n(the fresh plume decouples T and S in the north)", im, "ρ")
 
     ax = fig.add_subplot(gs[3, 3])
     im = show(ax, T_arr[0], cmap=ocean_cmap, vmin=vT[0], vmax=vT[1])
@@ -886,22 +886,22 @@ def plot_nature_run(run, out_path="outputs/ocean_nature_run.png", S_arr=None):
     bx = rng.integers(0, NX_, N_BUOYS)*dxkm; by = rng.integers(0, NY_, N_BUOYS)*dxkm
     ax.scatter(bx, by, c="white", s=34, edgecolors="black", linewidths=0.7, zorder=5)
     ax.scatter(bx, by, c="#ffd93d", s=9, zorder=6)
-    styled(ax, f"SST + réseau bouées (N={N_BUOYS})", im, "°C")
+    styled(ax, f"SST + buoy network (N={N_BUOYS})", im, "°C")
 
     fig.text(0.5, 0.975,
-             "Nature Run 2D+T — traceurs advectés par un courant géostrophique "
-             "(double gyre + jet méandreux + tourbillons)",
+             "2D+T Nature Run -- tracers advected by a geostrophic flow "
+             "(double gyre + meandering jet + eddies)",
              ha="center", color="white", fontsize=14, fontweight="bold")
     fig.text(0.5, 0.955,
-             f"Domaine {NX_*dxkm:.0f} × {NY_*dxkm:.0f} km  ·  Δx = {dxkm:.0f} km  ·  "
-             f"{nt} jours  ·  lat {run.get('lat0', LAT0):.0f}°N  ·  "
+             f"Domain {NX_*dxkm:.0f} x {NY_*dxkm:.0f} km  |  dx = {dxkm:.0f} km  |  "
+             f"{nt} days  |  lat {run.get('lat0', LAT0):.0f}N  |  "
              f"$R_d$ = {RD_KM:.0f} km",
              ha="center", color="#8fb3d9", fontsize=9.5)
 
     Path(out_path).parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_path, dpi=130, facecolor=BG, bbox_inches="tight")
     plt.close()
-    print(f"  Figure nature run -> {out_path}")
+    print(f"  Nature run figure -> {out_path}")
 
 
 # =============================================================================
@@ -918,12 +918,12 @@ if __name__ == "__main__":
     t0 = time.time()
     gen = SyntheticOceanGenerator()
     run = gen.generate_full(nt=args.nt, seed=args.seed)
-    print(f"  Généré en {time.time()-t0:.1f} s")
+    print(f"  Generated in {time.time()-t0:.1f} s")
 
     print(f"  SST : {run['T'].shape}  [{run['T'].min():.1f}, {run['T'].max():.1f}] °C")
     print(f"  SSS : {run['S'].shape}  [{run['S'].min():.2f}, {run['S'].max():.2f}] psu")
     print(f"  SSH : {run['SSH'].shape}  [{run['SSH'].min():.2f}, {run['SSH'].max():.2f}] m")
-    print("\n  ── Diagnostics ──")
+    print("\n  -- Diagnostics --")
     for k, v in gen.diagnostics().items():
         print(f"    {k:<22} {v: .4f}")
     plot_nature_run(run, out_path=args.out)

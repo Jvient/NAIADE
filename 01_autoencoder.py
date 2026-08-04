@@ -1,42 +1,41 @@
 """
 ==========================================================================
-  BRIQUE 1 — AE-UNet v4 d'Observabilite (MC-Dropout + ObsGate + FiLM)
+  BRICK 1 -- Observability AE-UNet v4 (MC-Dropout + ObsGate + FiLM)
 ==========================================================================
 
-Pourquoi v4 est différent des versions précédentes ?
-─────────────────────────────────────────────────────
-v1/v2/v3 utilisaient un VAE (reparamétrisation z = μ + ε·σ).
-Le log de training v3 montrait une stagnation RMSE_unobs ≈ 0.185 dès ep40.
-Cause : le bruit ε~N(0,I) injecté à chaque forward de training crée un
-plancher de RMSE que le modèle ne peut pas franchir, peu importe les
-améliorations architecturales.
+Why v4 differs from earlier versions
+------------------------------------
+v1/v2/v3 used a VAE (reparameterisation z = mu + eps*sigma). The v3 training
+log showed RMSE_unobs stalling around 0.185 from epoch 40 onwards. Cause: the
+noise eps ~ N(0, I) injected at every training forward pass creates an RMSE
+floor the model cannot cross, whatever the architectural improvements.
 
-Solution v4 : AE déterministe + MC-Dropout pour l'incertitude
-───────────────────────────────────────────────────────────────
-- MC-Dropout (Gal & Ghahramani 2016) : dropout actif aussi à l'inférence
-  → N passes forward → variance des prédictions = incertitude épistémique
-  → même qualité d'incertitude qu'un VAE, bien meilleur RMSE
+v4 solution: deterministic AE + MC-Dropout for uncertainty
+----------------------------------------------------------
+- MC-Dropout (Gal & Ghahramani 2016): dropout kept active at inference too
+  -> N forward passes -> prediction variance = epistemic uncertainty
+  -> same uncertainty quality as a VAE, far better RMSE
 
-Nouveautés architecturales :
-───────────────────────────
-1. ObsGate sur chaque skip-connexion
-   Gate σ(conv(mask_downsampled)) module les features du skip selon la
-   densité locale d'observations. Le décodeur sait quelle zone est observée.
+Architectural changes
+---------------------
+1. ObsGate on every skip connection
+   A gate sigmoid(conv(mask_downsampled)) modulates the skip features by the
+   local observation density. The decoder knows which zone is observed.
 
-2. GroupNorm remplace BatchNorm
-   Compatible avec batch_size=1 à l'inférence MC (BN crashe avec B=1).
+2. GroupNorm replaces BatchNorm
+   Compatible with batch_size=1 at MC inference (BatchNorm crashes at B=1).
 
-3. Huber loss (δ=0.5) remplace MSE
-   Robuste aux observations bruitées et fronts mal positionnés.
-   Gradients bornés → convergence plus stable.
+3. Huber loss (delta=0.5) replaces MSE
+   Robust to noisy observations and misplaced fronts. Bounded gradients give
+   more stable convergence.
 
-4. Retrait de L_spec et L_ts
-   Dans v3 : L_spec ≈ 0.007 à la fin → contribution nulle.
-   Ces termes diluaient les gradients de reconstruction principale.
+4. L_spec and L_ts removed
+   In v3, L_spec ~ 0.007 at the end -> negligible contribution. Those terms
+   diluted the gradients of the main reconstruction objective.
 
-5. FiLM conditioning et deep supervision conservés.
+5. FiLM conditioning and deep supervision retained.
 
-Usage :
+Usage:
   python 01_autoencoder.py --train
   python 01_autoencoder.py --score   --checkpoint outputs/vae_best.pt
   python 01_autoencoder.py --figures --checkpoint outputs/vae_best.pt
@@ -62,33 +61,33 @@ from data.dataset import (SyntheticOceanGenerator, OceanOEDDataset,
 
 
 # =============================================================================
-#  BLOCS DE BASE
+#  BASIC BLOCKS
 # =============================================================================
 
 class MCDropout2d(nn.Module):
     """
-    Dropout spatial TOUJOURS actif (training et inférence).
-    C'est le secret de MC-Dropout : à l'inférence, on fait N passes
-    avec dropout ON → variance des prédictions = incertitude épistémique.
-    (Gal & Ghahramani 2016 — Bayesian deep learning via dropout)
+    Spatial dropout kept ALWAYS active (training and inference).
+    That is the point of MC-Dropout: at inference, N passes with dropout on
+    give a prediction variance = epistemic uncertainty.
+    (Gal & Ghahramani 2016 -- Bayesian deep learning via dropout)
     """
     def __init__(self, p=0.1):
         super().__init__()
         self.p = p
 
     def forward(self, x):
-        # training=True force le dropout même en mode eval
+        # training=True forces dropout even in eval mode
         return F.dropout2d(x, p=self.p, training=True)
 
 
 class ResDoubleConv(nn.Module):
-    """Double conv résiduelle + MC-Dropout spatial."""
+    """Residual double convolution + spatial MC-Dropout."""
     def __init__(self, in_ch, out_ch, dropout_p=0.1):
         super().__init__()
         self.net = nn.Sequential(
             nn.Conv2d(in_ch, out_ch, 3, padding=1, bias=False),
-            nn.GroupNorm(min(8, out_ch), out_ch),   # GroupNorm > BatchNorm
-            nn.GELU(),                               # pour MC-Dropout (batch size 1)
+            nn.GroupNorm(min(8, out_ch), out_ch),   # GroupNorm over BatchNorm
+            nn.GELU(),                               # for MC-Dropout (batch size 1)
             MCDropout2d(dropout_p),
             nn.Conv2d(out_ch, out_ch, 3, padding=1, bias=False),
             nn.GroupNorm(min(8, out_ch), out_ch),
@@ -100,8 +99,8 @@ class ResDoubleConv(nn.Module):
     def forward(self, x):
         return self.net(x) + self.skip(x)
 
-    # Note: GroupNorm remplace BatchNorm car MC-Dropout à l'inférence
-    # peut être appelé avec batch_size=1, ce qui fait crasher BatchNorm.
+    # Note: GroupNorm replaces BatchNorm because MC-Dropout at inference can
+    # be called with batch_size=1, which makes BatchNorm crash.
 
 
 class Down(nn.Module):
@@ -114,18 +113,18 @@ class Down(nn.Module):
 
 class ObsGate(nn.Module):
     """
-    Skip-gating conditionné sur la densité d'observations locale.
+    Skip gating conditioned on the local observation density.
 
-    Pour chaque skip-connexion (niveau k), on downsampe le masque
-    d'observations à la résolution de ce niveau et on calcule un gate
-    σ(conv(mask_ds)) ∈ [0,1]. Ce gate module les features du skip :
-      - Gate≈1 dans les zones bien observées → skip passe fort
-        (le décodeur peut faire confiance aux features encodées)
-      - Gate≈0 dans les zones lacunaires → skip atténué
-        (le décodeur doit interpoler depuis le bottleneck)
+    For each skip connection (level k) the observation mask is downsampled to
+    that level's resolution and a gate sigmoid(conv(mask_ds)) in [0, 1] is
+    computed. The gate modulates the skip features:
+      - gate ~ 1 in well-observed zones -> the skip passes through strongly
+        (the decoder can trust the encoded features)
+      - gate ~ 0 in gap zones -> the skip is attenuated
+        (the decoder must interpolate from the bottleneck)
 
-    Impact direct sur RMSE : le décodeur ne "confond" plus les zones
-    observées avec les zones à interpoler.
+    Direct effect on RMSE: the decoder no longer confuses observed zones with
+    zones it has to interpolate.
     """
     def __init__(self, ch):
         super().__init__()
@@ -141,7 +140,7 @@ class ObsGate(nn.Module):
 
 
 class FiLMUp(nn.Module):
-    """Bloc Up avec FiLM conditioning (N_obs) + ObsGate sur skip."""
+    """Up block with FiLM conditioning (N_obs) + ObsGate on the skip."""
     def __init__(self, in_ch, skip_ch, out_ch, cond_dim, dropout_p=0.1):
         super().__init__()
         self.up      = nn.ConvTranspose2d(in_ch, in_ch // 2, 2, stride=2)
@@ -154,7 +153,7 @@ class FiLMUp(nn.Module):
         dy   = skip.shape[2] - x.shape[2]
         dx   = skip.shape[3] - x.shape[3]
         x    = F.pad(x, [dx//2, dx-dx//2, dy//2, dy-dy//2])
-        skip = self.gate(skip, mask_ds)          # gate selon observations locales
+        skip = self.gate(skip, mask_ds)          # gate by local observation density
         h    = self.conv(torch.cat([skip, x], dim=1))
         gam, bet = self.film(cond).chunk(2, dim=-1)
         gam  = gam.view(-1, h.shape[1], 1, 1)
@@ -163,7 +162,7 @@ class FiLMUp(nn.Module):
 
 
 class CBAM(nn.Module):
-    """Attention canal + spatiale au bottleneck."""
+    """Channel + spatial attention at the bottleneck."""
     def __init__(self, ch, reduction=8):
         super().__init__()
         self.channel_att = nn.Sequential(
@@ -183,35 +182,35 @@ class CBAM(nn.Module):
 
 
 # =============================================================================
-#  AE-UNet v4 — MC-Dropout + ObsGate + FiLM
+#  AE-UNet v4 -- MC-Dropout + ObsGate + FiLM
 # =============================================================================
 
 class ObservabilityVAE(nn.Module):
     """
-    AE-UNet déterministe avec incertitude par MC-Dropout.
+    Deterministic AE-UNet with MC-Dropout uncertainty.
 
-    Pourquoi abandonner la reparamétrisation VAE ?
-    ─────────────────────────────────────────────────
-    Dans le log v3 : RMSE stagne à 0.185 dès ep40, malgré 160 époques de
-    plus. Cause : le bruit ε~N(0,I) injecté à CHAQUE forward pass de
-    training crée un plancher de RMSE (~0.03-0.05 en absolu) que le modèle
-    ne peut pas franchir.
+    Why drop the VAE reparameterisation
+    -----------------------------------
+    In the v3 log, RMSE stalls at 0.185 from epoch 40 despite 160 further
+    epochs. Cause: the noise eps ~ N(0, I) injected at EVERY training forward
+    pass creates an RMSE floor (~0.03-0.05 in absolute terms) the model cannot
+    cross.
 
-    MC-Dropout (Gal & Ghahramani 2016) :
-    ────────────────────────────────────
-    - Training  : dropout actif → régularisation
-    - Inférence : dropout TOUJOURS actif → N passes → variance = incertitude
-    - Mathématiquement équivalent à une inférence variationnelle approximative
-    - RMSE bien meilleur car pas de bruit latent injected
+    MC-Dropout (Gal & Ghahramani 2016)
+    ----------------------------------
+    - training  : dropout active -> regularisation
+    - inference : dropout STILL active -> N passes -> variance = uncertainty
+    - mathematically equivalent to approximate variational inference
+    - much better RMSE, since no latent noise is injected
 
-    Nouveautés v4 :
-    ───────────────
-    1. MC-Dropout remplace reparamétrisation VAE
-    2. ObsGate sur chaque skip : gate conditionné sur densité observations locale
-       → décodeur sait distinguer zones observées / lacunaires
-    3. GroupNorm remplace BatchNorm (compatible batch_size=1 à l'inférence MC)
-    4. FiLM conditioning maintenu (N_obs)
-    5. Deep supervision maintenu
+    v4 changes
+    ----------
+    1. MC-Dropout replaces the VAE reparameterisation
+    2. ObsGate on every skip: gate conditioned on local observation density
+       -> the decoder can tell observed zones from gap zones
+    3. GroupNorm replaces BatchNorm (works at batch_size=1 for MC inference)
+    4. FiLM conditioning retained (N_obs)
+    5. Deep supervision retained
     """
 
     def __init__(self, in_ch=3, out_ch=2, base_ch=32, latent_ch=64,
@@ -223,33 +222,33 @@ class ObservabilityVAE(nn.Module):
         self.cond_dim  = cond_dim
         self.dropout_p = dropout_p
 
-        # ── Encodeur 4 niveaux ─────────────────────────────────────────────
+        # -- 4-level encoder ------------------------------------------------
         self.inc   = ResDoubleConv(in_ch, bc,    dp)
         self.down1 = Down(bc,    bc*2,  dp)
         self.down2 = Down(bc*2,  bc*4,  dp)
         self.down3 = Down(bc*4,  bc*8,  dp)
         self.down4 = Down(bc*8,  bc*16, dp)
 
-        # ── FiLM embedding ─────────────────────────────────────────────────
+        # -- FiLM embedding -------------------------------------------------
         self.cond_embed = nn.Sequential(
             nn.Linear(1, cond_dim), nn.GELU(),
             nn.Linear(cond_dim, cond_dim), nn.GELU(),
         )
 
-        # ── Bottleneck déterministe + CBAM ─────────────────────────────────
-        # Pas de reparamétrisation — le "latent" est un simple vecteur de features
+        # -- Deterministic bottleneck + CBAM --------------------------------
+        # No reparameterisation -- the "latent" is a plain feature vector
         self.cbam   = CBAM(bc*16)
-        self.to_z   = nn.Conv2d(bc*16, latent_ch, 1)   # encode déterministe
+        self.to_z   = nn.Conv2d(bc*16, latent_ch, 1)   # deterministic encoding
         self.from_z = nn.Conv2d(latent_ch, bc*16, 1)
 
-        # ── Décodeur FiLM 4 niveaux + ObsGate ─────────────────────────────
+        # -- 4-level FiLM decoder + ObsGate ---------------------------------
         self.up1 = FiLMUp(bc*16, bc*8,  bc*8,  cond_dim, dp)
         self.up2 = FiLMUp(bc*8,  bc*4,  bc*4,  cond_dim, dp)
         self.up3 = FiLMUp(bc*4,  bc*2,  bc*2,  cond_dim, dp)
         self.up4 = FiLMUp(bc*2,  bc,    bc,    cond_dim, dp)
         self.head = nn.Conv2d(bc, out_ch, 1)
 
-        # ── Têtes de deep supervision ──────────────────────────────────────
+        # -- Deep supervision heads -----------------------------------------
         self.aux1 = nn.Conv2d(bc*8, out_ch, 1)
         self.aux2 = nn.Conv2d(bc*4, out_ch, 1)
         self.aux3 = nn.Conv2d(bc*2, out_ch, 1)
@@ -259,7 +258,7 @@ class ObservabilityVAE(nn.Module):
         return self.cond_embed(mask.mean(dim=[2, 3]))   # (B, cond_dim)
 
     def _downsample_mask(self, mask, target):
-        """Downsampling NN du masque à la résolution d'une feature map cible."""
+        """Nearest-neighbour downsampling of the mask to a target feature-map size."""
         return F.interpolate(mask, size=target.shape[2:], mode="nearest")
 
     def encode(self, x):
@@ -273,7 +272,7 @@ class ObservabilityVAE(nn.Module):
         return z, (s1, s2, s3, s4)
 
     def decode(self, z, skips, cond, mask):
-        """Décodage avec FiLM + ObsGate sur chaque skip."""
+        """Decoding with FiLM + ObsGate on every skip."""
         s1, s2, s3, s4 = skips
         h  = self.from_z(z)
         h  = self.up1(h, s4, cond, self._downsample_mask(mask, s4))
@@ -290,26 +289,26 @@ class ObservabilityVAE(nn.Module):
         cond      = self._get_cond(x)
         z, skips  = self.encode(x)
         pred, aux = self.decode(z, skips, cond, mask)
-        # Pour compatibilité API avec le reste du code (score, figures)
-        # On retourne mu=z, logvar=zeros (pas de KL)
+        # API compatibility with the rest of the code (score, figures):
+        # return mu=z and logvar=zeros (there is no KL term)
         return pred, z, torch.zeros_like(z), aux
 
     @torch.no_grad()
     def reconstruct_with_uncertainty(self, x, n_samples=50):
         """
-        Incertitude par MC-Dropout.
+        MC-Dropout uncertainty.
 
-        Le modèle est en mode EVAL (BN/LN figés) mais MCDropout2d
-        force dropout=True → chaque passe donne une prédiction légèrement
-        différente. La variance = incertitude épistémique.
+        The model is in EVAL mode (normalisation layers frozen) but
+        MCDropout2d forces dropout=True, so every pass gives a slightly
+        different prediction. The variance is the epistemic uncertainty.
 
-        Avantage vs VAE : pas de bruit latent → la moyenne des prédictions
-        est beaucoup plus proche de la vérité terrain.
+        Advantage over a VAE: no latent noise, so the mean prediction is much
+        closer to the ground truth.
         """
         mask = x[:, 2:3]
         cond = self._get_cond(x)
         z, skips = self.encode(x)
-        # MC passes : dropout actif via MCDropout2d
+        # MC passes: dropout active through MCDropout2d
         samples = [self.decode(z, skips, cond, mask)[0]
                    for _ in range(n_samples)]
         stack = torch.stack(samples)
@@ -321,25 +320,25 @@ class ObservabilityVAE(nn.Module):
 
 
 # =============================================================================
-#  LOSS v4 : Huber + gradient + deep supervision  (spectral/T-S retirés)
+#  LOSS v4: Huber + gradient + deep supervision  (spectral/T-S removed)
 # =============================================================================
 
 class VAELoss(nn.Module):
     """
-    Loss v4 — focus sur le RMSE_unobs :
+    Loss v4 -- focused on RMSE_unobs:
 
-        L = L_recon + λ_grad·L_grad + Σ w_k·L_aux_k   (pas de KL, pas de spectral)
+        L = L_recon + lambda_grad * L_grad + sum_k w_k * L_aux_k
+        (no KL term, no spectral term)
 
-    Huber loss (δ=0.5) remplace MSE :
-        MSE pénalise très fortement les outliers (observations bruitées,
-        front mal positionné). Huber est quadratique pour |e|<δ et linéaire
-        au-delà → gradients bornés → convergence plus stable sur les fronts.
+    Huber loss (delta=0.5) replaces MSE: MSE penalises outliers very heavily
+    (noisy observations, a misplaced front). Huber is quadratic for |e| < delta
+    and linear beyond, so gradients stay bounded and convergence on fronts is
+    more stable.
 
-    Retrait de L_spec et L_ts :
-        Dans le log v3, L_spec = 0.007 à la fin → contribution quasi-nulle,
-        les gradients correspondants "polluent" l'optimisation principale.
-        L_ts : même constat (contrainte utile en physique mais poids trop faible
-        pour compenser son effet de dilution sur le gradient principal).
+    L_spec and L_ts removed: in the v3 log, L_spec ended at 0.007, a nearly
+    null contribution whose gradients simply polluted the main optimisation.
+    Same story for L_ts (physically useful constraint, but weighted too low to
+    offset its dilution of the main gradient).
     """
     def __init__(self, w_obs=1.0, w_unobs=4.0, beta_max=0.0,
                  lambda_grad=0.5, lambda_spec=0.0, lambda_ts=0.0,
@@ -347,7 +346,7 @@ class VAELoss(nn.Module):
         super().__init__()
         self.w_obs       = w_obs
         self.w_unobs     = w_unobs
-        self.beta_max    = beta_max          # conservé à 0 — pas de KL
+        self.beta_max    = beta_max          # kept at 0 -- no KL term
         self.lambda_grad = lambda_grad
         self.huber_delta = huber_delta
         self.aux_weights = [0.4, 0.3, 0.2]
@@ -387,7 +386,7 @@ class VAELoss(nn.Module):
                 mask_ds = F.interpolate(mask, size=(H, W), mode="nearest")
                 loss_aux = loss_aux + w * self._recon_loss(aux_up, target, mask_ds)
 
-        # KL = 0 (pas de reparamétrisation)
+        # KL = 0 (no reparameterisation)
         kl       = torch.tensor(0.0, device=pred.device)
         loss_spec = torch.tensor(0.0, device=pred.device)
 
@@ -396,30 +395,30 @@ class VAELoss(nn.Module):
 
 
 # =============================================================================
-#  ENTRAÎNEMENT
+#  TRAINING
 # =============================================================================
 
 def train(args):
     print("=" * 62)
-    print("  Brique 1 — Entraînement AE-UNet v4 (MC-Dropout + ObsGate)")
+    print("  Brick 1 -- AE-UNet v4 training (MC-Dropout + ObsGate)")
     print("=" * 62)
 
-    print("\n[1/4] Generation du nature run...")
-    # seed_ocean explicite : sans lui, le nature run d'entraînement differait
-    # de celui utilise pour --figures / --score, et le checkpoint n'etait pas
-    # reproductible d'un run a l'autre.
+    print("\n[1/4] Nature run generation...")
+    # Explicit seed_ocean: without it the training nature run differed from
+    # the one used by --figures / --score, and the checkpoint was not
+    # reproducible from one run to the next.
     gen = SyntheticOceanGenerator()
     T, S = gen.generate_dataset(nt=args.nt, seed=args.seed_ocean)
     print(f"  T: {T.shape}  [{T.min():.1f}, {T.max():.1f}] degC  (seed={args.seed_ocean})")
     print(f"  S: {S.shape}  [{S.min():.2f}, {S.max():.2f}] psu")
     print(f"  sigma(SST)={T.std():.2f} degC   sigma(SSS)={S.std():.3f} psu")
     if args.nt < 365:
-        print(f"  [ATTENTION] nt={args.nt} < 365 : cycle saisonnier "
-              f"incomplet, statistiques biaisees.")
+        print(f"  [WARNING] nt={args.nt} < 365: incomplete seasonal cycle, "
+              f"biased statistics.")
 
 
-    # augment=True sur train uniquement : flip H/V aléatoire → ×4 diversité effective
-    # val sans augmentation pour mesure stable
+    # augment=True on the training split only: random zonal flip
+    # validation is left unaugmented for a stable measurement
     train_ds, val_ds = build_datasets(T, S, split=0.8,
                                       n_obs_min=args.n_obs_min,
                                       n_obs_max=args.n_obs_max,
@@ -429,7 +428,7 @@ def train(args):
     val_ld   = DataLoader(val_ds,   batch_size=args.batch_size,
                           shuffle=False, num_workers=0)
 
-    print(f"\n[2/4] Modele AE-UNet v4 "
+    print(f"\n[2/4] AE-UNet v4 model "
           f"(base_ch={args.base_ch}, latent_ch={args.latent_ch}, "
           f"dropout={args.dropout_p}, cond_dim={args.cond_dim})...")
     model = ObservabilityVAE(base_ch=args.base_ch,
@@ -437,7 +436,7 @@ def train(args):
                              dropout_p=args.dropout_p,
                              cond_dim=args.cond_dim).to(DEVICE)
     npar = sum(p.numel() for p in model.parameters())
-    print(f"  Parametres : {npar:,}")
+    print(f"  Parameters : {npar:,}")
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
 
@@ -458,8 +457,8 @@ def train(args):
     out_dir = Path(args.output_dir); out_dir.mkdir(parents=True, exist_ok=True)
     warmup  = max(1, args.epochs // 3)
 
-    print(f"\n[3/4] Entrainement {args.epochs} ep | "
-          f"Huber δ={args.huber_delta} | λ_grad={args.lambda_grad} | "
+    print(f"\n[3/4] Training {args.epochs} epochs | "
+          f"Huber delta={args.huber_delta} | lambda_grad={args.lambda_grad} | "
           f"MC-Dropout p={args.dropout_p} | augment=flip | "
           f"n_mc_val={args.n_mc_val}...")
     history = {"train_loss": [], "val_rmse_unobs": [], "kl": [],
@@ -487,8 +486,8 @@ def train(args):
         n = len(train_ld)
         ep_loss /= n; ep_kl /= n; ep_spec /= n; ep_aux /= n
 
-        # Validation MC-moyennée : on moyenne n_mc_val passes pour avoir
-        # le vrai RMSE du modèle (pas le biais d'un seul tirage dropout)
+        # MC-averaged validation: average n_mc_val passes to get the model's
+        # true RMSE rather than the bias of a single dropout draw
         model.eval()
         val_rmses = []
         val_rmse_T, val_rmse_S = [], []
@@ -496,19 +495,19 @@ def train(args):
         with torch.no_grad():
             for x, y, mask in val_ld:
                 x, y, mask = x.to(DEVICE), y.to(DEVICE), mask.to(DEVICE)
-                # Moyenne sur n_mc_val passes MC-Dropout
+                # Average over n_mc_val MC-Dropout passes
                 preds = torch.stack([model(x)[0] for _ in range(args.n_mc_val)])
                 pred_mean = preds.mean(0)
                 sq = (pred_mean - y) ** 2
-                # RMSE et stratification par échantillon (pas moyenne batch)
+                # RMSE and stratification per sample (not a batch average)
                 for b in range(x.shape[0]):
-                    n_obs_b = int(mask[b].sum().item())   # obs pour cet échantillon
+                    n_obs_b = int(mask[b].sum().item())   # observations for this sample
                     rmse_b  = float(torch.sqrt(
                         (sq[b] * (1 - mask[b])).mean()).item())
-                    # RMSE separe par variable : les deux canaux sont normalises
-                    # par des ecarts-types differents (2.6 degC vs 0.18 psu),
-                    # un RMSE agrege n'est convertible en unite physique
-                    # pour aucune des deux.
+                    # Per-variable RMSE: the two channels are normalised by
+                    # very different standard deviations (2.6 degC against
+                    # 0.18 psu), so an aggregate RMSE converts to physical
+                    # units for neither of them.
                     w = (1 - mask[b])
                     val_rmse_T.append(float(torch.sqrt(
                         (sq[b, 0:1] * w).mean()).item()))
@@ -555,22 +554,22 @@ def train(args):
                           "obs_noise_T": OBS_NOISE_T, "obs_noise_S": OBS_NOISE_S},
             }, out_dir / "vae_best.pt")
 
-    print(f"\n  Meilleur RMSE val (non-obs) : {best_val:.4f}")
-    print(f"  RMSE physique final : {rmse_T_phys:.3f} degC | {rmse_S_phys:.4f} psu")
+    print(f"\n  Best validation RMSE (unobserved) : {best_val:.4f}")
+    print(f"  Final physical RMSE : {rmse_T_phys:.3f} degC | {rmse_S_phys:.4f} psu")
 
-    print("\n[4/4] Sauvegarde des courbes...")
+    print("\n[4/4] Saving training curves...")
     fig, axes = plt.subplots(1, 5, figsize=(25, 4), facecolor="#0a1628")
-    # KL et loss spectrale valent 0 par construction en v4 : on affiche a la
-    # place les RMSE physiques, qui sont les chiffres reellement interpretables.
-    data = [("Loss totale",           "train_loss",      "#6baed6"),
-            ("RMSE val (non-obs)",    "val_rmse_unobs",  "#fc8d59"),
+    # KL and spectral loss are 0 by construction in v4: show the physical
+    # RMSE values instead, which are the genuinely interpretable numbers.
+    data = [("Total loss",            "train_loss",      "#6baed6"),
+            ("Val RMSE (unobserved)", "val_rmse_unobs",  "#fc8d59"),
             ("RMSE SST (degC)",       "rmse_T_degC",     "#ff6b6b"),
             ("RMSE SSS (psu)",        "rmse_S_psu",      "#74c476"),
             ("Deep supervision",      "loss_aux",        "#cc99ff")]
     for ax, (lbl, k, col) in zip(axes, data):
         ax.plot(history[k], color=col, lw=1.8)
         ax.set_title(lbl, color="white", fontsize=9, fontweight="bold")
-        ax.set_xlabel("Epoque", color="white", fontsize=8)
+        ax.set_xlabel("Epoch", color="white", fontsize=8)
         ax.tick_params(colors="white", labelsize=7)
         ax.set_facecolor("#050d1a")
         for sp in ax.spines.values(): sp.set_edgecolor("#2a4a7a")
@@ -579,34 +578,34 @@ def train(args):
     fig.savefig(out_dir / "vae_training_curves.png", dpi=130,
                 facecolor="#0a1628", bbox_inches="tight")
     plt.close()
-    print(f"  Courbes -> {out_dir}/vae_training_curves.png")
+    print(f"  Curves -> {out_dir}/vae_training_curves.png")
     print(f"  Checkpoint -> {out_dir}/vae_best.pt")
 
 
 # =============================================================================
-#  FIGURE 1 — Évaluation d'un réseau existant
+#  FIGURE 1 -- Evaluation of an existing network
 #
-#  Objectif : étant donné un réseau de N capteurs à positions fixes,
-#  montrer où le réseau couvre bien / mal le domaine, et quantifier
-#  la contribution de chaque capteur.
+#  Goal: given a network of N sensors at fixed positions, show where the
+#  network covers the domain well or poorly, and quantify each sensor's
+#  contribution.
 #
-#  Layout (2 lignes × 4 colonnes) :
-#    Ligne 1 SST : champ vrai + capteurs | reconstruction | sigma MC | zones lacunaires
-#    Ligne 2 SSS : champ vrai + capteurs | reconstruction | sigma MC | score LOO capteurs
+#  Layout (2 rows x 4 columns):
+#    Row 1 SST: true field + sensors | reconstruction | MC sigma | gap zones
+#    Row 2 SSS: true field + sensors | reconstruction | MC sigma | LOO scores
 # =============================================================================
 
 @torch.no_grad()
 def plot_network_evaluation(model, T, S, norm, args,
                             positions=None, n_samples=80, n_loo_t=8):
     """
-    Figure d'évaluation du réseau de capteurs.
+    Sensor-network evaluation figure.
 
-    Paramètres
+    Parameters
     ----------
-    positions : liste de (x, y) en coordonnées pixel, ou None
-        Si None, un réseau de N_BUOYS capteurs est généré avec args.seed_buoys.
-    n_samples  : tirages MC pour l'incertitude
-    n_loo_t    : nombre d'instants pour le calcul LOO
+    positions : list of (x, y) in pixel coordinates, or None
+        If None, a network of N_BUOYS sensors is drawn using args.seed_buoys.
+    n_samples  : MC draws for the uncertainty estimate
+    n_loo_t    : number of time steps used for the LOO computation
     """
     out_dir = Path(args.output_dir); out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -622,32 +621,32 @@ def plot_network_evaluation(model, T, S, norm, args,
     T_n = (T - norm["T_mean"]) / norm["T_std"]
     S_n = (S - norm["S_mean"]) / norm["S_std"]
 
-    # ── Réseau de référence ────────────────────────────────────────────────────
+    # -- Reference network ------------------------------------------------------
     if positions is None:
         seed_b = getattr(args, "seed_buoys", 42)
         rng    = np.random.default_rng(seed_b)
-        # separation minimale : deux bouees adjacentes sont interdites cote RL,
-        # le reseau de reference de l AE doit respecter la meme contrainte
+        # Minimum separation: adjacent buoys are forbidden on the RL side, so the
+        # AE reference network must obey the same constraint
         positions = sample_separated_positions(NX, NY, N_BUOYS, rng=rng)
-        print(f"  Réseau généré : {N_BUOYS} bouées (seed_buoys={seed_b}, "
-              f"séparation ≥ {MIN_BUOY_SEP_KM:.0f} km)")
+        print(f"  Network drawn : {N_BUOYS} buoys (seed_buoys={seed_b}, "
+              f"separation >= {MIN_BUOY_SEP_KM:.0f} km)")
     positions = list(positions)
     n_sensors = len(positions)
 
-    # Masque fixe du réseau
+    # Fixed network mask
     mask_np = np.zeros((NX, NY), dtype=np.float32)
     for (x, y) in positions:
         mask_np[x, y] = 1.0
     obs_pos = np.array(positions)
 
-    # Instant de référence pour les cartes
+    # Reference time step for the maps
     t_ref = len(T) // 3
     T_t, S_t = T_n[t_ref], S_n[t_ref]
     T_obs = T_t * mask_np
     S_obs = S_t * mask_np
     x_in = torch.from_numpy(np.stack([T_obs, S_obs, mask_np])[None]).to(DEVICE)
 
-    # Reconstruction + incertitude MC
+    # Reconstruction + MC uncertainty
     recon_mean, recon_std, _ = model.reconstruct_with_uncertainty(x_in, n_samples=n_samples)
     rm = recon_mean[0].cpu().numpy()
     rs = recon_std[0].cpu().numpy()
@@ -659,41 +658,41 @@ def plot_network_evaluation(model, T, S, norm, args,
     T_sigma = rs[0] * norm["T_std"]
     S_sigma = rs[1] * norm["S_std"]
 
-    # ── Carte des zones lacunaires ─────────────────────────────────────────────
-    # Une zone est "lacunaire" si sigma > seuil (percentile 75).
-    # On construit une carte binaire + un masque de distance au capteur le plus proche.
+    # -- Gap-zone map -----------------------------------------------------------
+    # A zone counts as a "gap" when sigma exceeds a threshold (75th pct).
+    # Build a binary map plus a distance-to-nearest-sensor mask.
     from scipy.ndimage import distance_transform_edt
 
-    dist_to_sensor = distance_transform_edt(1 - mask_np)   # distance en pixels
-    dist_to_sensor_n = dist_to_sensor / dist_to_sensor.max()   # normalisé [0,1]
+    dist_to_sensor = distance_transform_edt(1 - mask_np)   # distance in pixels
+    dist_to_sensor_n = dist_to_sensor / dist_to_sensor.max()   # normalised to [0,1]
 
-    # Incertitude combinée T+S (moyenne normalisée)
+    # Combined T+S uncertainty (normalised mean)
     T_sigma_n = T_sigma / (T_sigma.max() + 1e-9)
     S_sigma_n = S_sigma / (S_sigma.max() + 1e-9)
     combined_sigma = 0.5 * (T_sigma_n + S_sigma_n)
 
-    # Score de couverture : zones lacunaires = sigma élevé ET loin d'un capteur
-    gap_map = combined_sigma * dist_to_sensor_n   # ∈ [0, 1]
+    # Coverage score: a gap is high sigma AND far from any sensor
+    gap_map = combined_sigma * dist_to_sensor_n   # in [0, 1]
     gap_threshold = np.percentile(gap_map, 80)
     gap_binary = (gap_map > gap_threshold).astype(float)
 
-    # ── 3 bouées proposées — maximisent la couverture lacunaire ───────────────
-    # Algorithme glouton : à chaque étape, on place la bouée au maximum de
-    # gap_map résiduel, puis on met à jour la distance au capteur le plus proche.
+    # -- 3 proposed buoys, maximising gap coverage ------------------------------
+    # Greedy algorithm: at each step place the buoy at the maximum of the
+    # residual gap_map, then update the distance to the nearest sensor.
     from scipy.ndimage import distance_transform_edt as _edt
     proposed_positions = []
     gap_residual = gap_map.copy()
     mask_augmented = mask_np.copy()
     for _ in range(3):
         flat_idx = np.argmax(gap_residual)
-        px, py   = np.unravel_index(flat_idx, gap_residual.shape)  # px∈[0,NX), py∈[0,NY)
+        px, py   = np.unravel_index(flat_idx, gap_residual.shape)  # px in [0,NX), py in [0,NY)
         proposed_positions.append((int(px), int(py)))
         mask_augmented[px, py] = 1.0
         dist_new = _edt(1 - mask_augmented) / (dist_to_sensor.max() + 1e-9)
         gap_residual = combined_sigma * dist_new
-    proposed_arr = np.array(proposed_positions)  # (3, 2) — (x, y) en coords pixel
+    proposed_arr = np.array(proposed_positions)  # (3, 2) -- (x, y) in pixels
 
-    # ── LOO scores — contribution de chaque capteur ───────────────────────────
+    # -- LOO scores: contribution of each sensor --------------------------------
     t_idx = np.random.choice(len(T), min(n_loo_t, len(T)), replace=False)
     rmse_full = np.mean([
         _compute_rmse_mc(model, T_n[t], S_n[t], positions, norm, n_mc=6)
@@ -706,12 +705,12 @@ def plot_network_evaluation(model, T, S, norm, args,
             _compute_rmse_mc(model, T_n[t], S_n[t], sub, norm, n_mc=6)
             for t in t_idx
         ])
-        loo_delta[i] = rmse_i - rmse_full   # >0 : ce capteur apporte de l'info
+        loo_delta[i] = rmse_i - rmse_full   # > 0: this sensor carries information
 
-    # Normaliser les deltas pour l'affichage
+    # Normalise the deltas for display
     loo_colors = np.clip(loo_delta / (loo_delta.max() + 1e-9), 0, 1)
 
-    # ── Figure ─────────────────────────────────────────────────────────────────
+    # -- Figure -----------------------------------------------------------------
     fig = plt.figure(figsize=(22, 11), facecolor=BG)
     gs  = gridspec.GridSpec(2, 4, figure=fig,
                             hspace=0.35, wspace=0.28,
@@ -741,36 +740,36 @@ def plot_network_evaluation(model, T, S, norm, args,
     vT = (T_true.min(), T_true.max())
     vS = (S_true.min(), S_true.max())
 
-    # ── Ligne 1 : SST ──────────────────────────────────────────────────────────
-    # [0,0] SST vrai + positions capteurs (colorées par LOO delta)
+    # -- Row 1: SST -------------------------------------------------------------
+    # [0,0] True SST + sensor positions (coloured by LOO delta)
     ax00 = fig.add_subplot(gs[0, 0])
     cell(ax00, T_true, ocean_cmap, *vT,
-         f"SST vrai + réseau ({n_sensors} capteurs)\n"
-         f"couleur = contribution LOO (vert=fort, rouge=faible)",
+         f"True SST + network ({n_sensors} sensors)\n"
+         f"colour = LOO contribution (green high, red low)",
          "°C", pts=obs_pos, pts_c=loo_colors, pts_s=55)
 
     # [0,1] SST reconstruction
     ax01 = fig.add_subplot(gs[0, 1])
     cell(ax01, T_pred, ocean_cmap, *vT,
-         f"SST reconstruction VAE\n(t={t_ref},  RMSE_unobs={rmse_full:.3f})",
+         f"AE SST reconstruction\n(t={t_ref},  RMSE_unobs={rmse_full:.3f})",
          "°C", pts=obs_pos, pts_c="white", pts_s=12)
 
-    # [0,2] Incertitude SST
+    # [0,2] SST uncertainty
     ax02 = fig.add_subplot(gs[0, 2])
     cell(ax02, T_sigma, "YlOrRd", 0, T_sigma.max(),
-         f"SST incertitude σ MC  (N={n_samples} tirages)\n"
-         "rouge = zone mal contrainte par le réseau",
+         f"SST MC uncertainty sigma  (N={n_samples} draws)\n"
+         "red = zone poorly constrained by the network",
          "°C", pts=obs_pos, pts_c="cyan", pts_s=12,
          contour=gap_binary)
 
-    # [0,3] Carte des zones lacunaires + 3 bouées proposées
+    # [0,3] Gap map + 3 proposed buoys
     ax03 = fig.add_subplot(gs[0, 3])
     cell(ax03, gap_map, "inferno", 0, gap_map.max(),
-         f"Zones lacunaires + 3 bouées proposées\n"
-         f"(σ élevé × distance capteur)  —  {int(gap_binary.sum())} px critiques",
+         f"Gap zones + 3 proposed buoys\n"
+         f"(high sigma x sensor distance) -- {int(gap_binary.sum())} critical px",
          "score", pts=obs_pos, pts_c="cyan", pts_s=15,
          contour=gap_binary)
-    # Bouées proposées : étoiles jaunes numérotées
+    # Proposed buoys: numbered yellow stars
     for k, (px, py) in enumerate(proposed_arr):
         ax03.scatter(px, py, marker="*", s=320, c="#ffd93d",
                      edgecolors="black", linewidths=0.8, zorder=8)
@@ -778,32 +777,32 @@ def plot_network_evaluation(model, T, S, norm, args,
                       textcoords="offset points", xytext=(6, 4),
                       fontsize=8, color="#ffd93d", fontweight="bold")
 
-    # ── Ligne 2 : SSS ──────────────────────────────────────────────────────────
-    # [1,0] SSS vrai
+    # -- Row 2: SSS -------------------------------------------------------------
+    # [1,0] True SSS
     ax10 = fig.add_subplot(gs[1, 0])
     cell(ax10, S_true, sal_cmap, *vS,
-         "SSS vrai + positions capteurs", "psu",
+         "True SSS + sensor positions", "psu",
          pts=obs_pos, pts_c="white", pts_s=12)
 
     # [1,1] SSS reconstruction
     ax11 = fig.add_subplot(gs[1, 1])
     cell(ax11, S_pred, sal_cmap, *vS,
-         "SSS reconstruction VAE", "psu",
+         "AE SSS reconstruction", "psu",
          pts=obs_pos, pts_c="white", pts_s=12)
 
-    # [1,2] Incertitude SSS
+    # [1,2] SSS uncertainty
     ax12 = fig.add_subplot(gs[1, 2])
     cell(ax12, S_sigma, "YlOrRd", 0, S_sigma.max(),
-         "SSS incertitude σ MC", "psu",
+         "SSS MC uncertainty sigma", "psu",
          pts=obs_pos, pts_c="cyan", pts_s=12,
          contour=gap_binary)
 
-    # [1,3] LOO barplot — contribution de chaque capteur
+    # [1,3] LOO bar chart: contribution of each sensor
     ax13 = fig.add_subplot(gs[1, 3])
     ax13.set_facecolor("#050d1a")
     for sp in ax13.spines.values(): sp.set_edgecolor("#1a3a5c")
 
-    idx_sort = np.argsort(loo_delta)[::-1]   # trié par contribution décroissante
+    idx_sort = np.argsort(loo_delta)[::-1]   # sorted by decreasing contribution
     colors_bar = plt.cm.RdYlGn(
         np.clip((loo_delta[idx_sort] - loo_delta.min()) /
                 (loo_delta.max() - loo_delta.min() + 1e-9), 0, 1))
@@ -814,52 +813,52 @@ def plot_network_evaluation(model, T, S, norm, args,
     ax13.set_yticklabels([f"C{idx_sort[i]}" for i in
                           range(0, n_sensors, max(1, n_sensors//10))],
                          color="white", fontsize=6)
-    ax13.set_xlabel("Δ RMSE  (LOO − complet)", color="white", fontsize=8)
-    ax13.set_title("Contribution LOO par capteur\n"
-                   "vert = indispensable  |  rouge = redondant",
+    ax13.set_xlabel("delta RMSE  (LOO - full)", color="white", fontsize=8)
+    ax13.set_title("LOO contribution per sensor\n"
+                   "green = essential  |  red = redundant",
                    color="white", fontsize=8.5, fontweight="bold", pad=5)
     ax13.tick_params(colors="white", labelsize=6)
     ax13.grid(True, alpha=0.2, color="white", axis="x")
 
-    # Seuil de redondance (delta < 5% du max)
+    # Redundancy threshold (delta < 5% of the maximum)
     thr = loo_delta.max() * 0.05
     n_redondant = (loo_delta < thr).sum()
     ax13.axvline(thr, color="#ffd93d", lw=1, linestyle="--", alpha=0.7,
-                 label=f"seuil 5%  ({n_redondant} redondants)")
+                 label=f"5% threshold  ({n_redondant} redundant)")
     ax13.legend(fontsize=6, labelcolor="white", facecolor="#0a1628", loc="lower right")
 
     fig.text(0.5, 0.97,
-             f"AE-UNet — Évaluation Réseau  ({n_sensors} capteurs)  "
-             f"|  contour rouge = zones lacunaires  |  ★ = bouées proposées",
+             f"AE-UNet -- network evaluation  ({n_sensors} sensors)  "
+             f"|  red contour = gap zones  |  star = proposed buoy",
              ha="center", color="white", fontsize=12, fontweight="bold")
     fig.text(0.5, 0.005,
-             "cyan = capteur existant  |  ★ jaune = bouée proposée (greedy gap)  "
-             "|  couleur capteur ligne 1 = contribution LOO",
+             "cyan = existing sensor  |  yellow star = proposed buoy (greedy gap)  "
+             "|  sensor colour in row 1 = LOO contribution",
              ha="center", color="#8ab4d4", fontsize=8)
 
     out = out_dir / "vae_network_evaluation.png"
     fig.savefig(out, dpi=150, facecolor=BG, bbox_inches="tight")
     plt.close()
-    print(f"  Figure évaluation réseau -> {out}")
-    print(f"  Bouées proposées : " +
+    print(f"  Network evaluation figure -> {out}")
+    print(f"  Proposed buoys : " +
           "  ".join([f"P{k+1}=({px},{py})" for k,(px,py) in enumerate(proposed_arr)]))
     return loo_delta, gap_map, positions, proposed_arr
 
 
 # =============================================================================
-#  FIGURE 2 — Incertitude comparée sur différentes densités de réseau
+#  FIGURE 2 - Uncertainty across different network densities
 #
-#  Même réseau, on enlève des capteurs progressivement et on montre
-#  comment l'incertitude augmente dans les zones déjà lacunaires.
+#  Same network, sensors are removed progressively to show how uncertainty
+#  grows in the areas that were already poorly covered.
 # =============================================================================
 
 @torch.no_grad()
 def plot_uncertainty_maps(model, T, S, norm, args, n_samples=60):
     """
-    Figure 2 — Evolution de l'incertitude en fonction de la densité réseau.
+    Figure 2 - Uncertainty as a function of network density.
 
-    3 colonnes : réseau Dense (N=40), Moyen (N=20), Clairsemé (N=8)
-    Pour chaque : SST sigma | SSS sigma | profil d'incertitude méridionale
+    3 columns: Dense (N=40), Medium (N=20), Sparse (N=8)
+    For each: SST sigma | SSS sigma | meridional uncertainty profile
     """
     out_dir = Path(args.output_dir); out_dir.mkdir(parents=True, exist_ok=True)
     ocean_cmap = LinearSegmentedColormap.from_list("oc",
@@ -872,9 +871,9 @@ def plot_uncertainty_maps(model, T, S, norm, args, n_samples=60):
     S_n = (S - norm["S_mean"]) / norm["S_std"]
     t   = len(T) // 2
 
-    configs = [("Dense   (N=40)", 40), ("Moyen   (N=20)", 20), ("Clairsemé (N=8)", 8)]
+    configs = [("Dense   (N=40)", 40), ("Medium  (N=20)", 20), ("Sparse  (N=8)", 8)]
 
-    # Échelle commune pour comparaison
+    # Common colour scale so the three columns are comparable
     unc_max_all = 0.0
     results = []
     for (_, n_obs) in configs:
@@ -927,7 +926,7 @@ def plot_uncertainty_maps(model, T, S, norm, args, n_samples=60):
         cb = fig.colorbar(im, ax=ax, pad=0.02, fraction=0.046)
         cb.ax.yaxis.set_tick_params(color="white", labelcolor="white", labelsize=6)
 
-        # Ligne 2 : profil méridional d'incertitude (moyen sur x)
+        # Row 2: meridional uncertainty profile (averaged over x)
         ax = fig.add_subplot(gs[2, col])
         ax.set_facecolor("#050d1a")
         for sp in ax.spines.values(): sp.set_edgecolor("#1a3a5c")
@@ -936,10 +935,10 @@ def plot_uncertainty_maps(model, T, S, norm, args, n_samples=60):
                          color="#fc8d59", alpha=0.7, label="SST sigma")
         ax.fill_betweenx(y_ax, 0, S_s.mean(axis=0),
                          color="#6baed6", alpha=0.5, label="SSS sigma")
-        # Points capteurs sur le profil
+        # Sensor positions on the profile
         for (_, yp) in obs_pos:
             ax.axhline(yp, color="cyan", lw=0.4, alpha=0.4)
-        ax.set_title(f"Profil méridional σ (moyen en x)", color="white",
+        ax.set_title(f"Meridional profile of sigma (x-average)", color="white",
                      fontsize=8, fontweight="bold", pad=4)
         ax.set_xlabel("sigma moyen", color="white", fontsize=7)
         ax.set_ylabel("y (latitude)", color="white", fontsize=7)
@@ -948,19 +947,19 @@ def plot_uncertainty_maps(model, T, S, norm, args, n_samples=60):
         ax.grid(True, alpha=0.2, color="white", axis="x")
 
     fig.text(0.5, 0.97,
-             "VAE-UNet — Incertitude vs Densité Réseau  "
-             "(cyan = capteurs  |  même échelle de couleur)",
+             "AE-UNet - Uncertainty vs Network Density  "
+             "(cyan = sensors  |  shared colour scale)",
              ha="center", color="white", fontsize=12, fontweight="bold")
 
     out = out_dir / "vae_uncertainty_density.png"
     fig.savefig(out, dpi=150, facecolor=BG, bbox_inches="tight")
     plt.close()
-    print(f"  Figure densité/incertitude -> {out}")
+    print(f"  Density/uncertainty figure -> {out}")
     """
     Figure 1 — Reconstruction vs Nature Run.
 
-    4 lignes x 4 colonnes :
-      Colonne :  Verite terrain | Reconstruction (mu) | Erreur |  Incertitude (sigma)
+    4 rows x 4 columns:
+      Columns:  Ground truth | Reconstruction (mu) | Error | Uncertainty (sigma)
       Ligne 1 :  SST
       Ligne 2 :  SSS
       Ligne 3 :  SST (diff instant, + dense)
@@ -981,9 +980,9 @@ def plot_uncertainty_maps(model, T, S, norm, args, n_samples=60):
     T_n = (T - norm["T_mean"]) / norm["T_std"]
     S_n = (S - norm["S_mean"]) / norm["S_std"]
 
-    # Deux instants : dense (30 obs) et clairseme (8 obs)
-    # Instants choisis relativement a la longueur du nature run : les indices
-    # 50 et 150 etaient codes en dur et plantaient des que nt < 151.
+    # Two snapshots: dense (30 obs) and sparse (8 obs)
+    # Time steps chosen relative to the nature run length: indices 50 and 150
+    # were hard-coded and crashed as soon as nt < 151.
     nt_ = len(T_n)
     t_a, t_b = min(nt_ - 1, nt_ // 4), min(nt_ - 1, 3 * nt_ // 4)
     scenarios = [
@@ -992,7 +991,7 @@ def plot_uncertainty_maps(model, T, S, norm, args, n_samples=60):
     ]
 
     fig, axes = plt.subplots(4, 4, figsize=(20, 18), facecolor="#0a1628")
-    col_titles = ["Verite terrain", "Reconstruction (mu)", "Erreur |pred - vrai|", "Incertitude (sigma MC)"]
+    col_titles = ["Ground truth", "Reconstruction (mu)", "Error |pred - true|", "Uncertainty (MC sigma)"]
 
     def cell(ax, data, cmap, vmin=None, vmax=None, title="", label="",
              norm_obj=None):
@@ -1014,7 +1013,7 @@ def plot_uncertainty_maps(model, T, S, norm, args, n_samples=60):
     for row_pair, (desc, t, n_obs) in enumerate(scenarios):
         T_t = T_n[t]; S_t = S_n[t]
 
-        # Masque aleatoire avec n_obs observations
+        # Random observation mask with n_obs sensors
         mask_np = np.zeros((NX, NY), dtype=np.float32)
         for (px, py) in sample_separated_positions(
                 NX, NY, n_obs, rng=np.random.default_rng(t + 100)):
@@ -1031,7 +1030,7 @@ def plot_uncertainty_maps(model, T, S, norm, args, n_samples=60):
         recon_mean = recon_mean[0].cpu().numpy()  # (2, NX, NY)
         recon_std  = recon_std[0].cpu().numpy()
 
-        # Denormalisation pour affichage
+        # Back to physical units for display
         T_true_phys  = T_t * norm["T_std"] + norm["T_mean"]
         S_true_phys  = S_t * norm["S_std"] + norm["S_mean"]
         T_pred_phys  = recon_mean[0] * norm["T_std"] + norm["T_mean"]
@@ -1053,7 +1052,7 @@ def plot_uncertainty_maps(model, T, S, norm, args, n_samples=60):
         # -- SST --
         cell(axes[row_T,0], T_true_phys, ocean_cmap, *vT,
              title=f"SST | Verite  |  {desc}", label="degC")
-        # Overlay bouees
+        # Overlay buoys
         obs_pos = np.argwhere(mask_np > 0.5)
         axes[row_T,0].scatter(obs_pos[:,0], obs_pos[:,1], c="white", s=8,
                               marker="x", linewidths=0.6, zorder=5, alpha=0.8)
@@ -1063,7 +1062,7 @@ def plot_uncertainty_maps(model, T, S, norm, args, n_samples=60):
 
         err_lim = T_err_phys.max()
         cell(axes[row_T,2], T_err_phys, "hot", 0, err_lim,
-             title=f"SST | Erreur |predict-vrai|  RMSE={T_err_phys.mean():.3f}", label="degC")
+             title=f"SST | Error |pred - true|  RMSE={T_err_phys.mean():.3f}", label="degC")
 
         cell(axes[row_T,3], T_unc_phys, unc_cmap, 0, T_unc_phys.max(),
              title=f"SST | Incertitude sigma MC (N={n_samples})", label="degC")
@@ -1079,12 +1078,12 @@ def plot_uncertainty_maps(model, T, S, norm, args, n_samples=60):
 
         s_err_lim = S_err_phys.max()
         cell(axes[row_S,2], S_err_phys, "hot", 0, s_err_lim,
-             title=f"SSS | Erreur  RMSE={S_err_phys.mean():.3f}", label="psu")
+             title=f"SSS | Error  RMSE={S_err_phys.mean():.3f}", label="psu")
 
         cell(axes[row_S,3], S_unc_phys, unc_cmap, 0, S_unc_phys.max(),
              title=f"SSS | Incertitude sigma MC (N={n_samples})", label="psu")
 
-    # Titres colonnes
+    # Column titles
     for j, ct in enumerate(col_titles):
         axes[0, j].set_xlabel("")
         fig.text(0.12 + j * 0.22, 0.97, ct,
@@ -1099,7 +1098,7 @@ def plot_uncertainty_maps(model, T, S, norm, args, n_samples=60):
 
 @torch.no_grad()
 def _compute_rmse_mc(model, T_n_t, S_n_t, positions, norm, n_mc=8):
-    """RMSE (pixels non observés) sur un seul instant, moyenne sur n_mc tirages VAE."""
+    """RMSE over unobserved pixels at one time step, averaged over n_mc MC draws."""
     mask = np.zeros((NX, NY), dtype=np.float32)
     T_obs = np.zeros_like(mask); S_obs = np.zeros_like(mask)
     ns_T = OBS_NOISE_T / (norm["T_std"] + 1e-9)
@@ -1122,7 +1121,7 @@ def _compute_rmse_mc(model, T_n_t, S_n_t, positions, norm, n_mc=8):
 
 def score(args):
     print("=" * 62)
-    print("  Brique 1 — Scoring VAE")
+    print("  Brick 1 - AE scoring")
     print("=" * 62)
 
     ckpt  = torch.load(args.checkpoint, map_location=DEVICE, weights_only=False)
@@ -1133,15 +1132,15 @@ def score(args):
         cond_dim=ckpt["args"].get("cond_dim", 32)).to(DEVICE)
     model.load_state_dict(ckpt["model_state"])
     model.eval()
-    print(f"  Modele charge : {args.checkpoint}")
+    print(f"  Model loaded: {args.checkpoint}")
 
     gen = SyntheticOceanGenerator()
     T, S = gen.generate_dataset(nt=args.nt, seed=args.seed_ocean)
     norm = ckpt["norm"]
 
-    # Le modele travaille sur des champs normalises : _compute_rmse_mc attend
-    # T_n / S_n, pas les champs physiques. (l'ancien code appelait une fonction
-    # _rmse_unobs inexistante, sur des champs bruts -> NameError)
+    # The model works on normalised fields: _compute_rmse_mc expects T_n / S_n,
+    # not physical fields. (the previous code called a non-existent function
+    # _rmse_unobs, on raw fields -> NameError)
     T_n = (T - norm["T_mean"]) / norm["T_std"]
     S_n = (S - norm["S_mean"]) / norm["S_std"]
 
@@ -1154,7 +1153,7 @@ def score(args):
     rmse_full = np.mean([_compute_rmse_mc(model, T_n[t], S_n[t], positions,
                                           norm, n_mc=args.n_mc_val)
                          for t in t_idx])
-    print(f"  RMSE reseau complet : {rmse_full:.4f}")
+    print(f"  RMSE, full network : {rmse_full:.4f}")
 
     loo_scores = {}
     for i, pos in enumerate(positions):
@@ -1163,7 +1162,7 @@ def score(args):
                                              norm, n_mc=args.n_mc_val)
                             for t in t_idx])
         loo_scores[i] = {"position": list(pos), "delta_rmse": float(rmse_loo - rmse_full)}
-        print(f"  Capteur {i:2d} @ {pos} | delta={loo_scores[i]['delta_rmse']:+.4f}")
+        print(f"  Sensor {i:2d} @ {pos} | delta={loo_scores[i]['delta_rmse']:+.4f}")
 
     out_dir = Path(args.output_dir)
     with open(out_dir / "vae_loo_scores.json", "w") as f:
@@ -1181,15 +1180,15 @@ def parse_args():
     p.add_argument("--score",        action="store_true")
     p.add_argument("--figures",      action="store_true")
     p.add_argument("--report",       action="store_true",
-                   help="Produit un rapport .txt avec les métriques clés")
+                   help="Write a .txt report with the key metrics")
     p.add_argument("--seed_ocean",   type=int,   default=42,
-                   help="Seed du nature run (pour --report)")
+                   help="Nature run seed (used by --report)")
     p.add_argument("--seed_buoys",   type=int,   default=7,
-                   help="Seed du réseau de bouées (pour --report)")
+                   help="Buoy network seed (used by --report)")
     p.add_argument("--checkpoint",   type=str,   default="outputs/vae_best.pt")
     p.add_argument("--output_dir",   type=str,   default="outputs")
     p.add_argument("--nt",           type=int,   default=NT,
-                   help="Longueur du nature run (jours)")
+                   help="Nature run length in days")
     p.add_argument("--epochs",       type=int,   default=100)
     p.add_argument("--batch_size",   type=int,   default=16)
     p.add_argument("--lr",           type=float, default=3e-4)
@@ -1197,7 +1196,7 @@ def parse_args():
     p.add_argument("--latent_ch",    type=int,   default=64)
     p.add_argument("--cond_dim",     type=int,   default=32)
     p.add_argument("--dropout_p",    type=float, default=0.1,
-                   help="MC-Dropout p (actif aussi à l inférence)")
+                   help="MC-Dropout rate p (kept active at inference too)")
     p.add_argument("--w_unobs",      type=float, default=4.0)
     p.add_argument("--lambda_grad",  type=float, default=0.5)
     p.add_argument("--lambda_spec",  type=float, default=0.0)
@@ -1232,14 +1231,14 @@ if __name__ == "__main__":
         model.eval()
         norm = ckpt["norm"]
 
-        print("  Generation du nature run pour les figures...")
+        print("  Generating the nature run for the figures...")
         gen = SyntheticOceanGenerator()
         T, S = gen.generate_dataset(nt=args.nt, seed=args.seed_ocean)
 
         if args.figures:
-            print("\n  Figure 1 : Evaluation du reseau existant (zones lacunaires + LOO)...")
+            print("\n  Figure 1: existing network evaluation (gaps + LOO)...")
             plot_network_evaluation(model, T, S, norm, args, n_samples=args.n_mc)
-            print("\n  Figure 2 : Incertitude vs densite reseau...")
+            print("\n  Figure 2: uncertainty vs network density...")
             plot_uncertainty_maps(model, T, S, norm, args, n_samples=args.n_mc)
 
         if args.score:
@@ -1248,7 +1247,7 @@ if __name__ == "__main__":
     if args.report:
         ts  = datetime.now().strftime("%Y%m%d_%H%M%S")
         out = Path(args.output_dir)
-        # Recharger métriques depuis checkpoint si disponible
+        # Reload metrics from the checkpoint if available
         try:
             ckpt = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
             saved_args = ckpt.get("args", {})
@@ -1256,14 +1255,14 @@ if __name__ == "__main__":
             saved_args = {}
         lines = [
             "=" * 68,
-            "  Brique 1 — AE-UNet MC-Dropout — Rapport",
-            f"  Généré le : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+            "  Brick 1 - AE-UNet MC-Dropout - Report",
+            f"  Generated on : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
             "=" * 68, "",
-            "── REPRODUCTIBILITÉ ─────────────────────────────────────────────────",
+            "-- REPRODUCIBILITY --------------------------------------------------",
             f"  seed_ocean  : {args.seed_ocean}",
             f"  seed_buoys  : {args.seed_buoys}",
             "",
-            "── HYPERPARAMÈTRES ──────────────────────────────────────────────────",
+            "-- HYPERPARAMETERS --------------------------------------------------",
             f"  epochs      : {args.epochs}",
             f"  base_ch     : {args.base_ch}",
             f"  latent_ch   : {args.latent_ch}",
@@ -1279,6 +1278,6 @@ if __name__ == "__main__":
             if f.suffix in {".pt", ".png", ".gif"}:
                 lines.append(f"  {f.name:<44} {f.stat().st_size//1024:>5} KB")
         lines += ["", "=" * 68]
-        rpt = out / f"rapport_ae_{ts}.txt"
+        rpt = out / f"report_ae_{ts}.txt"
         rpt.write_text("\n".join(lines), encoding="utf-8")
-        print(f"\n  Rapport AE → {rpt}")
+        print(f"\n  AE report -> {rpt}")

@@ -1,24 +1,24 @@
 """
 ╔══════════════════════════════════════════════════════════════════════════════╗
-║         BRIQUE 2 — Graph Neural Network pour la Structure du Réseau         ║
+║         BRICK 2 -- Graph Neural Network for network structure                ║
 ║                                                                              ║
-║  Pipeline :                                                                  ║
-║    1. Construction du graphe depuis les positions des capteurs               ║
-║       et la matrice de corrélation spatiale du nature run                    ║
-║    2. Graph Attention Network (GAT) : apprend l'importance relative          ║
-║       de chaque voisin → poids d'attention = proxy de redondance             ║
-║    3. GraphSAGE en mode inductif : évalue des capteurs hypothétiques         ║
-║       (gliders, Argo) non présents à l'entraînement                         ║
-║    4. Analyse : détection redondance, lacunes, ranking des capteurs          ║
+║  Pipeline:                                                                   ║
+║    1. Build the graph from sensor positions and the spatial                  ║
+║       correlation matrix of the nature run                                   ║
+║    2. Graph Attention Network (GAT): learns the relative importance          ║
+║       of each neighbour -> attention weights = redundancy proxy              ║
+║    3. GraphSAGE in inductive mode: scores hypothetical sensors               ║
+║       (gliders, Argo floats) absent from training                            ║
+║    4. Analysis: redundancy detection, gaps, sensor ranking                   ║
 ║                                                                              ║
-║  Usage :                                                                     ║
+║  Usage:                                                                      ║
 ║    python 02_gnn.py --build_graph                                            ║
 ║    python 02_gnn.py --train                                                  ║
 ║    python 02_gnn.py --analyze                                                ║
 ║    python 02_gnn.py --inductive --new_positions "[(10,20),(80,150)]"        ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
 
-Dépendances : pip install torch-geometric
+Dependencies: pip install torch-geometric
 """
 
 import sys, argparse, ast
@@ -36,26 +36,26 @@ from data.dataset import (SyntheticOceanGenerator, sensor_series,
                           local_variance_map, mesoscale_anomaly,
                           sample_separated_positions)
 
-# ── Import PyTorch Geometric ───────────────────────────────────────────────────
+# -- PyTorch Geometric import -------------------------------------------------
 try:
     from torch_geometric.data import Data
     from torch_geometric.nn import GATConv, SAGEConv, global_mean_pool
     PYG_AVAILABLE = True
 except ImportError:
     PYG_AVAILABLE = False
-    print("[WARN] torch-geometric non disponible — implémentation manuelle utilisée.")
-    print("       pip install torch-geometric  pour activer les GATConv/SAGEConv natifs")
+    print("[WARN] torch-geometric unavailable -- using the hand-written fallback.")
+    print("       pip install torch-geometric  to enable native GATConv/SAGEConv")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  IMPLÉMENTATION MANUELLE (fallback si torch_geometric absent)
-#  Message Passing + Attention simplifiés
+#  HAND-WRITTEN FALLBACK (used when torch_geometric is absent)
+#  Simplified message passing + attention
 # ══════════════════════════════════════════════════════════════════════════════
 
 class ManualGATLayer(nn.Module):
     """
-    Graph Attention Layer manuel (single-head) si PyG indisponible.
-    Identique à Veličković et al. (2018) pour 1 tête.
+    Hand-written single-head graph attention layer, used when PyG is absent.
+    Identical to Velickovic et al. (2018) for one head.
     """
     def __init__(self, in_dim, out_dim):
         super().__init__()
@@ -64,23 +64,23 @@ class ManualGATLayer(nn.Module):
 
     def forward(self, h, edge_index):
         """
-        h          : (N, in_dim)  features nodaux
-        edge_index : (2, E)       arêtes (src, dst)
+        h          : (N, in_dim)  node features
+        edge_index : (2, E)       edges (src, dst)
         """
         Wh = self.W(h)                        # (N, out_dim)
         src, dst = edge_index[0], edge_index[1]
 
-        # Calcul des coefficients d'attention
+        # Attention coefficients
         e = torch.cat([Wh[src], Wh[dst]], dim=-1)  # (E, 2*out_dim)
         alpha = F.leaky_relu(self.a(e), 0.2).squeeze(-1)  # (E,)
 
-        # Softmax par nœud destination
+        # Softmax over destination nodes
         alpha_exp = torch.exp(alpha - alpha.max())
         alpha_sum = torch.zeros(h.size(0), device=h.device)
         alpha_sum.scatter_add_(0, dst, alpha_exp)
         alpha_norm = alpha_exp / (alpha_sum[dst] + 1e-9)   # (E,)
 
-        # Agrégation
+        # Aggregation
         out = torch.zeros_like(Wh)
         out.scatter_add_(0, dst.unsqueeze(-1).expand_as(Wh[src]),
                          alpha_norm.unsqueeze(-1) * Wh[src])
@@ -88,24 +88,24 @@ class ManualGATLayer(nn.Module):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  CONSTRUCTION DU GRAPHE
+#  GRAPH CONSTRUCTION
 # ══════════════════════════════════════════════════════════════════════════════
 
 def build_spatial_correlation(T, S, positions, n_timestamps=200,
                               deseason=DESEASON_ANALYSIS):
     """
-    Matrice de corrélation entre capteurs, estimée sur le nature run.
+    Inter-sensor correlation matrix, estimated on the nature run.
 
-    Rho[i,j] = corrélation de Pearson entre les séries (0.6·T + 0.4·S)
-                standardisées aux positions i et j.
+    Rho[i,j] = Pearson correlation between the standardised (0.6*T + 0.4*S)
+    series at positions i and j.
 
-    `deseason=True` (défaut) retire la moyenne de domaine à chaque pas avant
-    de corréler. C'est indispensable avec le nature run v3 : le cycle
-    saisonnier est un mode quasi uniforme, et si on le garde 40 % des paires
-    de bouées dépassent |rho| = 0.5 quelle que soit leur distance. Le graphe
-    devient une quasi-clique et la notion de redondance perd tout sens.
-    Après retrait, |rho| moyen tombe de 0.45 à 0.17 et ne dépend plus que
-    de la structure mésoéchelle — ce que le réseau doit réellement résoudre.
+    `deseason=True` (default) removes the domain mean at every step before
+    correlating. This is indispensable with the v3 nature run: the seasonal
+    cycle is a near-uniform mode, and keeping it puts 40% of buoy pairs above
+    |rho| = 0.5 regardless of their separation. The graph becomes a
+    near-clique and redundancy loses all meaning. Once removed, mean |rho|
+    drops from 0.45 to 0.17 and depends only on mesoscale structure -- which
+    is what the network actually has to resolve.
     """
     t_idx = np.sort(np.random.choice(len(T), min(n_timestamps, len(T)),
                                      replace=False))
@@ -121,22 +121,22 @@ def build_graph(positions, corr_matrix,
                 k_nearest=4,
                 T=None, S=None):
     """
-    Construit le graphe du réseau d'observation.
+    Build the observing-network graph.
 
-    Stratégie d'arête combinée :
-        (a) Seuil de corrélation : |rho| > threshold → arête
-        (b) k plus proches voisins géographiques : garantit la connexité
+    Combined edge strategy:
+        (a) correlation threshold: |rho| > threshold -> edge
+        (b) k geographic nearest neighbours: guarantees connectivity
 
-    Features nodaux (x_nodes) :
-        [lon_norm, lat_norm, variance_T_norm, variance_S_norm,
-         degré_géo_norm, corrélation_max_avec_voisin]
+    Node features (x_nodes):
+        [x_norm, y_norm, max_correlation_with_neighbour, degree_norm,
+         local_SST_variance, local_SSS_variance]
 
-    Retourne un dict compatible torch_geometric.Data et le fallback manuel.
+    Returns a dict compatible with both torch_geometric.Data and the fallback.
     """
     n = len(positions)
     pos_arr = np.array(positions, dtype=np.float32)
 
-    # ── (a) Arêtes par seuil de corrélation ──────────────────────────────────
+    # -- (a) Edges from the correlation threshold ------------------------------
     src_list, dst_list, edge_attr_list = [], [], []
     for i in range(n):
         for j in range(i + 1, n):
@@ -145,12 +145,12 @@ def build_graph(positions, corr_matrix,
                 dst_list += [j, i]
                 edge_attr_list += [corr_matrix[i, j], corr_matrix[i, j]]
 
-    # ── (b) k-NN géographique ────────────────────────────────────────────────
+    # -- (b) Geographic k-NN ---------------------------------------------------
     from scipy.spatial import KDTree
     tree = KDTree(pos_arr)
     for i in range(n):
         dists, idxs = tree.query(pos_arr[i], k=k_nearest + 1)
-        for j in idxs[1:]:   # exclure self
+        for j in idxs[1:]:   # exclude self
             if (i, j) not in set(zip(src_list, dst_list)):
                 dist_norm = dists[list(idxs).index(j)] / (NX + NY)
                 src_list += [i, j]
@@ -161,24 +161,24 @@ def build_graph(positions, corr_matrix,
     edge_index = torch.tensor([src_list, dst_list], dtype=torch.long)
     edge_attr  = torch.tensor(edge_attr_list, dtype=torch.float).unsqueeze(-1)
 
-    # ── Features nodaux ───────────────────────────────────────────────────────
-    # Position normalisée
+    # -- Node features ---------------------------------------------------------
+    # Normalised position
     x_norm = pos_arr[:, 0:1] / NX
     y_norm = pos_arr[:, 1:2] / NY
-    # Corrélation max avec voisin (proxy de redondance)
+    # Max correlation with a neighbour (redundancy proxy)
     corr_max = np.array([corr_matrix[i, :].copy() for i in range(n)])
     np.fill_diagonal(corr_max, 0)
     corr_max_vals = corr_max.max(axis=1, keepdims=True)
-    # Degré du nœud normalisé
+    # Normalised node degree
     degree = np.bincount(src_list, minlength=n).reshape(-1, 1).astype(np.float32)
     degree_norm = degree / (degree.max() + 1e-9)
 
-    # Variabilité locale du champ vue par chaque capteur.
-    # La docstring d'origine annonçait variance_T / variance_S dans les
-    # features, mais elles n'y étaient pas : le GNN ne voyait que la
-    # géométrie du réseau, jamais l'océan. On les ajoute, standardisées
-    # séparément (var_T ~ 3 °C², var_S ~ 0.03 psu² : sans standardisation
-    # la salinité disparaît numériquement).
+    # Local field variability seen by each sensor.
+    # The original docstring advertised variance_T / variance_S among the
+    # features, but they were not there: the GNN only saw network geometry,
+    # never the ocean. They are added here, standardised separately
+    # (var_T ~ 3 degC^2 against var_S ~ 0.03 psu^2: without standardisation
+    # salinity vanishes numerically).
     if T is not None and S is not None:
         _, vT, vS = local_variance_map(T, S, positions)
         zT = ((vT - vT.mean()) / (vT.std() + 1e-9)).reshape(-1, 1)
@@ -204,25 +204,25 @@ def build_graph(positions, corr_matrix,
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  MODÈLE — GAT + GraphSAGE
+#  MODEL -- GAT + GraphSAGE
 # ══════════════════════════════════════════════════════════════════════════════
 
 class OceanNetworkGAT(nn.Module):
     """
-    Graph Attention Network pour l'analyse du réseau d'observation.
+    Graph Attention Network for observing-network analysis.
 
-    Architecture :
-        GAT layer 1 (4→32, 4 têtes) → GAT layer 2 (128→64, 1 tête)
-        → MLP → score par nœud (observabilité prédite)
+    Architecture:
+        GAT layer 1 (in -> 32, 4 heads) -> GAT layer 2 (128 -> 32, 1 head)
+        -> MLP -> per-node score (predicted observability)
 
-    Tâche supervisée :
-        Pour chaque nœud (capteur), prédire sa "contribution locale"
-        = amélioration de reconstruction RMSE apportée (target = LOO score
-          normalisé, produit par la Brique 1 ou une proxy rapide).
+    Supervised task:
+        For each node (sensor), predict its "local contribution" = the
+        reconstruction RMSE improvement it brings (target = normalised LOO
+        score, produced by Brick 1 or by a fast proxy).
 
-    Les poids d'attention alpha_{ij} sont le signal principal d'analyse :
-        alpha_{ij} élevé → capteur j fortement influencé par i
-        → redondance potentielle si la corrélation est élevée
+    The attention weights alpha_{ij} are the main analysis signal:
+        high alpha_{ij} -> sensor j strongly influenced by i
+        -> potential redundancy when the correlation is also high
     """
     def __init__(self, in_dim=4, hidden_dim=32, out_dim=1, n_heads=4):
         super().__init__()
@@ -239,7 +239,7 @@ class OceanNetworkGAT(nn.Module):
             nn.Dropout(0.1),
             nn.Linear(32, out_dim),
         )
-        self._attention_weights = None   # stocké pour l'analyse post-hoc
+        self._attention_weights = None   # stored for post-hoc analysis
 
     def forward(self, x, edge_index, edge_attr=None, return_attention=False):
         if PYG_AVAILABLE:
@@ -263,16 +263,16 @@ class OceanNetworkGAT(nn.Module):
 
 class GraphSAGEInductive(nn.Module):
     """
-    GraphSAGE en mode inductif pour évaluer de nouveaux capteurs.
+    GraphSAGE in inductive mode, to score new sensors.
 
-    Contrairement au GAT transductif (qui ne voit que les nœuds d'entraînement),
-    GraphSAGE apprend des fonctions d'agrégation généralisables :
-    on peut insérer un nouveau nœud (glider, Argo) dans le graphe
-    et obtenir immédiatement son embedding sans ré-entraînement.
+    Unlike the transductive GAT (which only sees training nodes), GraphSAGE
+    learns generalisable aggregation functions: a new node (glider, Argo
+    float) can be inserted into the graph and get its embedding immediately,
+    without retraining.
 
-    Usage OED :
-        → Simuler l'ajout d'une nouvelle bouée/glider
-        → Prédire sa contribution marginale sans LOO exhaustif
+    OED use:
+        -> simulate adding a new buoy or glider
+        -> predict its marginal contribution without an exhaustive LOO sweep
     """
     def __init__(self, in_dim=4, hidden_dim=64, out_dim=1):
         super().__init__()
@@ -280,7 +280,7 @@ class GraphSAGEInductive(nn.Module):
             self.conv1 = SAGEConv(in_dim, hidden_dim)
             self.conv2 = SAGEConv(hidden_dim, hidden_dim // 2)
         else:
-            # Agrégation mean manuelle
+            # Hand-written mean aggregation
             self.conv1 = ManualGATLayer(in_dim, hidden_dim)
             self.conv2 = ManualGATLayer(hidden_dim, hidden_dim // 2)
 
@@ -303,42 +303,41 @@ class GraphSAGEInductive(nn.Module):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  GÉNÉRATION DES TARGETS (proxy rapide sans Brique 1)
+#  TARGET GENERATION (fast proxy, no dependency on Brick 1)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def compute_proxy_targets(positions, corr_matrix):
     """
-    Target de supervision rapide (sans charger la Brique 1) :
-        contribution_i = 1 - mean(|corr(i, j)|) pour j ≠ i
+    Fast supervision target (no need to load Brick 1):
+        contribution_i = 1 - mean(|corr(i, j)|) over j != i
 
-    Interprétation : un capteur très corrélé à tous ses voisins
-    a une faible contribution marginale → il est redondant.
-    Ce proxy est cohérent avec la définition théorique OED
-    (réduction d'entropie marginale en cas gaussien).
+    Reading: a sensor strongly correlated with all its neighbours has a low
+    marginal contribution -- it is redundant. This proxy is consistent with
+    the theoretical OED definition (marginal entropy reduction in the
+    Gaussian case).
     """
     n = len(positions)
     targets = np.zeros(n)
     for i in range(n):
         off_diag = np.delete(corr_matrix[i], i)
         targets[i] = 1.0 - np.mean(np.abs(off_diag))
-    # Normalisation [0, 1]
+    # Normalise to [0, 1]
     targets = (targets - targets.min()) / (targets.max() - targets.min() + 1e-9)
     return torch.tensor(targets, dtype=torch.float)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  ENTRAÎNEMENT GNN
+#  GNN TRAINING
 # ══════════════════════════════════════════════════════════════════════════════
 
 def train_gnn(args, graph_dict, targets):
     """
-    Entraîne le GAT sur la tâche de scoring nodal.
+    Train the GAT on the node-scoring task.
 
-    Stratégie semi-supervisée :
-        On entraîne sur un sous-ensemble de nœuds (masque train)
-        et on évalue sur le reste → simule l'évaluation de nouveaux capteurs.
+    Semi-supervised strategy: train on a subset of nodes (train mask) and
+    evaluate on the rest -> mimics scoring sensors never seen before.
     """
-    print("\n── Entraînement GAT ───────────────────────────────────────────────")
+    print("\n-- GAT training ---------------------------------------------------")
     model = OceanNetworkGAT(in_dim=graph_dict["x"].shape[1]).to(DEVICE)
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-4)
 
@@ -347,7 +346,7 @@ def train_gnn(args, graph_dict, targets):
     y          = targets.to(DEVICE)
 
     n = x.shape[0]
-    # Masque train/test (80/20 aléatoire sur les nœuds)
+    # Train/test mask (random 80/20 split over nodes)
     perm = torch.randperm(n)
     train_mask = torch.zeros(n, dtype=torch.bool)
     train_mask[perm[:int(0.8 * n)]] = True
@@ -370,31 +369,31 @@ def train_gnn(args, graph_dict, targets):
             with torch.no_grad():
                 scores_eval = model(x, edge_index)
                 test_loss = F.mse_loss(scores_eval[test_mask], y[test_mask])
-            print(f"  Époque {epoch:3d} | Train MSE={loss.item():.4f} | "
+            print(f"  Epoch {epoch:3d} | Train MSE={loss.item():.4f} | "
                   f"Test MSE={test_loss.item():.4f}")
             if test_loss.item() < best_loss:
                 best_loss = test_loss.item()
                 torch.save(model.state_dict(), out_dir / "gnn_best.pt")
 
-    print(f"  ✓ Checkpoint → {out_dir}/gnn_best.pt")
+    print(f"  [ok] Checkpoint -> {out_dir}/gnn_best.pt")
     return model
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  ANALYSE DU RÉSEAU
+#  NETWORK ANALYSIS
 # ══════════════════════════════════════════════════════════════════════════════
 
 def analyze_network(model, graph_dict, targets, args, T=None, label=""):
     """
-    Produit le diagnostic complet du réseau :
-        - Scores nodaux prédits (contribution de chaque capteur)
-        - Poids d'attention GAT (redondance inter-capteurs)
-        - Identification des zones lacunaires (coarse grid non couvert)
-        - Recommandations : capteurs à retirer / zones à couvrir
+    Produce the full network diagnostic:
+        - predicted node scores (contribution of each sensor)
+        - GAT attention weights (inter-sensor redundancy)
+        - identification of gap zones (uncovered coarse-grid cells)
+        - recommendations: sensors to remove / zones to cover
 
-    T      : nature run (NT, NX, NY) — si fourni, SST moyenne en fond sur
-             les cartes contribution / redondance / graphe réseau.
-    label  : suffixe pour le nom de fichier (ex: "rl_optimal", "random")
+    T      : nature run (NT, NX, NY) -- if provided, the time-mean SST is used
+             as a background for the contribution / redundancy / graph maps.
+    label  : filename suffix (e.g. "rl_optimal", "random")
     """
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -410,9 +409,9 @@ def analyze_network(model, graph_dict, targets, args, T=None, label=""):
         scores, attention = model(x, edge_index, return_attention=True)
     scores = scores.cpu().numpy()
 
-    # ── Matrice d'attention ────────────────────────────────────────────────────
-    # Pour chaque arête, le poids d'attention indique l'influence du nœud source
-    # La matrice attention_matrix[i,j] = mean des poids sur l'arête (i→j)
+    # -- Attention matrix -------------------------------------------------------
+    # For each edge the attention weight gives the influence of the source
+    # node; attention_matrix[i,j] = mean weight over the edge (i -> j)
     n = len(positions)
     attention_matrix = np.zeros((n, n))
     ei = graph_dict["edge_index"].numpy()
@@ -428,41 +427,41 @@ def analyze_network(model, graph_dict, targets, args, T=None, label=""):
         if k < len(a_vals):
             attention_matrix[s, d] = max(attention_matrix[s, d], float(a_vals[k]))
 
-    # ── Score de redondance par nœud (corrélation pairwise moyenne) ───────────
-    # L'attention peut être creuse → utiliser la corrélation directe entre capteurs
-    # redondance_i = mean |corr(i,j)| pour j ≠ i  (voisins dans le graphe)
-    # unicite_i    = 1 - redondance_i
-    # Un capteur très corrélé avec ses voisins est redondant.
-    # Un capteur faiblement corrélé = information unique → forte unicité.
+    # -- Per-node redundancy score (mean pairwise correlation) ------------------
+    # Attention can be sparse -> use the direct inter-sensor correlation
+    # redundancy_i = mean |corr(i,j)| over j != i  (graph neighbours)
+    # uniqueness_i = 1 - redundancy_i
+    # A sensor strongly correlated with its neighbours is redundant.
+    # A weakly correlated sensor carries unique information -> high uniqueness.
     n = len(positions)
-    corr_mat = corr_matrix  # (n, n) corrélation déjà calculée
+    corr_mat = corr_matrix  # (n, n) correlation, already computed
     redundancy_score = np.zeros(n)
     for i in range(n):
         row = np.abs(corr_mat[i, :])
-        row[i] = 0.0                      # exclure la corrélation avec soi-même
-        neighbors = np.where(row > 0)[0]  # voisins avec corrélation non nulle
+        row[i] = 0.0                      # exclude self-correlation
+        neighbors = np.where(row > 0)[0]  # neighbours with non-zero correlation
         if len(neighbors) > 0:
             redundancy_score[i] = row[neighbors].mean()
         else:
-            # Nœud isolé : pas de voisins → unicité maximale par défaut
+            # Isolated node: no neighbours -> maximum uniqueness by default
             redundancy_score[i] = 0.0
 
-    # Normaliser [0, 1] pour comparaison avec les scores de contribution
+    # Normalise to [0, 1] for comparison with the contribution scores
     r_min, r_max = redundancy_score.min(), redundancy_score.max()
     if r_max > r_min:
         redundancy_score = (redundancy_score - r_min) / (r_max - r_min)
     else:
-        # Tous les capteurs également redondants → unicité uniforme à 0.5
+        # All sensors equally redundant -> uniform uniqueness at 0.5
         redundancy_score = np.full(n, 0.5)
 
-    # ── Couverture spatiale (grille grossière) ─────────────────────────────────
+    # -- Spatial coverage (coarse grid) -----------------------------------------
     grid_res = 16
     coverage_grid = np.zeros((NX // grid_res + 1, NY // grid_res + 1))
     for (x_p, y_p) in positions:
         coverage_grid[x_p // grid_res, y_p // grid_res] += 1
 
-    # ── Fond SST (optionnel) ──────────────────────────────────────────────────
-    # SST moyenne temporelle — image de fond cohérente pour tous les panneaux
+    # -- SST background (optional) ----------------------------------------------
+    # Time-mean SST -- consistent background image for every panel
     from matplotlib.colors import LinearSegmentedColormap
     ocean_cmap = LinearSegmentedColormap.from_list("oc",
         ["#08306b","#2171b5","#6baed6","#c6dbef","#fff5eb",
@@ -472,35 +471,35 @@ def analyze_network(model, graph_dict, targets, args, T=None, label=""):
     sst_vmax   = sst_bg.max()   if sst_bg is not None else 1
 
     def _bg(ax):
-        """Affiche la SST moyenne en fond + cadre."""
+        """Draw the mean SST as background + frame."""
         if sst_bg is not None:
             ax.imshow(sst_bg.T, cmap=ocean_cmap, origin="lower", aspect="auto",
                       vmin=sst_vmin, vmax=sst_vmax, alpha=0.45,
                       extent=[0, NX, 0, NY])
         ax.set_xlim(0, NX); ax.set_ylim(0, NY)
 
-    # ── Seuil de redondance ────────────────────────────────────────────────────
-    # Un capteur est "redondant" si son unicité est dans le quartile inférieur
-    # (très corrélé avec ses voisins → apport marginal faible)
-    unicite = 1 - redundancy_score
-    redondance_thr = np.percentile(unicite, 25)   # 25% les moins uniques
-    is_redundant   = unicite < redondance_thr      # (n,) bool
+    # -- Redundancy threshold ---------------------------------------------------
+    # A sensor is "redundant" when its uniqueness falls in the lower quartile
+    # (strongly correlated with its neighbours -> low marginal contribution)
+    uniqueness = 1 - redundancy_score
+    redundancy_thr = np.percentile(uniqueness, 25)   # the 25% least unique
+    is_redundant   = uniqueness < redundancy_thr      # (n,) bool
 
-    # ── Visualisation ─────────────────────────────────────────────────────────
+    # -- Visualisation ----------------------------------------------------------
     suffix = f"_{label}" if label else ""
     fig, axes = plt.subplots(2, 3, figsize=(18, 11))
-    fig.suptitle(f"Brique 2 — GNN : Analyse Structurelle du Réseau"
+    fig.suptitle(f"Brick 2 -- GNN: network structure analysis"
                  + (f"  [{label}]" if label else ""),
                  fontsize=14, fontweight="bold")
 
     def _scatter_on_sst(ax, pos, colors, cmap, vmin, vmax,
                         title, cbar_label, size=130, mark_redundant=False):
-        """Scatter coloré sur fond SST. Cercles rouges sur les bouées redondantes."""
+        """Coloured scatter over the SST background. Red rings mark redundant buoys."""
         _bg(ax)
         sc = ax.scatter(pos[:, 0], pos[:, 1], c=colors,
                         cmap=cmap, s=size, vmin=vmin, vmax=vmax,
                         zorder=5, edgecolors="white", linewidths=0.8)
-        # Cercle rouge sur les bouées redondantes
+        # Red ring on redundant buoys
         if mark_redundant and is_redundant.any():
             ax.scatter(pos[is_redundant, 0], pos[is_redundant, 1],
                        s=size * 2.2, facecolors="none",
@@ -521,36 +520,36 @@ def analyze_network(model, graph_dict, targets, args, T=None, label=""):
             sm_sst.set_array([])
             cb_sst = plt.colorbar(sm_sst, ax=ax, pad=0.13, fraction=0.03,
                                   location="right", shrink=0.55)
-            cb_sst.set_label("SST moy. (°C)", fontsize=7, color="#555555")
+            cb_sst.set_label("mean SST (degC)", fontsize=7, color="#555555")
             cb_sst.ax.tick_params(labelsize=6, color="#888888", labelcolor="#555555")
         ax.set_title(title, fontsize=10, fontweight="bold")
         ax.set_xlabel("x (pixels)"); ax.set_ylabel("y (pixels)")
         return sc
 
-    # 1. Scores de contribution + fond SST + marque redondants
+    # 1. Contribution scores + SST background + redundant markers
     _scatter_on_sst(axes[0, 0], pos_arr,
                     colors=scores, cmap="RdYlGn",
                     vmin=scores.min(), vmax=scores.max(),
-                    title="Score de contribution GAT\n(vert = fort | ○ rouge = redondant)",
-                    cbar_label="Contribution [0→1]",
+                    title="GAT contribution score\n(green = high | red ring = redundant)",
+                    cbar_label="Contribution [0-1]",
                     mark_redundant=True)
 
-    # 2. Score d'unicité (1 - redondance) + fond SST + marque redondants
+    # 2. Uniqueness score (1 - redundancy) + SST background + redundancy rings
     _scatter_on_sst(axes[0, 1], pos_arr,
-                    colors=unicite, cmap="RdYlGn",
+                    colors=uniqueness, cmap="RdYlGn",
                     vmin=0, vmax=1,
-                    title="Score d'unicité (1 − redondance)\n(vert = unique | ○ rouge = redondant)",
-                    cbar_label="Unicité [0→1]",
+                    title="Uniqueness score (1 - redundancy)\n(green = unique | red ring = redundant)",
+                    cbar_label="Uniqueness [0-1]",
                     mark_redundant=True)
 
-    # 3. Matrice de corrélation
+    # 3. Correlation matrix
     ax = axes[0, 2]
     im = ax.imshow(corr_matrix, cmap="RdBu_r", vmin=-1, vmax=1, aspect="auto")
     plt.colorbar(im, ax=ax)
-    ax.set_title(f"Matrice de corrélation spatiale\nSeuil arêtes = {args.corr_threshold}")
-    ax.set_xlabel("Index capteur"); ax.set_ylabel("Index capteur")
+    ax.set_title(f"Spatial correlation matrix\nEdge threshold = {args.corr_threshold}")
+    ax.set_xlabel("Sensor index"); ax.set_ylabel("Sensor index")
 
-    # 4. Graphe du réseau + fond SST + marquage redondants
+    # 4. Network graph + SST background + redundancy rings
     ax = axes[1, 0]
     _bg(ax)
     for k, (s, d) in enumerate(zip(ei[0], ei[1])):
@@ -563,7 +562,7 @@ def analyze_network(model, graph_dict, targets, args, T=None, label=""):
                c=scores, cmap="RdYlGn", s=100,
                vmin=scores.min(), vmax=scores.max(),
                edgecolors="black", linewidths=0.5, zorder=5)
-    # Cercles rouges sur redondants
+    # Red circles mark redundant sensors
     if is_redundant.any():
         ax.scatter(pos_arr[is_redundant, 0], pos_arr[is_redundant, 1],
                    s=260, facecolors="none", edgecolors="#ff4444",
@@ -573,18 +572,18 @@ def analyze_network(model, graph_dict, targets, args, T=None, label=""):
     for i, (x_p, y_p) in enumerate(positions):
         ax.annotate(f"{i}", (x_p, y_p), fontsize=6, ha="center", va="center",
                     color="black", zorder=6)
-    ax.set_title("Graphe du réseau\n(épaisseur arête ∝ attention GAT | ○ rouge = redondant)")
+    ax.set_title("Network graph\n(edge width ~ GAT attention | red ring = redundant)")
     ax.set_xlabel("x"); ax.set_ylabel("y")
 
-    # 5. Couverture spatiale
+    # 5. Spatial coverage
     ax = axes[1, 1]
     im = ax.imshow(coverage_grid.T, cmap="Blues", origin="lower", aspect="auto")
     plt.colorbar(im, ax=ax)
-    ax.set_title(f"Couverture spatiale (grille {grid_res}×{grid_res} px)\n"
-                 f"(blanc = zone non couverte → candidat à l'ajout)")
+    ax.set_title(f"Spatial coverage ({grid_res}x{grid_res} px grid)\n"
+                 f"(white = uncovered zone -> candidate for a new sensor)")
     ax.set_xlabel(f"x / {grid_res}"); ax.set_ylabel(f"y / {grid_res}")
 
-    # 6. Recommandations : barplot contribution vs redondance
+    # 6. Recommendations: contribution vs redundancy bar plot
     ax = axes[1, 2]
     idx_sorted = np.argsort(scores)[::-1]
     bar_width = 0.35
@@ -592,10 +591,10 @@ def analyze_network(model, graph_dict, targets, args, T=None, label=""):
     ax.bar(x_pos - bar_width/2, scores[idx_sorted],
            bar_width, label="Contribution GAT", color="steelblue", alpha=0.8)
     ax.bar(x_pos + bar_width/2, 1 - redundancy_score[idx_sorted],
-           bar_width, label="Unicité (1 - redondance)", color="orange", alpha=0.8)
-    ax.set_xlabel("Capteurs (triés par contribution)")
+           bar_width, label="Uniqueness (1 - redundancy)", color="orange", alpha=0.8)
+    ax.set_xlabel("Sensors (sorted by contribution)")
     ax.set_ylabel("Score [0, 1]")
-    ax.set_title("Contribution vs Unicité par capteur\n(orange > bleu → candidat à supprimer)")
+    ax.set_title("Contribution vs uniqueness per sensor\n(orange > blue -> removal candidate)")
     ax.legend(fontsize=8)
     ax.set_xticks(x_pos[::3])
     ax.set_xticklabels([f"C{idx_sorted[i]}" for i in range(0, n, 3)], fontsize=7)
@@ -604,27 +603,27 @@ def analyze_network(model, graph_dict, targets, args, T=None, label=""):
     fig.tight_layout()
     fig.savefig(out_dir / "gnn_network_analysis.png", dpi=150, bbox_inches="tight")
     plt.close()
-    print(f"  ✓ Figure → {out_dir}/gnn_network_analysis.png")
+    print(f"  [ok] Figure -> {out_dir}/gnn_network_analysis.png")
 
-    # ── Recommandations textuelles ─────────────────────────────────────────────
-    print("\n── Recommandations GNN ────────────────────────────────────────────")
-    # Candidats à la suppression : faible contribution + forte redondance
+    # -- Text recommendations ---------------------------------------------------
+    print("\n-- GNN recommendations --------------------------------------------")
+    # Removal candidates: low contribution + high redundancy
     combined_score = scores - redundancy_score
     candidates_remove = np.argsort(combined_score)[:5]
-    print(f"  Capteurs candidats à la SUPPRESSION (redondants) :")
+    print(f"  Sensors that are REMOVAL candidates (redundant):")
     for ci in candidates_remove:
         print(f"    C{ci:2d} @ {positions[ci]} | "
-              f"contribution={scores[ci]:.3f} | redondance={redundancy_score[ci]:.3f}")
+              f"contribution={scores[ci]:.3f} | redundancy={redundancy_score[ci]:.3f}")
 
-    # Zones lacunaires
+    # Gap zones
     gaps = np.argwhere(coverage_grid == 0)
-    print(f"\n  Zones lacunaires ({len(gaps)} cellules de grille non couvertes) :")
+    print(f"\n  Gap zones ({len(gaps)} uncovered grid cells):")
     if len(gaps) > 0:
         for gx, gy in gaps[:5]:
-            print(f"    Cellule grille ({gx}, {gy}) → "
+            print(f"    Grid cell ({gx}, {gy}) -> "
                   f"pixel centre (~{gx*grid_res+grid_res//2}, ~{gy*grid_res+grid_res//2})")
     if len(gaps) > 5:
-        print(f"    ... et {len(gaps) - 5} autres zones")
+        print(f"    ... and {len(gaps) - 5} more zones")
 
     return scores, redundancy_score, coverage_grid
 
@@ -632,17 +631,17 @@ def analyze_network(model, graph_dict, targets, args, T=None, label=""):
 def inductive_eval(model, graph_dict, new_positions, corr_matrix_orig, args,
                    T=None, S=None):
     """
-    Évalue des capteurs hypothétiques (gliders, Argo) non vus à l'entraînement.
+    Score hypothetical sensors (gliders, Argo floats) unseen during training.
 
-    Processus :
-        1. Ajouter les nouveaux nœuds au graphe (features géographiques)
-        2. Connecter aux voisins existants par kNN
-        3. Passer le graphe étendu dans GraphSAGE
-        4. Lire les scores des nouveaux nœuds → contribution prédite
+    Procedure:
+        1. add the new nodes to the graph (geographic features)
+        2. connect them to existing neighbours by kNN
+        3. push the extended graph through GraphSAGE
+        4. read the new nodes' scores -> predicted contribution
 
-    C'est l'avantage fondamental du mode inductif : pas de ré-entraînement.
+    This is the fundamental advantage of the inductive mode: no retraining.
     """
-    print("\n── Évaluation Inductive (nouveaux capteurs) ───────────────────────")
+    print("\n-- Inductive evaluation (new sensors) -----------------------------")
     out_dir = Path(args.output_dir)
 
     existing_pos = graph_dict["positions"]
@@ -650,12 +649,12 @@ def inductive_eval(model, graph_dict, new_positions, corr_matrix_orig, args,
     all_positions = existing_pos + new_positions
     n_all = len(all_positions)
 
-    # Nouvelles features nodales — MÊME dimension que build_graph, sinon le
-    # concat plante dès qu'on change le jeu de features.
+    # New node features -- SAME dimension as build_graph, otherwise the
+    # concatenation breaks as soon as the feature set changes.
     n_feat = graph_dict["x"].shape[1]
     if T is not None and S is not None:
-        # la variabilité locale est connue même pour un capteur hypothétique :
-        # c'est justement ce qui permet de prédire son apport avant déploiement
+        # local variability is known even for a hypothetical sensor: that is
+        # precisely what allows predicting its value before deployment
         _, vT_new, vS_new = local_variance_map(T, S, new_positions)
         _, vT_ref, vS_ref = local_variance_map(T, S, list(existing_pos))
         zT_new = (vT_new - vT_ref.mean()) / (vT_ref.std() + 1e-9)
@@ -671,7 +670,7 @@ def inductive_eval(model, graph_dict, new_positions, corr_matrix_orig, args,
     new_feat_tensor = torch.tensor(new_features, dtype=torch.float)
     x_extended = torch.cat([graph_dict["x"], new_feat_tensor], dim=0)
 
-    # Connexion des nouveaux nœuds aux k plus proches voisins existants
+    # Connect the new nodes to their k nearest existing neighbours
     from scipy.spatial import KDTree
     pos_arr = np.array(all_positions, dtype=np.float32)
     tree = KDTree(pos_arr[:n_existing])
@@ -687,58 +686,58 @@ def inductive_eval(model, graph_dict, new_positions, corr_matrix_orig, args,
          graph_dict["edge_index"][1].tolist() + new_edges_dst],
         dtype=torch.long)
 
-    # Évaluation avec GraphSAGE
+    # Evaluation with GraphSAGE
     sage_model = GraphSAGEInductive(in_dim=x_extended.shape[1]).to(DEVICE)
-    # Note : en production, charger les poids SAGE pré-entraînés
-    # Ici, on illustre le pipeline avec un modèle non entraîné
+    # Note: in production, load pre-trained SAGE weights here
+    # Here the pipeline is illustrated with an untrained model
     sage_model.eval()
     with torch.no_grad():
         scores_all = sage_model(x_extended.to(DEVICE), edge_ext.to(DEVICE))
     scores_new = scores_all[n_existing:].cpu().numpy()
 
-    print(f"  Scores prédits pour {len(new_positions)} nouveaux capteurs :")
+    print(f"  Predicted scores for {len(new_positions)} new sensors:")
     for i, (pos, sc) in enumerate(zip(new_positions, scores_new)):
-        print(f"    Nouveau capteur @ {pos} → score = {sc:.4f}")
+        print(f"    New sensor @ {pos} -> score = {sc:.4f}")
 
     # Visualisation
     fig, ax = plt.subplots(figsize=(8, 6))
     ex_arr = np.array(existing_pos)
     ax.scatter(ex_arr[:, 0], ex_arr[:, 1],
-               c="steelblue", s=80, label="Capteurs existants", zorder=5)
+               c="steelblue", s=80, label="Existing sensors", zorder=5)
     new_arr = np.array(new_positions)
     sc = ax.scatter(new_arr[:, 0], new_arr[:, 1],
                     c=scores_new, cmap="RdYlGn", s=200,
                     marker="*", edgecolors="black", linewidths=1,
-                    label="Nouveaux capteurs (score)", zorder=6)
-    plt.colorbar(sc, ax=ax, label="Score de contribution prédit")
+                    label="New sensors (score)", zorder=6)
+    plt.colorbar(sc, ax=ax, label="Predicted contribution score")
     ax.set_xlim(0, NX); ax.set_ylim(0, NY)
-    ax.set_title("Évaluation inductive de nouveaux capteurs\n(étoile = glider/Argo hypothétique)")
+    ax.set_title("Inductive evaluation of new sensors\n(star = hypothetical glider / Argo float)")
     ax.legend()
     ax.grid(True, alpha=0.2)
     fig.savefig(out_dir / "gnn_inductive_eval.png", dpi=150)
     plt.close()
-    print(f"  ✓ Figure → {out_dir}/gnn_inductive_eval.png")
+    print(f"  [ok] Figure -> {out_dir}/gnn_inductive_eval.png")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  POINT D'ENTRÉE
+#  ENTRY POINT
 # ══════════════════════════════════════════════════════════════════════════════
 
 def parse_args():
-    p = argparse.ArgumentParser(description="Brique 2 — GNN")
+    p = argparse.ArgumentParser(description="Brick 2 -- GNN")
     p.add_argument("--train",          action="store_true")
     p.add_argument("--analyze",        action="store_true")
     p.add_argument("--inductive",      action="store_true")
     p.add_argument("--report",         action="store_true",
-                   help="Produit un rapport .txt avec les métriques clés")
+                   help="Write a .txt report with the key metrics")
     p.add_argument("--seed_ocean",     type=int,   default=42)
     p.add_argument("--seed_buoys",     type=int,   default=7)
     p.add_argument("--new_positions",  type=str, default="[(10,20),(80,150),(130,40)]")
     p.add_argument("--nt",             type=int,   default=500,
-                   help="Longueur du nature run (jours)")
+                   help="Nature run length (days)")
     p.add_argument("--corr_threshold", type=float, default=GNN_CORR_THRESHOLD)
     p.add_argument("--deseason",       type=int,   default=int(DESEASON_ANALYSIS),
-                   help="1 = retire le cycle saisonnier avant de correler")
+                   help="1 = remove the seasonal cycle before correlating")
     p.add_argument("--k_nearest",      type=int,   default=4)
     p.add_argument("--gnn_epochs",     type=int,   default=200)
     p.add_argument("--output_dir",     type=str,   default="outputs")
@@ -755,38 +754,39 @@ if __name__ == "__main__":
         sys.exit(0)
 
     print("═" * 60)
-    print(" Brique 2 — GNN : Structure du Réseau d'Observation")
+    print(" Brick 2 -- GNN: observing-network structure")
     print("═" * 60)
 
-    print(f"\n[1/3] Génération du nature run (seed_ocean={args.seed_ocean}, nt={args.nt})...")
+    print(f"\n[1/3] Nature run generation (seed_ocean={args.seed_ocean}, nt={args.nt})...")
     gen = SyntheticOceanGenerator()
     T, S = gen.generate_dataset(nt=args.nt, seed=args.seed_ocean)
 
     rng = np.random.default_rng(args.seed_buoys)
     if args.nt < 365:
-        print(f"  [ATTENTION] nt={args.nt} < 365 : cycle saisonnier "
-              f"incomplet, statistiques biaisees.")
+        print(f"  [WARNING] nt={args.nt} < 365: incomplete seasonal "
+              f"cycle, biased statistics.")
 
     positions = [(int(rng.integers(0, NX)), int(rng.integers(0, NY)))
                  for _ in range(args.n_buoys)]
-    print(f"      {args.n_buoys} capteurs (seed_buoys={args.seed_buoys})")
+    print(f"      {args.n_buoys} sensors (seed_buoys={args.seed_buoys}, "
+          f"separation >= {MIN_BUOY_SEP_KM:.0f} km)")
 
-    print("\n[2/3] Calcul de la matrice de corrélation spatiale...")
+    print("\n[2/3] Computing the spatial correlation matrix...")
     corr_matrix = build_spatial_correlation(T, S, positions,
                                             n_timestamps=min(300, args.nt),
                                             deseason=bool(args.deseason))
     _off = corr_matrix[~np.eye(len(positions), dtype=bool)]
-    print(f"      |rho| moyen = {np.abs(_off).mean():.3f} | "
-          f"paires au-dessus du seuil = {(np.abs(_off) > args.corr_threshold).mean():.1%}"
+    print(f"      mean |rho| = {np.abs(_off).mean():.3f} | "
+          f"pairs above threshold = {(np.abs(_off) > args.corr_threshold).mean():.1%}"
           f"  (deseason={bool(args.deseason)})")
 
-    print(f"\n[3/3] Construction du graphe (seuil={args.corr_threshold}, k={args.k_nearest})...")
+    print(f"\n[3/3] Building the graph (threshold={args.corr_threshold}, k={args.k_nearest})...")
     graph_dict = build_graph(positions, corr_matrix,
                              corr_threshold=args.corr_threshold,
                              k_nearest=args.k_nearest,
                              T=T, S=S)
     n_edges = graph_dict["edge_index"].shape[1]
-    print(f"      Nœuds : {len(positions)} | Arêtes : {n_edges}")
+    print(f"      Nodes : {len(positions)} | Edges : {n_edges}")
     targets = compute_proxy_targets(positions, corr_matrix)
 
     model = None
@@ -801,7 +801,7 @@ if __name__ == "__main__":
             if ckpt_path.exists():
                 model.load_state_dict(torch.load(ckpt_path, map_location=DEVICE,
                                                   weights_only=True))
-                print(f"  Modèle chargé depuis {ckpt_path}")
+                print(f"  Model loaded from {ckpt_path}")
         scores_out, redund_out, _ = analyze_network(
             model, graph_dict, targets, args, T=T)
 
@@ -818,41 +818,41 @@ if __name__ == "__main__":
     if args.report:
         ts  = datetime.now().strftime("%Y%m%d_%H%M%S")
         out = Path(args.output_dir)
-        unicite = (1 - redund_out) if redund_out is not None else None
-        is_redond = (unicite < np.percentile(unicite, 25)) if unicite is not None else None
+        uniqueness = (1 - redund_out) if redund_out is not None else None
+        is_redundant = (uniqueness < np.percentile(uniqueness, 25)) if uniqueness is not None else None
         lines = [
             "=" * 68,
-            "  Brique 2 — GNN — Rapport",
-            f"  Généré le : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+            "  Brick 2 -- GNN -- Report",
+            f"  Generated : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
             "=" * 68, "",
-            "── REPRODUCTIBILITÉ ─────────────────────────────────────────────────",
+            "-- REPRODUCIBILITY --------------------------------------------------",
             f"  seed_ocean     : {args.seed_ocean}",
             f"  seed_buoys     : {args.seed_buoys}",
             f"  n_buoys        : {args.n_buoys}",
             f"  corr_threshold : {args.corr_threshold}",
             f"  k_nearest      : {args.k_nearest}",
             "",
-            "── POSITIONS DES BOUÉES ─────────────────────────────────────────────",
+            "-- BUOY POSITIONS ---------------------------------------------------",
         ] + [f"  B{i:02d} : ({px:4d}, {py:4d})" for i, (px, py) in enumerate(positions)] + [
             "",
-            "── GRAPHE ───────────────────────────────────────────────────────────",
-            f"  Nœuds   : {len(positions)}",
-            f"  Arêtes  : {n_edges}",
+            "-- GRAPH ------------------------------------------------------------",
+            f"  Nodes   : {len(positions)}",
+            f"  Edges   : {n_edges}",
         ]
         if scores_out is not None:
             lines += [
-                f"  Score contribution moy : {scores_out.mean():.3f} ± {scores_out.std():.3f}",
-                f"  Redondance moyenne     : {redund_out.mean():.3f}",
-                f"  Capteurs redondants    : {int(is_redond.sum())}  (unicité Q25)",
-                f"  IDs redondants         : {[int(i) for i in np.where(is_redond)[0]]}",
+                f"  Mean contribution      : {scores_out.mean():.3f} +/- {scores_out.std():.3f}",
+                f"  Mean redundancy        : {redund_out.mean():.3f}",
+                f"  Redundant sensors      : {int(is_redundant.sum())}  (uniqueness Q25)",
+                f"  Redundant IDs          : {[int(i) for i in np.where(is_redundant)[0]]}",
             ]
-        lines += ["", "── FICHIERS PRODUITS ────────────────────────────────────────────────"]
+        lines += ["", "-- FILES PRODUCED ---------------------------------------------------"]
         for f in sorted(out.iterdir()):
             if f.suffix in {".pt", ".png"}:
                 lines.append(f"  {f.name:<44} {f.stat().st_size//1024:>5} KB")
         lines += ["", "=" * 68]
-        rpt = out / f"rapport_gnn_{ts}.txt"
+        rpt = out / f"report_gnn_{ts}.txt"
         rpt.write_text("\n".join(lines), encoding="utf-8")
-        print(f"\n  Rapport GNN → {rpt}")
+        print(f"\n  GNN report -> {rpt}")
 
-    print("\n  ✓ Brique 2 terminée.")
+    print("\n  [ok] Brick 2 done.")

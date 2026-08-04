@@ -3,10 +3,7 @@
 **Optimal Experimental Design for marine observing networks, with AI.**
 
 NAIADE is a Python/PyTorch framework for designing, scoring and evolving ocean
-observing networks. It follows the INSU roadmap on observing-network
-optimisation and targets the French marine SNOs — MOOSE (fixed stations,
-NW Mediterranean), PIRATA (moored array, tropical Atlantic) and COOL/OISO
-(instrumented ships of opportunity).
+observing networks.
 
 Everything runs in an OSSE framework: a synthetic ocean plays the role of
 ground truth, so any network configuration can be evaluated against a known
@@ -34,6 +31,7 @@ answer.
 
 ## Table of contents
 
+0. [Gallery](#0-gallery)
 1. [Install](#1-install)
 2. [Quick start](#2-quick-start)
 3. [The synthetic ocean](#3-the-synthetic-ocean)
@@ -46,6 +44,32 @@ answer.
 10. [Known limitations](#10-known-limitations)
 11. [Citing NAIADE](#11-citing-naiade)
 12. [References](#12-references)
+
+---
+
+## 0. Gallery
+
+**[→ Full result gallery with reproducible commands](docs/GALLERY.md)**
+
+Every figure below comes from `--seed_ocean 42 --seed_buoys 7 --nt 365`.
+
+![Nature run](docs/figures/01_nature_run.png)
+
+*The synthetic ocean. Fronts and filaments are not drawn — they emerge from the
+competition between geostrophic stirring and restoring towards climatology.*
+
+![Pareto front](docs/figures/09_rl_pareto_front_info_vs_N.png)
+
+*Information vs number of buoys. **N★ = 23, explaining 63.7 % of mesoscale
+variance — 23 optimised buoys are worth 43 randomly placed ones.***
+
+| annual budget | N | explained variance | tCO₂/yr |
+|---|---|---|---|
+| 500 k€ | 5 | 0.276 | 238 |
+| 900 k€ | 15 | 0.525 | 379 |
+| 1400 k€ | 28 | 0.687 | 553 |
+
+*Budget-constrained optimal networks, from the information/cost Pareto front.*
 
 ---
 
@@ -655,7 +679,7 @@ implements.
 
 ```bibtex
 @software{naiade,
-  author  = {JM.VIENT},
+  author  = {JM VIENT},
   title   = {NAIADE: AI methods for Optimal Experimental Design
              of marine observing networks},
   year    = {2026},

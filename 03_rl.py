@@ -1,18 +1,18 @@
 """
 ╔══════════════════════════════════════════════════════════════════════════════╗
-║         BRIQUE 3 — Reinforcement Learning : Optimisation du Réseau          ║
+║         BRICK 3 - Reinforcement Learning: network optimisation             ║
 ║                                                                              ║
 ║  Formalisation MDP :                                                         ║
-║    État    s_t : masque binaire actuel (grille grossière) + stats champ     ║
-║    Action  a_t : activer / désactiver une des K positions candidates        ║
-║    Récompense  : gain de reconstruction RMSE − pénalité budget bouées      ║
+║    State   s_t : current binary mask (coarse grid) + field statistics      ║
+║    Action  a_t : toggle one of the K candidate positions                   ║
+║    Reward      : marginal information gain - budget penalty                ║
 ║                                                                              ║
-║  Algorithme : PPO (Proximal Policy Optimization) implémenté en PyTorch pur  ║
-║  Multi-objectif : front de Pareto information vs nombre de capteurs         ║
+║  Algorithm: PPO (Proximal Policy Optimization), plain PyTorch              ║
+║  Multi-objective: Pareto front, information vs number of sensors           ║
 ║                                                                              ║
-║  Usage :                                                                     ║
+║  Usage:                                                                      ║
 ║    python 03_rl.py --train                                                   ║
-║    python 03_rl.py --pareto           (front Pareto info/nb capteurs)       ║
+║    python 03_rl.py --pareto           (Pareto front info / n sensors)      ║
 ║    python 03_rl.py --train --pareto                                          ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
 """
@@ -33,7 +33,7 @@ from config import *
 from data.dataset import (SyntheticOceanGenerator, local_variance_map,
                           mesoscale_anomaly)
 
-# ─── Import optionnel de la Brique 1 pour la récompense dense ─────────────────
+# --- Optional import of Brick 1 for the dense reward -------------------------
 try:
     from brique1_autoencoder import ObservabilityVAE
     AE_AVAILABLE = True
@@ -47,46 +47,46 @@ except ImportError:
 
 class OceanNetworkEnv:
     """
-    Environnement RL pour l'optimisation du réseau d'observation.
+    RL environment for observing-network optimisation.
 
     Grille candidate (coarse grid) :
-        On discrétise l'espace en une grille GX × GY de positions candidates.
-        L'espace d'action est donc de taille K = GX × GY (toggle par position).
-        Le budget de bouées actives est contraint : [n_min, n_max].
+        Space is discretised into a GX x GY grid of candidate positions.
+        The action space therefore has size K = GX x GY (one toggle each).
+        The number of active buoys is constrained to [n_min, n_max].
 
-    État s_t : (K + n_stats,) float32
-        - K premiers éléments : masque binaire des positions actives
-        - n_stats derniers : statistiques globales du champ nature run
-          (variance locale agrégée, gradient moyen...)
+    State s_t : (K + n_stats,) float32
+        - first K entries: binary mask of active positions
+        - remaining n_stats: global statistics of the nature run field
+          (aggregated local variance, mean gradient, ...)
 
-    Récompense r_t :
+    Reward r_t :
         r_t = w_info * r_info − w_budget * r_budget
 
-        r_info    = amélioration de la couverture pondérée variance
-                    (proxy : couverture variance locale)
-        r_budget  = pénalité si hors de la plage [n_min, n_max] bouées actives
+        r_info    = improvement in variance-weighted coverage
+                    (proxy: variance-weighted coverage)
+        r_budget  = penalty when outside the [n_min, n_max] range
 
-    Épisode :
-        T_ep actions consécutives → à la fin, évaluation de la configuration finale
+    Episode :
+        T_ep consecutive actions -> the final configuration is then evaluated
     """
 
     def __init__(self, T, S,
-                 grid_x=16, grid_y=24,    # résolution de la grille candidate
-                 n_min=10, n_max=40,       # plage de bouées actives
-                 episode_len=20,           # actions par épisode
+                 grid_x=16, grid_y=24,    # candidate grid resolution
+                 n_min=10, n_max=40,       # allowed range of active buoys
+                 episode_len=20,           # actions per episode
                  w_info=1.0, w_budget=0.5,
                  info_mode="evf",          # "evf" (defaut) | "coverage" | "legacy"
                  influence_km=INFLUENCE_RADIUS_KM,
                  info_gain=RL_INFO_GAIN,
-                 eval_stride=8,            # sous-echantillonnage de la grille
+                 eval_stride=8,            # evaluation-grid subsampling
                  evf_cv=False,             # score EVF valide hors echantillon
-                 min_sep=MIN_SEP_CELLS,    # separation mini en cases de grille
-                 ae_model=None):           # autoencoder optionnel (Brique 1)
+                 min_sep=MIN_SEP_CELLS,    # minimum separation, in grid cells
+                 ae_model=None):           # optional autoencoder (Brick 1)
         self.T = T.astype(np.float32)
         self.S = S.astype(np.float32)
         self.grid_x  = grid_x
         self.grid_y  = grid_y
-        self.K       = grid_x * grid_y    # nb de positions candidates
+        self.K       = grid_x * grid_y    # number of candidate positions
         self.n_min   = n_min
         self.n_max   = n_max
         self.ep_len  = episode_len
@@ -100,7 +100,7 @@ class OceanNetworkEnv:
         self.ae_model = ae_model
         self.nt = len(T)
 
-        # Positions physiques des K candidats (centre de chaque cellule)
+        # Physical positions of the K candidates (centre of each cell)
         self.candidate_positions = []
         sx = NX / grid_x
         sy = NY / grid_y
@@ -110,13 +110,13 @@ class OceanNetworkEnv:
                 py = int(gy * sy + sy / 2)
                 self.candidate_positions.append((min(px, NX-1), min(py, NY-1)))
 
-        # Contrainte : deux bouées ne peuvent pas occuper des cases adjacentes
+        # Constraint: two buoys cannot occupy adjacent cells
         self._build_conflict_matrix()
 
-        # Statistiques globales du nature run (pré-calculées une fois)
+        # Global nature run statistics (precomputed once)
         self._precompute_field_stats()
 
-        # État courant
+        # Current state
         self.active_mask = None    # (K,) binaire
         self.step_count  = 0
         self.t_current   = 0
@@ -124,15 +124,15 @@ class OceanNetworkEnv:
 
     def _build_conflict_matrix(self):
         """
-        `_conflict[i, j] = True` si les candidats i et j sont trop proches pour
-        être actifs simultanément (distance de Tchebychev < min_sep sur la
-        grille candidate, ou de Manhattan si MIN_SEP_DIAGONAL est False).
+        `_conflict[i, j] = True` when candidates i and j are too close to be
+        active at the same time (Chebyshev distance < min_sep on the candidate
+        grid, or Manhattan distance if MIN_SEP_DIAGONAL is False).
 
-        Plafond de faisabilité : avec min_sep = 2 on ne peut activer qu'une
-        case sur deux dans chaque direction, d'où
+        Feasibility ceiling: with min_sep = 2 only one cell in two can be
+        activated in each direction, hence
             n_feasible_max = ceil(grid_x/min_sep) * ceil(grid_y/min_sep)
-        Ce plafond borne n_max et l'étendue des balayages de Pareto : demander
-        40 bouées sur une grille 8x12 contrainte est tout simplement infaisable.
+        This ceiling bounds n_max and the extent of the Pareto sweeps: asking
+        for 40 buoys on a constrained 8x12 grid simply has no solution.
         """
         gi = np.array([i // self.grid_y for i in range(self.K)])
         gj = np.array([i %  self.grid_y for i in range(self.K)])
@@ -147,15 +147,15 @@ class OceanNetworkEnv:
         self.n_feasible_max = int(np.ceil(self.grid_x / s)
                                   * np.ceil(self.grid_y / s))
         if self.n_max > self.n_feasible_max:
-            print(f"  [CONTRAINTE] n_max={self.n_max} > maximum faisable "
-                  f"({self.n_feasible_max}) avec séparation {self.min_sep} "
-                  f"case(s) — ramené à {self.n_feasible_max}")
+            print(f"  [CONSTRAINT] n_max={self.n_max} > feasible maximum "
+                  f"({self.n_feasible_max}) with a separation of {self.min_sep} "
+                  f"cell(s) - clipped to {self.n_feasible_max}")
             self.n_max = self.n_feasible_max
         self.n_min = int(min(self.n_min, self.n_max))
 
     # -------------------------------------------------------------------------
     def feasible_candidates(self, active_idx):
-        """Indices activables sans violer la séparation minimale."""
+        """Candidates that can be activated without breaking the separation."""
         active_idx = np.asarray(active_idx, dtype=int)
         ok = np.ones(self.K, dtype=bool)
         if len(active_idx):
@@ -171,19 +171,19 @@ class OceanNetworkEnv:
 
     def sample_feasible(self, n, rng=None):
         """
-        Tire n candidats respectant la séparation minimale (insertion aléatoire
-        gloutonne). Si n dépasse ce que le domaine peut accueillir, retourne le
-        plus grand ensemble faisable trouvé.
+        Draw n candidates satisfying the minimum separation (randomised greedy
+        insertion). If n exceeds what the domain can hold, return the largest
+        feasible set found.
         """
-        # np.random n'expose pas .integers : on force un Generator
+        # np.random does not expose .integers: force a Generator
         if rng is None or not hasattr(rng, "integers"):
             rng = np.random.default_rng()
         n = int(min(n, self.n_feasible_max))
         if n <= 0:
             return np.array([], dtype=int)
 
-        # Insertion gloutonne aleatoire : configurations bien diversifiees,
-        # mais elle sature avant le plafond theorique (77/96 sur 16x24).
+        # Randomised greedy insertion: well diversified configurations, but it
+        # saturates below the theoretical ceiling (77 out of 96 on 16x24).
         best = np.array([], dtype=int)
         for _ in range(20):
             sel = []
@@ -197,8 +197,8 @@ class OceanNetworkEnv:
             if len(sel) > len(best):
                 best = np.array(sel, dtype=int)
 
-        # Repli : reseau regulier a decalage aleatoire. Il atteint exactement
-        # le plafond de faisabilite, on en tire ensuite un sous-ensemble.
+        # Fallback: regular lattice with a random offset. It reaches the
+        # feasibility ceiling exactly; a subset is then drawn from it.
         sp = max(1, self.min_sep)
         oi, oj = int(rng.integers(0, sp)), int(rng.integers(0, sp))
         lat = np.where(((self._grid_ij[:, 0] - oi) % sp == 0)
@@ -209,12 +209,12 @@ class OceanNetworkEnv:
 
     def invalid_action_mask(self, active=None):
         """
-        Masque (K,) ou (B, K) des actions interdites : activer un candidat en
-        conflit avec une bouée déjà posée. Désactiver reste toujours permis.
+        Mask (K,) or (B, K) of forbidden actions: activating a candidate that
+        conflicts with an already placed buoy. Deactivating is always allowed.
 
-        Fonction déterministe du masque actif — donc recalculable depuis
-        l'observation stockée dans le buffer PPO, ce qui permet de masquer les
-        logits À LA FOIS au tirage et à la mise à jour sans stocker le masque.
+        This is a deterministic function of the active mask, so it can be
+        recomputed from the observation stored in the PPO buffer. That is what
+        allows masking the logits BOTH at sampling and at update time without
         """
         a = self.active_mask if active is None else np.asarray(active)
         single = (a.ndim == 1)
@@ -225,27 +225,27 @@ class OceanNetworkEnv:
 
     def _precompute_field_stats(self):
         """
-        Deux objets précalculés :
+        Two precomputed objects:
 
-        1. `field_stats` (K,) — variabilité mésoéchelle locale par candidat,
-           utilisée comme features d'état de la politique.
-           SST et SSS sont standardisées SÉPARÉMENT avant d'être mélangées.
-           Sans cela, var(SST) ~ 3 °C² écrase var(SSS) ~ 0.03 psu² et la
-           salinité contribue pour 0.0 % à la variance du mélange : l'agent
-           optimisait un réseau purement thermique.
+        1. `field_stats` (K,) - local mesoscale variability per candidate, used
+           as state features for the policy.
+           SST and SSS are standardised SEPARATELY before being mixed. Without
+           that, var(SST) ~ 3 degC^2 swamps var(SSS) ~ 0.03 psu^2 and salinity
+           contributes 0.0 % of the mixture variance: the agent was optimising
+           a purely thermal network.
 
-        2. `_kernel` (K, M) et `_weights` (M,) — noyau de couverture utilisé
-           par la récompense d'information. Chaque candidat « explique » une
-           tache gaussienne de rayon = échelle de décorrélation du nature run
-           (INFLUENCE_RADIUS_KM ~ 90 km, diagnostiquée sur le champ), pondérée
-           par la variabilité locale de la cellule.
+        2. `_kernel` (K, M) and `_weights` (M,) - coverage kernel used by the
+           information reward. Each candidate 'explains' a Gaussian patch whose
+           radius is the decorrelation scale of the nature run
+           (INFLUENCE_RADIUS_KM ~ 90 km, diagnosed on the field), weighted by
+           the local variability of the cell.
         """
-        # ── 1. features d'état ────────────────────────────────────────────────
+        # -- 1. state features ------------------------------------------------
         self.field_stats, vT, vS = local_variance_map(
             self.T, self.S, self.candidate_positions, half_win=2)
         self.var_T_cand, self.var_S_cand = vT, vS
 
-        # ── 2. grille d'évaluation + poids de variabilité ─────────────────────
+        # -- 2. evaluation grid + variability weights -------------------------
         st = self.eval_stride
         xs = np.arange(0, NX, st); ys = np.arange(0, NY, st)
         GX, GY = np.meshgrid(xs, ys, indexing="ij")
@@ -268,41 +268,41 @@ class OceanNetworkEnv:
 
     def _precompute_information_basis(self, shrinkage=None, cv=None):
         """
-        Critère de VARIANCE EXPLIQUÉE — la « qualité de l'information » d'un
-        réseau n'est pas une couverture géométrique mais la fraction de la
-        variabilité du système qu'on sait reconstruire à partir des seules
-        observations. Estimation linéaire optimale (BLUE / interpolation
-        optimale), critère standard en OSSE :
+        EXPLAINED VARIANCE criterion - the 'information quality' of a network
+        is not a geometric coverage but the fraction of the system variability
+        that can be reconstructed from the observations alone. It is evaluated
+        by optimal linear estimation (BLUE / optimal interpolation), the
+        standard OSSE criterion:
 
             EVF = Σ_c C_cO (C_OO + R)⁻¹ C_Oc  /  Σ_c C_cc
 
-        Le vecteur d'observation contient SST **et** SSS en chaque bouée
-        (2n observations), chacune normalisée par son écart-type et affectée
-        de son propre bruit instrumental : la salinité pèse réellement.
+        The observation vector holds SST **and** SSS at every buoy
+        (2n observations), each normalised by its own standard deviation and
+        given its own instrumental noise, so salinity genuinely counts.
 
-        Pourquoi la covariance n'est pas empirique
+        Why the covariance is not empirical
         ------------------------------------------
-        Le temps de décorrélation mésoéchelle du nature run est de ~12 jours.
-        Une série d'un an ne contient donc que ~30 réalisations INDÉPENDANTES,
-        pour 2n = 40 paramètres à estimer dès 20 bouées. La covariance
-        empirique brute sur-apprend : mesurée hors échantillon, la variance
-        expliquée devient NÉGATIVE (-0.23 à N=20). Le score « en échantillon »
-        correspondant (0.62) n'était que du bruit ajusté.
+        The mesoscale decorrelation time of the nature run is ~12 days. One
+        year therefore holds only ~30 INDEPENDENT realisations, against
+        2n = 40 parameters to estimate as soon as there are 20 buoys. The raw
+        sample covariance overfits: measured out of sample, explained variance
+        goes NEGATIVE (-0.23 at N=20). The matching in-sample score (0.62) was
+        nothing but fitted noise.
 
-        On contracte donc vers un modèle paramétrique construit sur les
-        diagnostics du nature run lui-même :
+        The covariance is therefore shrunk towards a parametric model built
+        from the nature run's own diagnostics:
 
             C[(i,v),(j,w)] = sigma_v(i)·sigma_w(j) · exp(-d_ij²/2L²) · c_vw
 
-        avec sigma = carte d'écart-type mésoéchelle, L = échelle de
-        décorrélation (INFLUENCE_RADIUS_KM) et c_vw = corrélation T-S locale.
-        Contraction EVF_SHRINKAGE = 0.9 : mesurée hors échantillon, la
-        variance expliquée redevient positive et croissante en N
-        (+0.03 / +0.07 / +0.12 / +0.20 pour N = 5 / 10 / 20 / 40).
+        with sigma = mesoscale standard-deviation map, L = decorrelation scale
+        (INFLUENCE_RADIUS_KM) and c_vw = local T-S correlation.
+        Shrinkage EVF_SHRINKAGE = 0.9: measured out of sample, explained
+        variance becomes positive again and increases with N
+        (+0.03 / +0.07 / +0.12 / +0.20 for N = 5 / 10 / 20 / 40).
 
-        Le mode `evf_cv` mesure directement cette valeur hors échantillon
-        (statistiques sur la 1re moitié, score sur la 2nde) : c'est le chiffre
-        honnête à communiquer, un peu plus bruité.
+        Mode `evf_cv` measures that out-of-sample value directly (statistics
+        on the first half, score on the second): it is the honest figure to
+        report, slightly noisier.
         """
         d = EVF_SHRINKAGE if shrinkage is None else float(shrinkage)
         cv = getattr(self, "evf_cv", False) if cv is None else bool(cv)
@@ -322,7 +322,7 @@ class OceanNetworkEnv:
         tr = slice(0, nt // 2) if cv else slice(0, nt)
         Otr, Ytr = O[tr], Y[tr]; n_tr = len(Ytr)
 
-        # ── modèle paramétrique ───────────────────────────────────────────────
+        # -- parametric model -------------------------------------------------
         cnd  = np.array(self.candidate_positions, dtype=np.float64)
         cell = self._eval_xy.astype(np.float64)
         L2   = 2.0 * self.influence_px ** 2
@@ -346,7 +346,7 @@ class OceanNetworkEnv:
         C_OY_p = np.block([[_b(Roc, sT_o, sT_c, 0), _b(Roc, sT_o, sS_c, 1)],
                            [_b(Roc, sS_o, sT_c, 1), _b(Roc, sS_o, sS_c, 0)]])
 
-        # ── contraction empirique -> paramétrique ─────────────────────────────
+        # -- shrinkage from empirical towards parametric ----------------------
         C_OO_s = Otr.T @ Otr / n_tr
         C_OY_s = Otr.T @ Ytr / n_tr
         self._C_OO = ((1 - d) * C_OO_s + d * C_OO_p).astype(np.float64)
@@ -364,13 +364,13 @@ class OceanNetworkEnv:
         else:
             self._var_total = float(((1 - d) * var_smp + d * var_par).sum())
 
-        # Bruit instrumental, dans les unités normalisées de chaque variable
+        # Instrumental noise, in the normalised units of each variable
         rT = (OBS_NOISE_T / (self.T.std() + 1e-9)) ** 2
         rS = (OBS_NOISE_S / (self.S.std() + 1e-9)) ** 2
         self._R_diag = np.concatenate([np.full(self.K, rT), np.full(self.K, rS)])
 
     def explained_variance(self, active_idx):
-        """Fraction de la variabilité mésoéchelle expliquée par le réseau."""
+        """Fraction of the system mesoscale variability explained by the network."""
         active_idx = np.asarray(active_idx, dtype=int)
         if len(active_idx) == 0:
             return 0.0
@@ -391,16 +391,16 @@ class OceanNetworkEnv:
 
     def network_cost(self, active_idx):
         """
-        Coût opérationnel annuel d'une configuration réseau.
+        Annual operating cost of a network configuration.
 
-            coût = N · COST_BUOY_FIXED
-                 + longueur_tournée · COST_SHIP_PER_KM · N_CAMPAIGNS_YEAR
+            cost = N * COST_BUOY_FIXED
+                 + tour_length * COST_SHIP_PER_KM * N_CAMPAIGNS_YEAR
 
-        La tournée de maintenance part du port, visite toutes les bouées par
-        plus proche voisin et revient. Le coût n'est donc PAS proportionnel à
-        N : un réseau compact près du port coûte moins cher qu'un réseau
-        dispersé au large de même taille. C'est cette non-proportionnalité qui
-        rend l'arbitrage information/coût réellement antagoniste.
+        The maintenance tour starts from the port, visits every buoy by nearest
+        neighbour and returns. Cost is therefore NOT proportional to N: a
+        compact network near the port is cheaper than a network of the same
+        size spread offshore. That non-proportionality is what makes the
+        information/cost trade-off genuinely antagonistic.
 
         Retourne (cout_keur, co2_tonnes, longueur_km).
         """
@@ -412,7 +412,7 @@ class OceanNetworkEnv:
                        dtype=np.float64) * DX_KM
         port = np.array([PORT_XY_FRAC[0] * NX, PORT_XY_FRAC[1] * NY]) * DX_KM
 
-        # tournée plus proche voisin depuis le port, retour au port
+        # nearest-neighbour tour from the port, back to the port
         remaining = list(range(n)); cur = port; length = 0.0
         while remaining:
             d = np.linalg.norm(pts[remaining] - cur, axis=1)
@@ -426,7 +426,7 @@ class OceanNetworkEnv:
         return float(cost), float(co2), float(length)
 
     def reset(self):
-        """Initialise un épisode : placement aléatoire de n_init bouées."""
+        """Initialise an episode: random placement of n_init buoys."""
         n_init = np.random.randint(self.n_min, self.n_max + 1)
         self.active_mask = np.zeros(self.K, dtype=np.float32)
         self.active_mask[self.sample_feasible(n_init)] = 1.0
@@ -435,32 +435,31 @@ class OceanNetworkEnv:
         return self._get_obs()
 
     def _get_obs(self):
-        """Vecteur d'état : masque actif ∥ statistiques du champ."""
+        """State vector: active mask || field statistics."""
         return np.concatenate([self.active_mask, self.field_stats])
 
     def _compute_info_reward(self):
         """
-        Score d'information du réseau courant, dans [0, 1].
+        Information score of the current network, in [0, 1].
 
-        Mode "coverage" (défaut)
+        Mode "coverage" (default)
         ------------------------
-            I(mask) = Σ_c  w_c · max_{i actif} exp(-d(c,i)² / 2L²)   /  Σ_c w_c
+            I(mask) = sum_c  w_c * max_{i active} exp(-d(c,i)^2 / 2L^2) / sum_c w_c
 
-        Fraction de la variabilité du domaine effectivement couverte par au
-        moins un capteur, à l'échelle de décorrélation L du nature run.
-        Propriétés : croissant en N, saturant, sous-modulaire — donc un vrai
-        coude, situé près de aire_domaine / (2πL²) ≈ 19 capteurs pour ce
-        nature run. Deux bouées collées n'ajoutent presque rien (le max ne
-        double pas), ce qui rend le bonus anti-clustering inutile.
+        Fraction of the domain variability actually covered by at least one
+        sensor, at the decorrelation scale L of the nature run.
+        Properties: increasing in N, saturating, submodular - hence a genuine
+        elbow, located near domain_area / (2*pi*L^2) ~ 19 sensors for this
+        nature run. Two buoys side by side add almost nothing (the max does not
+        double), which makes an anti-clustering bonus unnecessary.
 
         Mode "legacy"
         -------------
-        Ancienne formule 0.7·moyenne(variance aux positions actives)
-                       + 0.3·distance moyenne au plus proche voisin.
-        Elle est conservée pour comparaison mais elle est NON MONOTONE en N
-        (mesuré : 0.111 à N=3, 0.090 à N=5, -0.003 à N=12, 0.030 à N=40) :
-        le « coude » N★ extrait du front de Pareto n'y était pas
-        interprétable.
+        Former formula: 0.7 * mean(variance at active positions)
+                      + 0.3 * mean nearest-neighbour distance.
+        Kept for comparison only. It is NOT MONOTONE in N (measured: 0.111 at
+        N=3, 0.090 at N=5, -0.003 at N=12, 0.030 at N=40), so the elbow N* read
+        off the Pareto front was not interpretable.
         """
         active_idx = np.where(self.active_mask > 0.5)[0]
         if len(active_idx) == 0:
@@ -487,7 +486,7 @@ class OceanNetworkEnv:
 
     def step(self, action):
         """
-        Action : toggle de la position candidate `action` (0..K-1).
+        Action: toggle candidate position `action` (0..K-1).
         
         Retourne : (obs, reward, done, info)
         """
@@ -495,8 +494,8 @@ class OceanNetworkEnv:
         prev_info = self._compute_info_reward()
         prev_n_active = int(self.active_mask.sum())
 
-        # Toggle. Activer un candidat en conflit est refusé : la politique est
-        # normalement empêchée par le masquage des logits, ce test protège les
+        # Toggle. Activating a conflicting candidate is refused: the policy is
+        # normally prevented by logit masking; this guard protects calls made
         # appels hors PPO (rollouts manuels, chargement d'un vieux checkpoint).
         was_active = self.active_mask[action] > 0.5
         if not was_active:
@@ -512,11 +511,11 @@ class OceanNetworkEnv:
         self.active_mask[action] = 0.0 if was_active else 1.0
         n_active = int(self.active_mask.sum())
 
-        # Information après action
+        # Information after the action
         new_info = self._compute_info_reward()
         delta_info = new_info - prev_info
 
-        # Pénalité budget (hors de la plage autorisée)
+        # Budget penalty (outside the allowed range)
         budget_penalty = 0.0
         if n_active < self.n_min:
             budget_penalty = float(self.n_min - n_active) / self.n_min
@@ -524,7 +523,7 @@ class OceanNetworkEnv:
             budget_penalty = float(n_active - self.n_max) / self.n_max
 
         # info_gain remet delta_info (typiquement 1e-3..1e-2 en mode coverage)
-        # a l'echelle de la penalite budget, sinon le budget domine tout.
+        # comparable to the budget penalty, otherwise the budget dominates.
         reward = (self.w_info   * self.info_gain * delta_info
                   - self.w_budget * budget_penalty)
 
@@ -546,17 +545,17 @@ class OceanNetworkEnv:
 
 class ActorCritic(nn.Module):
     """
-    Réseau actor-critic partagé pour PPO.
+    Shared actor-critic network for PPO.
 
     Architecture :
-        Tronc commun MLP (obs_dim → 256 → 256)
-        ├── Actor  → logits (K actions) → distribution catégorielle
-        └── Critic → valeur d'état V(s) (scalaire)
+        Shared MLP trunk (obs_dim -> 256 -> 256)
+        |-- Actor  -> logits (K actions) -> categorical distribution
+        `-- Critic -> state value V(s) (scalar)
 
-    L'entrée mélange deux types d'information :
-        - masque binaire actif (sparse) : traité via embedding
-        - statistiques continues du champ
-    On les concatène et on passe dans le MLP commun.
+    The input mixes two kinds of information:
+        - active binary mask (sparse)
+        - continuous field statistics
+    They are concatenated and fed to the shared MLP.
     """
     def __init__(self, obs_dim, n_actions, hidden=256):
         super().__init__()
@@ -571,7 +570,7 @@ class ActorCritic(nn.Module):
         self.actor  = nn.Linear(hidden, n_actions)
         self.critic = nn.Linear(hidden, 1)
 
-        # Initialisation orthogonale (recommandée pour PPO)
+        # Orthogonal initialisation (recommended for PPO)
         for m in self.modules():
             if isinstance(m, nn.Linear):
                 nn.init.orthogonal_(m.weight, gain=np.sqrt(2))
@@ -597,8 +596,8 @@ class ActorCritic(nn.Module):
 
 class RolloutBuffer:
     """
-    Stocke les transitions (obs, action, reward, done, log_prob, value)
-    pour un mini-batch PPO.
+    Stores transitions (obs, action, reward, done, log_prob, value)
+    for one PPO mini-batch.
     """
     def __init__(self, buffer_size, obs_dim):
         self.obs       = np.zeros((buffer_size, obs_dim), dtype=np.float32)
@@ -620,7 +619,7 @@ class RolloutBuffer:
         self.ptr = (self.ptr + 1) % self.size
 
     def compute_returns(self, last_value, gamma=0.99, lam=0.95):
-        """GAE-λ : advantage estimé par Generalized Advantage Estimation."""
+        """GAE-lambda: advantage from Generalized Advantage Estimation."""
         advantages = np.zeros(self.size, dtype=np.float32)
         gae = 0.0
         for t in reversed(range(self.size)):
@@ -649,21 +648,21 @@ class RolloutBuffer:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  ENTRAÎNEMENT PPO
+#  PPO TRAINING
 # ══════════════════════════════════════════════════════════════════════════════
 
 def train_ppo(args, env):
     """
-    Boucle d'entraînement PPO complète.
+    Full PPO training loop.
 
-    Hyperparamètres clés :
-        clip_eps     : clipping du ratio de politique (0.2 standard)
+    Key hyperparameters:
+        clip_eps     : policy-ratio clipping (0.2 is standard)
         entropy_coef : encourage l'exploration (0.01)
-        vf_coef      : pondération de la value loss (0.5)
-        n_epochs_ppo : passes sur chaque mini-batch (4)
+        vf_coef      : value loss weight (0.5)
+        n_epochs_ppo : passes over each mini-batch (4)
     """
     print("═" * 60)
-    print(" Brique 3 — PPO : Optimisation du Réseau d'Observation")
+    print(" Brick 3 - PPO: observing-network optimisation")
     print("═" * 60)
 
     obs_dim   = env.obs_dim
@@ -672,9 +671,9 @@ def train_ppo(args, env):
     optimizer = torch.optim.Adam(policy.parameters(), lr=args.lr, eps=1e-5)
 
     n_params = sum(p.numel() for p in policy.parameters())
-    print(f"\n  Politique PPO — {n_params:,} paramètres")
-    print(f"  Espace d'état  : {obs_dim} dim")
-    print(f"  Espace d'action: {n_actions} positions candidates")
+    print(f"\n  PPO policy - {n_params:,} parameters")
+    print(f"  State space  : {obs_dim} dim")
+    print(f"  Action space   : {n_actions} candidate positions")
 
     buffer     = RolloutBuffer(args.buffer_size, obs_dim)
     clip_eps   = 0.2
@@ -694,7 +693,7 @@ def train_ppo(args, env):
     ep_reward = 0.0
     global_step = 0
 
-    print(f"\n  Entraînement : {args.rl_steps} steps | buffer={args.buffer_size}")
+    print(f"\n  Training: {args.rl_steps} steps | buffer={args.buffer_size}")
     print("─" * 60)
 
     for step in range(args.rl_steps):
@@ -731,7 +730,7 @@ def train_ppo(args, env):
             obs = env.reset()
             ep_reward = 0.0
 
-        # ── Mise à jour PPO tous les buffer_size steps ───────────────────────
+        # -- PPO update every buffer_size steps -------------------------------
         if (step + 1) % args.buffer_size == 0:
             with torch.no_grad():
                 obs_t = torch.tensor(obs, dtype=torch.float32, device=DEVICE).unsqueeze(0)
@@ -741,7 +740,7 @@ def train_ppo(args, env):
                 last_v = last_value.item()
 
             advantages, returns = buffer.compute_returns(last_v)
-            # Normalisation des avantages
+            # Advantage normalisation
             advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
             batch = buffer.get_tensors(advantages, returns, DEVICE)
 
@@ -759,9 +758,9 @@ def train_ppo(args, env):
                     ret_mb = batch["returns"][mb]
 
                     logits, values = policy(obs_mb)
-                    # Le masque est une fonction deterministe du masque actif,
-                    # qui occupe les K premieres composantes de l'observation :
-                    # on le recalcule ici pour que log_prob soit coherent avec
+                    # The mask is a deterministic function of the active mask,
+                    # which occupies the first K entries of the observation:
+                    # recomputing it here keeps log_prob consistent with the
                     # celui stocke au rollout (ratio PPO exact).
                     inv_mb = torch.as_tensor(
                         env.invalid_action_mask(
@@ -789,12 +788,12 @@ def train_ppo(args, env):
                       f"Mean reward (20 ep) = {np.mean(ep_rewards):+.3f} | "
                       f"Best = {best_reward:+.3f}")
 
-    print(f"\n  ✓ Meilleure récompense : {best_reward:.4f}")
+    print(f"\n  Best reward: {best_reward:.4f}")
     print(f"  ✓ Checkpoint → {out_dir}/rl_best.pt")
 
-    # ── Courbes d'apprentissage ────────────────────────────────────────────────
+    # -- Learning curves -------------------------------------------------------
     fig, axes = plt.subplots(2, 2, figsize=(14, 8))
-    fig.suptitle("Brique 3 — PPO : Courbes d'entraînement", fontsize=14, fontweight="bold")
+    fig.suptitle("Brick 3 - PPO training curves", fontsize=14, fontweight="bold")
 
     axes[0, 0].plot(history["episode_reward"], alpha=0.4, color="steelblue")
     # Moyenne glissante
@@ -802,51 +801,51 @@ def train_ppo(args, env):
     smooth = np.convolve(history["episode_reward"],
                          np.ones(w)/w, mode="valid")
     axes[0, 0].plot(range(w-1, len(history["episode_reward"])), smooth, color="navy", lw=2)
-    axes[0, 0].set_title("Récompense par épisode"); axes[0, 0].set_xlabel("Épisode")
+    axes[0, 0].set_title("Reward per episode"); axes[0, 0].set_xlabel("Episode")
     axes[0, 0].grid(True, alpha=0.3)
 
     axes[0, 1].plot(history["n_active"], color="orange", alpha=0.6)
     axes[0, 1].axhline(env.n_min, color="red", linestyle="--", label=f"n_min={env.n_min}")
     axes[0, 1].axhline(env.n_max, color="red", linestyle=":",  label=f"n_max={env.n_max}")
-    axes[0, 1].set_title("Nombre de capteurs actifs en fin d'épisode")
+    axes[0, 1].set_title("Active sensors at end of episode")
     axes[0, 1].legend(); axes[0, 1].grid(True, alpha=0.3)
 
     axes[1, 0].plot(history["info_score"], color="green", alpha=0.6)
-    axes[1, 0].set_title("Score d'information (couverture pondérée variance)")
+    axes[1, 0].set_title("Information score")
     axes[1, 0].grid(True, alpha=0.3)
 
     axes[1, 1].plot(history["info_score"], color="#74c476", alpha=0.8)
-    axes[1, 1].set_title("Score d information (couverture pondérée variance)")
+    axes[1, 1].set_title("Information score (smoothed)")
     axes[1, 1].grid(True, alpha=0.3)
 
     fig.tight_layout()
     fig.savefig(out_dir / "rl_training_curves.png", dpi=150)
     plt.close()
-    print(f"  ✓ Courbes → {out_dir}/rl_training_curves.png")
+    print(f"  [ok] Curves -> {out_dir}/rl_training_curves.png")
 
     return policy
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  FRONT DE PARETO — Optimisation sous contrainte budgétaire
+#  PARETO FRONT - optimisation under budget constraint
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _elbow_index(n_vals, info_vals):
     """
-    Indice du coude : point le plus eloigne de la corde (premier -> dernier),
-    apres normalisation des deux axes dans [0, 1].
+    Elbow index: point furthest from the chord (first -> last), after
+    normalising both axes to [0, 1].
     """
     n = np.asarray(n_vals, dtype=float); v = np.asarray(info_vals, dtype=float)
     if len(n) < 3:
         return 0
-    # lissage leger : le sweep Monte-Carlo laisse du bruit residuel
+    # light smoothing: the Monte-Carlo sweep leaves residual noise
     k = min(5, len(v) // 4 * 2 + 1)
     if k >= 3:
         ker = np.ones(k) / k
         v = np.convolve(np.pad(v, k // 2, mode="edge"), ker, mode="valid")[:len(n)]
     nx = (n - n.min()) / (np.ptp(n) + 1e-12)
     vy = (v - v.min()) / (np.ptp(v) + 1e-12)
-    # distance verticale a la corde y = x (apres normalisation)
+    # vertical distance to the chord y = x (after normalisation)
     return int(np.argmax(vy - nx))
 
 
@@ -859,14 +858,14 @@ def _config_info(env, idx):
 
 def _greedy_sequence(env, n_max):
     """
-    Construction gloutonne : à chaque étape on ajoute le candidat qui maximise
-    le gain d'information. Le critère étant sous-modulaire, cette suite est
-    garantie à (1 − 1/e) de l'optimum (Nemhauser 1978) et sert de référence
-    haute. Elle est emboîtée : un seul passage donne toutes les tailles.
+    Greedy construction: at each step add the candidate that maximises the
+    information gain. The criterion being submodular, this sequence is
+    guaranteed within (1 - 1/e) of the optimum (Nemhauser 1978) and serves as
+    an upper reference. It is nested: one pass gives every size.
     """
     sel, seqs = [], []
     for _ in range(min(n_max, env.n_feasible_max)):
-        cands = env.feasible_candidates(sel)      # respecte la separation mini
+        cands = env.feasible_candidates(sel)      # honours the minimum separation
         if len(cands) == 0:
             break
         best_c, best_v = None, -np.inf
@@ -881,13 +880,13 @@ def _greedy_sequence(env, n_max):
 
 def _policy_sequence(env, policy, n_max):
     """
-    Construction guidée par la politique PPO : on part d'un réseau vide et on
-    active à chaque étape le candidat le mieux noté par l'acteur parmi les
-    inactifs. Emboîtée elle aussi.
+    Construction guided by the PPO policy: start from an empty network and, at
+    each step, activate the candidate ranked highest by the actor among the
+    inactive ones. Nested as well.
 
-    C'est ici que la politique entraînée est réellement évaluée. L'ancien
-    code recevait `policy` en argument et ne s'en servait jamais : le front
-    mesurait du placement aléatoire, pas l'apport du RL.
+    This is where the trained policy is actually evaluated. The previous code
+    code took `policy` as an argument and never used it: the front
+    measured random placement, not what the RL brings.
     """
     if policy is None:
         return []
@@ -900,8 +899,8 @@ def _policy_sequence(env, policy, n_max):
         with torch.no_grad():
             logits, _ = policy(obs)
         logits = logits[0].cpu().numpy()
-        logits[mask > 0.5] = -np.inf                       # deja selectionne
-        logits[env.invalid_action_mask(mask)] = -np.inf    # separation mini
+        logits[mask > 0.5] = -np.inf                       # already selected
+        logits[env.invalid_action_mask(mask)] = -np.inf    # minimum separation
         if not np.isfinite(logits).any():
             break
         c = int(np.argmax(logits))
@@ -912,11 +911,11 @@ def _policy_sequence(env, policy, n_max):
 
 def _non_dominated(n_vals, info_vals):
     """
-    Masque des configurations non dominées au sens (info max, N min).
-    Contrairement au balayage par N moyenné, ce test porte sur des
-    configurations INDIVIDUELLES : un réseau de 22 bouées mal placées est
-    dominé par un réseau de 17 bouées bien placées si son score est inférieur.
-    C'est ce qui rend le front non trivial malgré la monotonie en N.
+    Mask of non-dominated configurations in the (max info, min N) sense.
+    Unlike a sweep averaged over N, this test applies to INDIVIDUAL
+    configurations: a network of 22 badly placed buoys is dominated by one of
+    17 well placed buoys if its score is lower. That is what makes the front
+    non-trivial despite monotonicity in N.
     """
     n = np.asarray(n_vals); v = np.asarray(info_vals)
     order = np.argsort(n, kind="stable")
@@ -930,32 +929,32 @@ def _non_dominated(n_vals, info_vals):
 
 def compute_pareto_front(env, policy, args, n_random=25):
     """
-    Front de Pareto  qualité de l'information  vs  nombre de bouées.
+    Pareto front: information quality vs number of buoys.
 
-    Trois sources de configurations sont mises en concurrence à chaque N :
-        - aléatoire   : ligne de base (ce que vaut un réseau non optimisé)
-        - politique   : construction guidée par l'acteur PPO entraîné
-        - glouton     : référence haute, garantie (1 − 1/e) de l'optimum
+    Three sources of configurations compete at each N:
+        - random   : baseline (what an unoptimised network is worth)
+        - policy   : construction guided by the trained PPO actor
+        - greedy   : upper reference, (1 - 1/e) guarantee
 
-    Le front est l'ensemble des configurations non dominées parmi TOUTES
-    celles évaluées, pas la moyenne par N. L'enveloppe supérieure donne le
-    meilleur score atteignable pour chaque budget de bouées.
+    The front is the set of non-dominated configurations among ALL those
+    evaluated, not the average per N. The upper envelope gives the best score
+    reachable for each buoy budget.
 
-    Le « meilleur compromis » est identifié de deux façons complémentaires :
-        - le coude de l'enveloppe (distance maximale à la corde)
-        - la scalarisation  max_N [ info(N) − lambda·N ]  balayée en lambda,
-          qui montre comment N★ se déplace avec le coût marginal d'une bouée.
+    The 'best compromise' is identified in two complementary ways:
+        - the elbow of the envelope (maximum distance to the chord)
+        - the scalarisation max_N [ info(N) - lambda*N ] swept in lambda, which
+          shows how N* moves with the marginal cost of one buoy.
     """
-    print("\n── Front de Pareto : information vs nombre de capteurs ───────────")
+    print("\n-- Pareto front: information vs number of sensors ----------------")
     out_dir = Path(args.output_dir); out_dir.mkdir(parents=True, exist_ok=True)
 
     if env.info_mode == "evf":
-        print(f"  Critère : variance expliquée (interpolation optimale) | "
+        print(f"  Criterion: explained variance (optimal interpolation) | "
               f"L = {env.influence_px * DX_KM:.0f} km | "
               f"contraction = {env._shrinkage:.2f} | rho_TS = {env._rho_TS:+.2f}"
-              + ("  [validé hors échantillon]" if env._evf_cv else ""))
+              + ("  [validated out of sample]" if env._evf_cv else ""))
     else:
-        print(f"  Critère : {env.info_mode}")
+        print(f"  Criterion: {env.info_mode}")
 
     n_lo = max(1, env.n_min - 5)
     n_hi = min(env.n_feasible_max, env.n_max + 10)
@@ -963,8 +962,8 @@ def compute_pareto_front(env, policy, args, n_random=25):
 
     cloud_n, cloud_v, cloud_src = [], [], []
 
-    # ── 1. tirages aléatoires ─────────────────────────────────────────────────
-    print(f"  Tirages aléatoires ({n_random} par N)...")
+    # -- 1. random draws ---------------------------------------------------
+    print(f"  Random draws ({n_random} per N)...")
     rand_stats = {}
     for n_target in n_range:
         vals = []
@@ -975,8 +974,8 @@ def compute_pareto_front(env, policy, args, n_random=25):
             cloud_n.append(n_target); cloud_v.append(v); cloud_src.append(0)
         rand_stats[n_target] = (float(np.mean(vals)), float(np.std(vals)))
 
-    # ── 2. construction guidée par la politique PPO ───────────────────────────
-    print("  Construction guidée par la politique PPO...")
+    # -- 2. construction guided by the PPO policy --------------------------
+    print("  Construction guided by the PPO policy...")
     pol_seq = _policy_sequence(env, policy, n_hi)
     pol_by_n = {}
     for sel, v in pol_seq:
@@ -984,8 +983,8 @@ def compute_pareto_front(env, policy, args, n_random=25):
             pol_by_n[len(sel)] = (list(sel), v)
             cloud_n.append(len(sel)); cloud_v.append(v); cloud_src.append(1)
 
-    # ── 3. référence gloutonne ────────────────────────────────────────────────
-    print("  Référence gloutonne (sous-modulaire, garantie 1-1/e)...")
+    # -- 3. greedy reference -----------------------------------------------
+    print("  Greedy reference (submodular, 1-1/e guarantee)...")
     gre_seq = _greedy_sequence(env, n_hi)
     gre_by_n = {}
     for sel, v in gre_seq:
@@ -997,7 +996,7 @@ def compute_pareto_front(env, policy, args, n_random=25):
     cloud_src = np.array(cloud_src)
     pareto_mask = _non_dominated(cloud_n, cloud_v)
 
-    # ── 4. enveloppe supérieure par N ─────────────────────────────────────────
+    # -- 4. upper envelope per N -------------------------------------------
     pareto_points = []
     for n_target in n_range:
         m = cloud_n == n_target
@@ -1005,12 +1004,12 @@ def compute_pareto_front(env, policy, args, n_random=25):
         best_src = int(cloud_src[m][np.argmax(cloud_v[m])])
         pareto_points.append({
             "n_buoys":        n_target,
-            "info_mean":      float(cloud_v[m].max()),   # enveloppe = atteignable
+            "info_mean":      float(cloud_v[m].max()),   # envelope = achievable
             "info_std":       r_std,
             "info_random":    r_mean,
             "info_policy":    float(pol_by_n.get(n_target, ([], np.nan))[1]),
             "info_greedy":    float(gre_by_n.get(n_target, ([], np.nan))[1]),
-            "best_source":    ["aleatoire", "politique", "glouton"][best_src],
+            "best_source":    ["random", "policy", "greedy"][best_src],
             "n_dominated":    int((~pareto_mask[m]).sum()),
         })
 
@@ -1020,7 +1019,7 @@ def compute_pareto_front(env, policy, args, n_random=25):
     elbow_idx = _elbow_index(n_vals, info_vals)
     n_star    = int(n_vals[elbow_idx])
 
-    # ── 5. scalarisation : N★ en fonction du coût marginal d'une bouée ───────
+    # -- 5. scalarisation: N* as a function of the marginal cost of a buoy --
     marg = np.gradient(info_vals, n_vals)
     lambdas = np.linspace(0.0, max(marg.max(), 1e-6) * 1.05, 160)
     n_of_lambda = np.array([n_vals[int(np.argmax(info_vals - lam * n_vals))]
@@ -1042,13 +1041,13 @@ def compute_pareto_front(env, policy, args, n_random=25):
 
     # (a) nuage + front
     ax = axes[0]
-    frame(ax, "Front de Pareto  —  information vs nombre de bouées",
-          "Nombre de bouées actives",
-          "Variance mésoéchelle expliquée" if env.info_mode == "evf"
+    frame(ax, "Pareto front  -  information vs number of buoys",
+          "Number of active buoys",
+          "Explained mesoscale variance" if env.info_mode == "evf"
           else "Score d'information")
-    styles = [("aléatoire", "#5a7ca8", 14, 0.35, "o"),
-              ("politique PPO", "#ffd93d", 42, 0.95, "s"),
-              ("glouton (réf.)", "#6bcb77", 30, 0.85, "^")]
+    styles = [("random", "#5a7ca8", 14, 0.35, "o"),
+              ("PPO policy", "#ffd93d", 42, 0.95, "s"),
+              ("greedy (ref.)", "#6bcb77", 30, 0.85, "^")]
     for k, (lbl, col, sz, al, mk) in enumerate(styles):
         m = cloud_src == k
         if m.sum():
@@ -1056,15 +1055,15 @@ def compute_pareto_front(env, policy, args, n_random=25):
                        marker=mk, edgecolors="none", label=lbl, zorder=3)
     ax.scatter(cloud_n[pareto_mask], cloud_v[pareto_mask], s=95,
                facecolors="none", edgecolors="#ff6b6b", linewidths=1.4,
-               zorder=6, label=f"non dominées ({pareto_mask.sum()})")
+               zorder=6, label=f"non-dominated ({pareto_mask.sum()})")
     ax.plot(n_vals, info_vals, color="#ff6b6b", lw=1.4, alpha=0.8, zorder=4)
     ax.axvline(n_star, color="#ff6b6b", ls="--", lw=1.5, alpha=0.8)
-    ax.annotate(f"N★ = {n_star}\n{info_vals[elbow_idx]:.1%} de variance",
+    ax.annotate(f"N* = {n_star}\n{info_vals[elbow_idx]:.1%} of variance",
                 (n_star, info_vals[elbow_idx]), textcoords="offset points",
                 xytext=(12, -34), fontsize=9, color="#ff6b6b", fontweight="bold")
     n_eq = int(n_vals[np.argmin(np.abs(rnd_vals - info_vals[elbow_idx]))])
     if n_eq > n_star:
-        ax.annotate(f"{n_star} bouées optimisées ≡ {n_eq} au hasard",
+        ax.annotate(f"{n_star} optimised buoys = {n_eq} random ones",
                     xy=(0.03, 0.94), xycoords="axes fraction",
                     color="#8ab4d4", fontsize=8.5)
     ax.legend(fontsize=8, labelcolor="white", facecolor=BG, edgecolor=EDGE,
@@ -1072,59 +1071,59 @@ def compute_pareto_front(env, policy, args, n_random=25):
 
     # (b) gain marginal
     ax = axes[1]
-    frame(ax, "Gain marginal par bouée ajoutée\n(sur l'enveloppe supérieure)",
-          "Nombre de bouées actives", "Δ information / Δ N")
+    frame(ax, "Marginal gain per added buoy\n(on the upper envelope)",
+          "Number of active buoys", "d(information) / dN")
     cols = ["#6bcb77" if n <= n_star else "#5a7ca8" for n in n_vals]
     ax.bar(n_vals, marg, color=cols, alpha=0.9, edgecolor=EDGE, lw=0.4)
     thr = marg.max() * 0.20
     ax.axhline(thr, color="#ffd93d", ls="--", lw=1.4,
                label=f"20 % du gain initial")
     ax.axvline(n_star, color="#ff6b6b", ls="--", lw=1.5, alpha=0.8,
-               label=f"N★ = {n_star}")
+               label=f"N* = {n_star}")
     ax.legend(fontsize=8, labelcolor="white", facecolor=BG, edgecolor=EDGE)
 
-    # (c) compromis : N* en fonction du cout marginal
+    # (c) compromise: N* as a function of the marginal cost
     ax = axes[2]
-    frame(ax, "Compromis  —  N★ en fonction du coût d'une bouée\n"
+    frame(ax, "Compromise  -  N* vs the cost of one buoy\n"
               "max$_N$ [ info(N) − λ·N ]",
-          "λ  (coût marginal d'une bouée, en unité d'information)",
-          "N★ optimal")
+          "lambda  (marginal cost of one buoy, in information units)",
+          "optimal N*")
     ax.plot(lambdas, n_of_lambda, color="#6baed6", lw=2.2)
     ax.axhline(n_star, color="#ff6b6b", ls="--", lw=1.3, alpha=0.8)
     ax.axvline(lam_star, color="#ff6b6b", ls="--", lw=1.3, alpha=0.8)
-    ax.annotate(f"λ ≈ {lam_star:.4f}\n→ N★ = {n_star}", (lam_star, n_star),
+    ax.annotate(f"lambda ~ {lam_star:.4f}\n-> N* = {n_star}", (lam_star, n_star),
                 textcoords="offset points", xytext=(14, 14),
                 fontsize=9, color="#ff6b6b", fontweight="bold")
-    ax.annotate("bouée coûteuse →\nréseau léger",
+    ax.annotate("expensive buoy ->\nlighter network",
                 xy=(0.62, 0.80), xycoords="axes fraction",
                 color="#8ab4d4", fontsize=8)
 
-    fig.suptitle("Brique 3 — Front de Pareto information / nombre de bouées",
+    fig.suptitle("Brick 3 - Pareto front: information / number of buoys",
                  color="white", fontsize=13, fontweight="bold", y=1.02)
     fig.tight_layout()
     fig.savefig(out_dir / "rl_pareto_front.png", dpi=150,
                 bbox_inches="tight", facecolor=BG)
     plt.close()
-    print(f"  Figure → {out_dir}/rl_pareto_front.png")
+    print(f"  Figure -> {out_dir}/rl_pareto_front.png")
 
-    # ── 7. Recommandations ────────────────────────────────────────────────────
-    print("\n── Recommandations ────────────────────────────────────────────────")
-    print(f"  N★ (coude)         : {n_star} bouées  |  "
+    # -- 7. Recommendations ----------------------------------------------------
+    print("\n-- Recommendations -----------------------------------------------")
+    print(f"  N* (elbow)          : {n_star} buoys | "
           f"info = {info_vals[elbow_idx]:.3f}  "
-          f"(source : {pareto_points[elbow_idx]['best_source']})")
+          f"(source: {pareto_points[elbow_idx]['best_source']})")
     if n_eq > n_star:
-        print(f"  Équivalence        : {n_star} bouées optimisées valent "
-              f"{n_eq} bouées placées au hasard")
-    print(f"  Coût-seuil         : lambda* = {lam_star:.4f} — au-dessus, "
-          f"le réseau optimal se réduit")
-    print(f"  Configurations non dominées : {int(pareto_mask.sum())} "
-          f"sur {len(cloud_n)} évaluées")
-    print(f"\n  {'N':>4} | {'aléatoire':>10} | {'politique':>10} | "
-          f"{'glouton':>10} | {'enveloppe':>10}")
+        print(f"  Equivalence         : {n_star} optimised buoys are worth "
+              f"{n_eq} randomly placed ones")
+    print(f"  Threshold cost      : lambda* = {lam_star:.4f} - above it, "
+          f"the optimal network shrinks")
+    print(f"  Non-dominated configurations: {int(pareto_mask.sum())} "
+          f"out of {len(cloud_n)} evaluated")
+    print(f"\n  {'N':>4} | {'random':>10} | {'policy':>10} | "
+          f"{'greedy':>10} | {'envelope':>10}")
     for pt in pareto_points:
         if pt["n_buoys"] % max(1, len(pareto_points)//12) and pt["n_buoys"] != n_star:
             continue
-        star = " ★" if pt["n_buoys"] == n_star else "  "
+        star = " *" if pt["n_buoys"] == n_star else "  "
         print(f"  {pt['n_buoys']:>4} | {pt['info_random']:>10.3f} | "
               f"{pt['info_policy']:>10.3f} | {pt['info_greedy']:>10.3f} | "
               f"{pt['info_mean']:>10.3f}{star}")
@@ -1133,7 +1132,7 @@ def compute_pareto_front(env, policy, args, n_random=25):
 
 
 def _pareto_2d(cost, info):
-    """Non-domination pour (coût minimal, information maximale)."""
+    """Non-domination for (minimum cost, maximum information)."""
     c = np.asarray(cost); v = np.asarray(info)
     order = np.argsort(c, kind="stable")
     mask = np.zeros(len(c), dtype=bool); best = -np.inf
@@ -1145,9 +1144,9 @@ def _pareto_2d(cost, info):
 
 def _greedy_weighted(env, n_max, lam_cost):
     """
-    Glouton sur le critère scalarisé  info − lam_cost · coût.
-    Balayer lam_cost engendre l'ensemble du front information/coût :
-    lam = 0 donne le réseau le plus informatif, lam élevé le plus sobre.
+    Greedy on the scalarised criterion  info - lam_cost * cost.
+    Sweeping lam_cost generates the whole information/cost front:
+    lam = 0 gives the most informative network, large lam the most frugal.
     """
     sel, out = [], []
     for _ in range(min(n_max, env.n_feasible_max)):
@@ -1167,22 +1166,22 @@ def _greedy_weighted(env, n_max, lam_cost):
 
 def compute_multiobjective_front(env, policy, args, n_random=20, n_lambda=6):
     """
-    Front de Pareto bi-objectif : information vs COÛT opérationnel.
+    Bi-objective Pareto front: information vs operating COST.
 
-    Le nombre de bouées est un proxy grossier du coût. Ici le coût intègre la
-    tournée de maintenance depuis le port : à N fixé il varie d'un facteur 1.3
-    à 1.6 selon la dispersion du réseau. Les deux objectifs sont alors
-    véritablement antagonistes et la non-domination discrimine réellement.
+    The number of buoys is a crude proxy for cost. Here cost includes the
+    maintenance tour from the port: at fixed N it varies by a factor 1.3 to
+    1.6 depending on how spread out the network is. The two objectives are
+    then genuinely antagonistic and non-domination truly discriminates.
 
     Configurations mises en concurrence :
-        - aléatoires (ligne de base)
-        - politique PPO
-        - gloutons scalarisés  max [info − lambda·coût]  pour plusieurs lambda
+        - random (baseline)
+        - PPO policy
+        - scalarised greedy  max [info - lambda*cost]  for several lambda
           -> balaye l'ensemble du front
 
-    Sorties : figure 3 panneaux + recommandation sous contrainte de budget.
+    Outputs: a 3-panel figure + budget-constrained recommendations.
     """
-    print("\n── Front bi-objectif : information vs coût opérationnel ──────────")
+    print("\n-- Bi-objective front: information vs operating cost --------------")
     out_dir = Path(args.output_dir); out_dir.mkdir(parents=True, exist_ok=True)
 
     n_hi = min(env.n_feasible_max, env.n_max + 10)
@@ -1193,20 +1192,20 @@ def compute_multiobjective_front(env, policy, args, n_random=20, n_lambda=6):
         C_n.append(len(idx)); C_c.append(cost); C_co2.append(co2)
         C_v.append(_config_info(env, idx)); C_src.append(src)
 
-    print(f"  Tirages aléatoires ({n_random} par N)...")
+    print(f"  Random draws ({n_random} per N)...")
     for n_t in range(max(1, min(env.n_min, n_hi) - 5), n_hi + 1):
         for _ in range(n_random):
             _add(env.sample_feasible(n_t), 0)
 
-    print("  Politique PPO...")
+    print("  PPO policy...")
     for sel, _ in _policy_sequence(env, policy, n_hi):
         _add(np.array(sel), 1)
 
-    # échelle de lambda : gain d'info typique rapporté au coût d'une bouée
+    # lambda scale: typical information gain relative to the cost of one buoy
     lam_ref = 1.0 / max(COST_BUOY_FIXED * 20.0, 1e-6)
     lambdas = np.concatenate([[0.0], np.geomspace(0.2 * lam_ref, 8 * lam_ref,
                                                   n_lambda - 1)])
-    print(f"  Gloutons scalarisés ({n_lambda} valeurs de lambda)...")
+    print(f"  Scalarised greedy ({n_lambda} lambda values)...")
     for lam in lambdas:
         for sel in _greedy_weighted(env, n_hi, lam):
             _add(np.array(sel), 2)
@@ -1229,11 +1228,11 @@ def compute_multiobjective_front(env, policy, args, n_random=20, n_lambda=6):
         ax.grid(True, alpha=0.2, color="white")
 
     ax = axes[0]
-    frame(ax, "Front de Pareto  —  information vs coût",
-          "Coût opérationnel (k€/an)", "Variance mésoéchelle expliquée")
+    frame(ax, "Pareto front  -  information vs cost",
+          "Operating cost (kEUR/yr)", "Explained mesoscale variance")
     sc = ax.scatter(C_c, C_v, c=C_n, s=16, cmap="viridis", alpha=0.55,
                     edgecolors="none")
-    cb = fig.colorbar(sc, ax=ax, pad=0.02); cb.set_label("N bouées", color="white",
+    cb = fig.colorbar(sc, ax=ax, pad=0.02); cb.set_label("N buoys", color="white",
                                                           fontsize=8)
     cb.ax.yaxis.set_tick_params(color="white", labelcolor="white", labelsize=7)
     o = np.argsort(C_c[front])
@@ -1245,15 +1244,15 @@ def compute_multiobjective_front(env, policy, args, n_random=20, n_lambda=6):
               loc="lower right")
 
     ax = axes[1]
-    frame(ax, "Dispersion du coût à N fixé\n(deux réseaux de même taille ne "
-              "coûtent pas pareil)", "Nombre de bouées", "Coût (k€/an)")
+    frame(ax, "Cost spread at fixed N\n(two networks of equal size do not "
+              "cost the same)", "Number of buoys", "Cost (kEUR/yr)")
     ax.scatter(C_n, C_c, c=C_v, s=16, cmap="magma", alpha=0.6, edgecolors="none")
     ax.scatter(C_n[front], C_c[front], s=60, facecolors="none",
                edgecolors="#ff6b6b", linewidths=1.2, zorder=5)
 
     ax = axes[2]
     frame(ax, "Meilleure information atteignable\nsous contrainte de budget",
-          "Budget annuel (k€)", "Variance expliquée atteignable")
+          "Annual budget (kEUR)", "Reachable explained variance")
     budgets = np.linspace(C_c.min(), C_c.max(), 90)
     best_v = np.array([C_v[C_c <= b].max() if (C_c <= b).any() else np.nan
                        for b in budgets])
@@ -1262,22 +1261,22 @@ def compute_multiobjective_front(env, policy, args, n_random=20, n_lambda=6):
     ax.plot(budgets, best_v, color="#6bcb77", lw=2.4)
     ax2 = ax.twinx(); ax2.set_facecolor(PANEL)
     ax2.plot(budgets, best_n, color="#ffd93d", lw=1.4, ls="--", alpha=0.85)
-    ax2.set_ylabel("N bouées du réseau optimal", color="#ffd93d", fontsize=9)
+    ax2.set_ylabel("N buoys in the optimal network", color="#ffd93d", fontsize=9)
     ax2.tick_params(colors="#ffd93d", labelsize=8)
     for b in (600, 900, 1200):
         if C_c.min() <= b <= C_c.max():
             ax.axvline(b, color="#5a7ca8", ls=":", lw=1.0, alpha=0.8)
 
-    fig.suptitle("Brique 3 — Front bi-objectif information / coût opérationnel",
+    fig.suptitle("Brick 3 - Bi-objective front: information / operating cost",
                  color="white", fontsize=13, fontweight="bold", y=1.02)
     fig.tight_layout()
     fig.savefig(out_dir / "rl_pareto_cost.png", dpi=150,
                 bbox_inches="tight", facecolor=BG)
     plt.close()
-    print(f"  Figure → {out_dir}/rl_pareto_cost.png")
+    print(f"  Figure -> {out_dir}/rl_pareto_cost.png")
 
-    print("\n── Réseaux optimaux sous contrainte de budget ─────────────────────")
-    print(f"  {'budget':>9} | {'N':>3} | {'info':>6} | {'coût réel':>10} | {'tCO2/an':>8}")
+    print("\n-- Optimal networks under a budget constraint ---------------------")
+    print(f"  {'budget':>9} | {'N':>3} | {'info':>6} | {'real cost':>10} | {'tCO2/yr':>8}")
     recos = []
     for b in (500, 700, 900, 1100, 1400):
         m = C_c <= b
@@ -1296,9 +1295,9 @@ def compute_multiobjective_front(env, policy, args, n_random=20, n_lambda=6):
 
 def mark_retained_config_on_pareto(n_retained, info_retained, out_dir):
     """
-    Ajoute une étoile ★ sur le graphe rl_pareto_front.png pour montrer
-    la configuration effectivement retenue (depuis le best checkpoint).
-    Produit rl_pareto_front_pipeline.png pour ne pas écraser l'original.
+    Adds a star on rl_pareto_front.png to show the configuration actually
+    the configuration actually retained (from the best checkpoint).
+    Writes rl_pareto_front_pipeline.png so the original is not overwritten.
     """
     import matplotlib.pyplot as plt
     import matplotlib.image as mpimg
@@ -1315,7 +1314,7 @@ def mark_retained_config_on_pareto(n_retained, info_retained, out_dir):
 
     # Annoter en overlay — position textuelle en bas de l'image
     fig.text(0.5, 0.01,
-             f"★ Config retenue (best checkpoint) : N={n_retained}  |  "
+             f"* Retained config (best checkpoint): N={n_retained}  |  "
              f"info={info_retained:.3f}",
              ha="center", color="#ffd93d", fontsize=10, fontweight="bold",
              bbox=dict(boxstyle="round,pad=0.3", facecolor="#0a1628",
@@ -1324,21 +1323,21 @@ def mark_retained_config_on_pareto(n_retained, info_retained, out_dir):
     out = out_dir / "rl_pareto_front_pipeline.png"
     fig.savefig(out, dpi=150, bbox_inches="tight", facecolor="#0a1628")
     plt.close()
-    print(f"  Pareto annoté → {out}")
+    print(f"  Annotated Pareto -> {out}")
 
 
 def visualize_two_configs(env, pareto_points, n_star, policy, args,
                           best_mask=None):
     """
-    Compare deux configurations réseau :
+    Compare two network configurations:
 
-    Config Dense  : best_mask du checkpoint (si fourni) ou simulation depuis N★
-                    → c'est la configuration RETENUE transmise à GNN et AE
-    Config Légère : N ≈ N★ // 2, simulée par la politique
+    Dense config : best_mask from the checkpoint (if given), else simulated from N*
+                    -> this is the RETAINED configuration passed to GNN and AE
+    Light config : N ~ N* // 2, simulated by the policy
 
-    best_mask : np.ndarray (K,) float32 — active_mask du meilleur épisode RL.
-                Quand fourni (mode pipeline), le panneau Dense montre exactement
-                la configuration qui sera évaluée par GNN et AE.
+    best_mask : np.ndarray (K,) float32 - active_mask of the best RL episode.
+                When provided (pipeline mode), the Dense panel shows exactly
+                the configuration that GNN and AE will evaluate.
     """
     out_dir = Path(args.output_dir); out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1351,7 +1350,7 @@ def visualize_two_configs(env, pareto_points, n_star, policy, args,
     n_light = max(env.n_min, int(n_star) // 2)
 
     def _run_config_policy(n_target):
-        """Simule une configuration à n_target bouées avec la politique."""
+        """Simulate a configuration of n_target buoys with the policy."""
         env.active_mask[:] = 0.0
         idx = env.sample_feasible(min(n_target, env.n_feasible_max))
         env.active_mask[idx] = 1.0
@@ -1368,34 +1367,34 @@ def visualize_two_configs(env, pareto_points, n_star, policy, args,
         active_idx = np.where(env.active_mask > 0.5)[0]
         return active_idx, float(env._compute_info_reward())
 
-    # Config dense : best_mask si fourni, sinon simulation depuis N★
+    # Dense config: best_mask if provided, otherwise simulated from N*
     if best_mask is not None:
         env.active_mask = best_mask.copy()
         dense_idx  = np.where(best_mask > 0.5)[0]
         dense_info = float(env._compute_info_reward())
-        dense_label = "Dense  (config retenue)"
-        dense_note  = "★ configuration transmise au GNN & AE"
+        dense_label = "Dense  (retained config)"
+        dense_note  = "* configuration passed to GNN & AE"
     else:
         dense_idx, dense_info = _run_config_policy(int(n_star))
-        dense_label = "Dense  (N★ simulée)"
-        dense_note  = f"N★={n_star} (coude Pareto)"
+        dense_label = "Dense  (simulated N*)"
+        dense_note  = f"N*={n_star} (Pareto elbow)"
 
     light_idx, light_info = _run_config_policy(n_light)
-    light_label = f"Légère  (N★ ÷ 2 ≈ {n_light})"
+    light_label = f"Light  (N* / 2 ~ {n_light})"
 
     T_bg    = env.T[0]
     vTmin, vTmax = float(env.T.min()), float(env.T.max())
     all_pos = np.array(env.candidate_positions)
 
     fig = plt.figure(figsize=(18, 8), facecolor=BG)
-    title = ("Brique 3 RL — Config retenue (best checkpoint) vs Légère"
+    title = ("Brick 3 RL - Retained config (best checkpoint) vs Light"
              if best_mask is not None
-             else "Brique 3 RL — Dense (N★) vs Légère (N★÷2)")
+             else "Brick 3 RL - Dense (N*) vs Light (N*/2)")
     fig.suptitle(title, color="white", fontsize=13, fontweight="bold", y=0.99)
 
     for col, (active_idx, info_score, label, note, col_c) in enumerate([
         (dense_idx,  dense_info,  dense_label, dense_note,  "#6bcb77"),
-        (light_idx,  light_info,  light_label, f"N={len(light_idx)} capteurs", "#ffd93d"),
+        (light_idx,  light_info,  light_label, f"N={len(light_idx)} sensors", "#ffd93d"),
     ]):
         env.active_mask[:] = 0.0
         env.active_mask[active_idx] = 1.0
@@ -1417,7 +1416,7 @@ def visualize_two_configs(env, pareto_points, n_star, policy, args,
         cb = plt.colorbar(sc, ax=ax, pad=0.02, fraction=0.04)
         cb.set_label("Variance locale", color="white", fontsize=7)
         cb.ax.yaxis.set_tick_params(color="white", labelcolor="white", labelsize=6)
-        ax.set_title(f"{label}\nN={len(active_idx)} bouées  |  Info={info_score:.3f}",
+        ax.set_title(f"{label}\nN={len(active_idx)} buoys  |  Info={info_score:.3f}",
                      color=col_c, fontsize=11, fontweight="bold", pad=6)
         ax.text(0.02, 0.03, note, transform=ax.transAxes,
                 color=col_c, fontsize=8, alpha=0.85)
@@ -1427,15 +1426,15 @@ def visualize_two_configs(env, pareto_points, n_star, policy, args,
     fig.text(0.5, 0.02,
              f"{dense_label}: N={len(dense_idx)} | info={dense_info:.3f}     "
              f"{light_label}: N={len(light_idx)} | info={light_info:.3f}     "
-             f"Perte info: {loss_info:.1f}%  pour {len(dense_idx)-len(light_idx)} capteurs en moins",
+             f"Information loss: {loss_info:.1f}%  for {len(dense_idx)-len(light_idx)} fewer sensors",
              ha="center", color="#8ab4d4", fontsize=9)
 
     out = out_dir / "rl_two_configs.png"
     fig.savefig(out, dpi=150, facecolor=BG, bbox_inches="tight")
     plt.close()
-    print(f"\n  ── Deux configurations ──────────────────────────────────────")
-    print(f"  Dense  : N={len(dense_idx)} bouées  info={dense_info:.3f}  [{dense_note}]")
-    print(f"  Légère : N={len(light_idx)} bouées  info={light_info:.3f}")
+    print(f"\n  -- Two configurations ---------------------------------------")
+    print(f"  Dense : N={len(dense_idx)} buoys  info={dense_info:.3f}  [{dense_note}]")
+    print(f"  Light : N={len(light_idx)} buoys  info={light_info:.3f}")
     print(f"  Figure → {out}")
 
 
@@ -1445,11 +1444,11 @@ def visualize_two_configs(env, pareto_points, n_star, policy, args,
 #  VISUALISATION CONFIGURATION FINALE
 # ══════════════════════════════════════════════════════════════════════════════
 
-def visualize_final_config(env, active_mask, args, title="Configuration optimale RL"):
-    """Visualise la configuration de réseau trouvée par l'agent RL."""
+def visualize_final_config(env, active_mask, args, title="RL optimal configuration"):
+    """Visualise the network configuration found by the RL agent."""
     out_dir = Path(args.output_dir)
     fig, axes = plt.subplots(1, 2, figsize=(14, 6))
-    fig.suptitle(f"Brique 3 — {title}", fontsize=13, fontweight="bold")
+    fig.suptitle(f"Brick 3 - {title}", fontsize=13, fontweight="bold")
 
     active_idx = np.where(active_mask > 0.5)[0]
     inactive_idx = np.where(active_mask <= 0.5)[0]
@@ -1461,36 +1460,36 @@ def visualize_final_config(env, active_mask, args, title="Configuration optimale
     sc = ax.scatter(all_pos[active_idx, 0], all_pos[active_idx, 1],
                     c=env.field_stats[active_idx], cmap="YlOrRd",
                     s=120, edgecolors="black", linewidths=0.8, zorder=5,
-                    label=f"Bouées actives ({len(active_idx)})")
+                    label=f"Active buoys ({len(active_idx)})")
     plt.colorbar(sc, ax=ax, label="Variance locale (importance OED)")
     ax.set_xlim(0, NX); ax.set_ylim(0, NY)
-    ax.set_title(f"Réseau optimal — {len(active_idx)}/{env.K} positions actives")
+    ax.set_title(f"Optimal network - {len(active_idx)}/{env.K} active positions")
     ax.legend()
     ax.grid(True, alpha=0.2)
     ax.set_xlabel("x (pixel)"); ax.set_ylabel("y (pixel)")
 
-    # Heatmap de la variance du champ
+    # Heatmap of the field variance
     ax2 = axes[1]
     variance_grid = env.field_stats.reshape(env.grid_x, env.grid_y)
     im = ax2.imshow(variance_grid.T, cmap="YlOrRd", origin="lower", aspect="auto")
-    plt.colorbar(im, ax=ax2, label="Variance locale normalisée")
-    # Overlay des bouées
+    plt.colorbar(im, ax=ax2, label="Normalised local variance")
+    # Overlay the buoys
     for ai in active_idx:
         gx_idx = ai // env.grid_y
         gy_idx = ai % env.grid_y
         ax2.scatter(gx_idx, gy_idx, c="blue", s=60, marker="*", zorder=5)
-    ax2.set_title("Grille de variance + positionnement RL\n(étoile bleue = bouée active)")
+    ax2.set_title("Variance grid + RL placement\n(blue star = active buoy)")
     ax2.set_xlabel(f"x (cellule grille {env.grid_x})")
     ax2.set_ylabel(f"y (cellule grille {env.grid_y})")
 
     fig.tight_layout()
     fig.savefig(out_dir / "rl_optimal_network.png", dpi=150)
     plt.close()
-    print(f"  ✓ Configuration finale → {out_dir}/rl_optimal_network.png")
+    print(f"  Final configuration -> {out_dir}/rl_optimal_network.png")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  POINT D'ENTRÉE
+#  ENTRY POINT
 # ══════════════════════════════════════════════════════════════════════════════
 
 # =============================================================================
@@ -1499,15 +1498,15 @@ def visualize_final_config(env, active_mask, args, title="Configuration optimale
 
 def save_rl_gif(env, policy, args, n_frames=80):
     """
-    Genere un GIF animant la progression de l agent RL.
+    Generate a GIF animating the RL agent's progression.
 
-    Chaque frame = 1 step de l agent dans l environnement.
-    On rejoue depuis un etat initial aleatoire et on laisse tourner
-    l agent avec la politique entrainees (mode deterministe).
+    Each frame = 1 agent step in the environment.
+    We replay from a random initial state and let the agent run with the
+    trained policy (deterministic mode).
 
-    Panneau gauche  : champ de variance locale (OED target) + bouees actives
-    Panneau central : graphe du reseau (positions + aretes kNN)
-    Panneau droit   : courbe de recompense cumulee en temps reel
+    Left panel   : local variance field (OED target) + active buoys
+    Middle panel : network graph (positions + kNN edges)
+    Right panel  : cumulative reward curve, updated live
     """
     import matplotlib; matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -1527,7 +1526,7 @@ def save_rl_gif(env, policy, args, n_frames=80):
     BG = "#0a1628"
     cands = np.array(env.candidate_positions)
 
-    # Rejouer avec la politique
+    # Replay with the policy
     obs = env.reset()
     all_states   = [env.active_mask.copy()]
     all_rewards  = [0.0]
@@ -1548,27 +1547,27 @@ def save_rl_gif(env, policy, args, n_frames=80):
             if done:
                 obs = env.reset()
 
-    # Variance de fond sur la grille candidate
+    # Background variance on the candidate grid
     var_grid = env.field_stats.reshape(env.grid_x, env.grid_y)
 
-    # Coordonnées pixel des positions candidates — doivent correspondre
-    # à l'extent de l'imshow SST (0→NX, 0→NY) pour que les points
-    # soient bien placés sur la carte.
+    # Pixel coordinates of the candidate positions - must match the extent
+    # of the SST imshow (0->NX, 0->NY) so the markers land correctly on
+    # the map.
     cands_px_x = cands[:, 0].astype(float)   # ∈ [0, NX]
     cands_px_y = cands[:, 1].astype(float)   # ∈ [0, NY]
 
     # Construction du GIF
     fig = plt.figure(figsize=(18, 7), facecolor=BG)
-    ax1 = fig.add_axes([0.03, 0.10, 0.28, 0.78])    # carte SST + variance + bouees
-    ax2 = fig.add_axes([0.36, 0.10, 0.28, 0.78])    # graphe reseau
-    ax3 = fig.add_axes([0.70, 0.10, 0.27, 0.78])    # courbe recompense
+    ax1 = fig.add_axes([0.03, 0.10, 0.28, 0.78])    # SST map + variance + buoys
+    ax2 = fig.add_axes([0.36, 0.10, 0.28, 0.78])    # network graph
+    ax3 = fig.add_axes([0.70, 0.10, 0.27, 0.78])    # reward curve
 
     for ax in [ax1, ax2, ax3]:
         ax.set_facecolor("#050d1a")
         for sp in ax.spines.values(): sp.set_edgecolor("#1a3a5c")
         ax.tick_params(colors="#8ab4d4", labelsize=7)
 
-    # Fond fixe ax1 : champ SST du nature run (coordonnées pixel NX×NY)
+    # Fixed background ax1: nature run SST field (pixel coordinates NX x NY)
     T_bg = env.T[0]
     vTmin, vTmax = float(env.T.min()), float(env.T.max())
     ax1.imshow(T_bg.T, cmap=ocean_cmap, origin="lower", aspect="auto",
@@ -1578,23 +1577,23 @@ def save_rl_gif(env, policy, args, n_frames=80):
                   fontsize=9, fontweight="bold", pad=5)
     ax1.set_xticks([]); ax1.set_yticks([])
 
-    # Fond fixe ax2 : même étendue pixel pour cohérence
+    # Fixed background ax2: same pixel extent for consistency
     ax2.set_xlim(0, NX); ax2.set_ylim(0, NY)
     ax2.imshow(T_bg.T, cmap=ocean_cmap, origin="lower", aspect="auto",
                vmin=vTmin, vmax=vTmax, alpha=0.3, extent=[0, NX, 0, NY])
-    ax2.set_title("Graphe du reseau (kNN)", color="white",
+    ax2.set_title("Network graph (kNN)", color="white",
                   fontsize=9, fontweight="bold", pad=5)
     ax2.set_xticks([]); ax2.set_yticks([])
 
-    # Courbe recompense
+    # Reward curve
     ax3.set_xlim(0, n_frames); ax3.set_ylim(min(cum_rewards)*1.1, max(cum_rewards)*1.1)
-    ax3.set_title("Recompense cumulee", color="white", fontsize=9, fontweight="bold", pad=5)
+    ax3.set_title("Cumulative reward", color="white", fontsize=9, fontweight="bold", pad=5)
     ax3.set_xlabel("Etape", color="#8ab4d4", fontsize=8)
     ax3.grid(True, alpha=0.15, color="white")
     reward_line, = ax3.plot([], [], color="#6bcb77", lw=2)
     step_vline   = ax3.axvline(0, color="#ffd93d", lw=1, alpha=0.7)
 
-    # Elements dynamiques — les offsets utilisent les coordonnées pixel (0→NX, 0→NY)
+    # Dynamic elements - offsets use pixel coordinates (0->NX, 0->NY)
     sc_inactive = ax1.scatter([], [], c="#1a3a5c", s=20, alpha=0.3, zorder=2)
     sc_active1  = ax1.scatter([], [], s=90, zorder=5, edgecolors="white",
                                linewidths=0.7)
@@ -1602,7 +1601,7 @@ def save_rl_gif(env, policy, args, n_frames=80):
     sc_active2   = ax2.scatter([], [], s=70, zorder=5, edgecolors="white",
                                 linewidths=0.7)
 
-    edge_lines = []   # lignes d aretes (recreees a chaque frame)
+    edge_lines = []   # edge lines (rebuilt at every frame)
 
     txt_step = fig.text(0.5, 0.96, "", ha="center", color="white",
                          fontsize=11, fontweight="bold")
@@ -1635,7 +1634,7 @@ def save_rl_gif(env, policy, args, n_frames=80):
         else:
             sc_active1.set_offsets(np.empty((0, 2)))
 
-        # ── Panneau 2 : graphe reseau ─────────────────────────────────────────
+        # -- Panel 2: network graph -------------------------------------------
         for ln in edge_lines: ln.remove()
         edge_lines = []
 
@@ -1669,10 +1668,10 @@ def save_rl_gif(env, policy, args, n_frames=80):
         # ── Textes ────────────────────────────────────────────────────────────
         eps = max(0.05, 1.0 - frame / n_frames)
         txt_step.set_text(
-            f"Brique 3 — RL  |  Etape {frame+1}/{n_frames}  "
+            f"Brick 3 - RL  |  Step {frame+1}/{n_frames}  "
             f"|  epsilon={eps:.2f}  |  N actives={n_active}")
         txt_step.set_color(plt.cm.cool(frame / n_frames))
-        txt_n.set_text(f"Bouees: {n_active} [{env.n_min}-{env.n_max}]")
+        txt_n.set_text(f"Buoys: {n_active} [{env.n_min}-{env.n_max}]")
         txt_r.set_text(f"R_cum = {cum_r:+.3f}")
 
         return (sc_inactive, sc_active1, sc_inactive2, sc_active2,
@@ -1692,14 +1691,14 @@ def save_rl_gif(env, policy, args, n_frames=80):
 # =============================================================================
 
 def parse_args():
-    p = argparse.ArgumentParser(description="Brique 3 — RL pour OED")
+    p = argparse.ArgumentParser(description="Brick 3 - RL for OED")
     p.add_argument("--train",        action="store_true", help="Lancer PPO")
     p.add_argument("--pareto",       action="store_true", help="Front info / N")
     p.add_argument("--multiobj",     action="store_true",
-                   help="Front bi-objectif information / cout operationnel")
-    p.add_argument("--gif",          action="store_true", help="Genere le GIF")
+                   help="Bi-objective front, information / operating cost")
+    p.add_argument("--gif",          action="store_true", help="Generate the GIF")
     p.add_argument("--report",       action="store_true",
-                   help="Produit un rapport .txt avec les métriques clés")
+                   help="Write a .txt report with the key metrics")
     p.add_argument("--seed_ocean",   type=int, default=42)
     p.add_argument("--seed_buoys",   type=int, default=7)
     p.add_argument("--checkpoint",   type=str, default="outputs/rl_best.pt")
@@ -1713,23 +1712,23 @@ def parse_args():
     p.add_argument("--n_max",        type=int, default=40)
     p.add_argument("--episode_len",  type=int, default=20)
     p.add_argument("--nt",           type=int, default=NT,
-                   help="Longueur du nature run (jours)")
+                   help="Nature run length in days")
     p.add_argument("--info_mode",    type=str, default="evf",
                    choices=["evf", "coverage", "legacy"],
-                   help="evf = variance expliquee (BLUE sur les EOF du nature "
-                        "run) | coverage = couverture geometrique (plus rapide)")
+                   help="evf = explained variance (BLUE on the nature run "
+                        "covariance) | coverage = geometric coverage (faster)")
     p.add_argument("--min_sep",      type=int, default=MIN_SEP_CELLS,
-                   help="Separation mini entre bouees, en cases de la grille "
-                        "candidate (2 = pas de cases adjacentes)")
+                   help="Minimum separation between buoys, in candidate grid "
+                        "cells (2 = no adjacent cells)")
     p.add_argument("--evf_shrink",   type=float, default=EVF_SHRINKAGE,
-                   help="Contraction vers la covariance parametrique (0..1)")
+                   help="Shrinkage towards the parametric covariance (0..1)")
     p.add_argument("--evf_cv",       type=int, default=0,
                    help="1 = score EVF valide hors echantillon (2 moities "
-                        "temporelles) : moins optimiste, un peu plus bruite")
+                        "halves): less optimistic, slightly noisier")
     p.add_argument("--n_random",     type=int, default=25,
-                   help="Tirages aleatoires par N pour le nuage de Pareto")
+                   help="Random draws per N for the Pareto cloud")
     p.add_argument("--influence_km", type=float, default=INFLUENCE_RADIUS_KM,
-                   help="Rayon d influence d un capteur (km)")
+                   help="Influence radius of one sensor (km)")
     p.add_argument("--w_info",       type=float, default=1.0)
     p.add_argument("--w_budget",     type=float, default=0.5)
     p.add_argument("--gif_frames",   type=int, default=80)
@@ -1745,11 +1744,11 @@ if __name__ == "__main__":
               "[--gif] [--report]")
         sys.exit(0)
 
-    print(f"\n[1/2] Generation du nature run (seed_ocean={args.seed_ocean})...")
+    print(f"\n[1/2] Generating the nature run (seed_ocean={args.seed_ocean})...")
     gen = SyntheticOceanGenerator()
     T, S = gen.generate_dataset(nt=args.nt, seed=args.seed_ocean)
 
-    print("[2/2] Initialisation de l environnement MDP...")
+    print("[2/2] Initialising the MDP environment...")
     if args.nt < 365:
         print(f"  [ATTENTION] nt={args.nt} < 365 : cycle saisonnier "
               f"incomplet, statistiques biaisees.")
@@ -1763,10 +1762,10 @@ if __name__ == "__main__":
         info_mode=args.info_mode, influence_km=args.influence_km,
         evf_cv=bool(args.evf_cv), min_sep=args.min_sep)
     print(f"  K = {env.K} positions candidates ({args.grid_x}x{args.grid_y})")
-    print(f"  Budget bouees : [{env.n_min}, {env.n_max}]")
+    print(f"  Buoy budget   : [{env.n_min}, {env.n_max}]")
     print(f"  Separation    : >= {env.min_sep} case(s) "
-          f"({'8-voisinage' if MIN_SEP_DIAGONAL else '4-voisinage'}) "
-          f"-> maximum faisable = {env.n_feasible_max} bouees")
+          f"({'8-neighbourhood' if MIN_SEP_DIAGONAL else '4-neighbourhood'}) "
+          f"-> feasible maximum = {env.n_feasible_max} buoys")
     print(f"  Score info    : {env.info_mode} | rayon d influence "
           f"{args.influence_km:.0f} km ({env.influence_px:.1f} px)")
 
@@ -1776,7 +1775,7 @@ if __name__ == "__main__":
         ckpt = torch.load(Path(args.output_dir) / "rl_best.pt",
                           map_location=DEVICE, weights_only=False)
         visualize_final_config(env, ckpt["active_mask"], args)
-        print("\n  Generation automatique du GIF post-entrainement...")
+        print("\n  Automatic post-training GIF...")
         save_rl_gif(env, policy, args, n_frames=args.gif_frames)
 
     if args.pareto:
@@ -1813,14 +1812,14 @@ if __name__ == "__main__":
             env, policy, args, n_random=max(5, args.n_random // 2))
 
     if args.gif:
-        print("\n  Generation du GIF de progression RL...")
+        print("\n  Generating the RL progression GIF...")
         if policy is None:
             policy = ActorCritic(env.obs_dim, env.K).to(DEVICE)
             ckpt_path = Path(args.output_dir) / "rl_best.pt"
             if ckpt_path.exists():
                 ckpt = torch.load(ckpt_path, map_location=DEVICE, weights_only=False)
                 policy.load_state_dict(ckpt["policy_state"])
-                print(f"  Politique chargee depuis {ckpt_path}")
+                print(f"  Policy loaded from {ckpt_path}")
         save_rl_gif(env, policy, args, n_frames=args.gif_frames)
 
     if args.report:
@@ -1833,14 +1832,14 @@ if __name__ == "__main__":
             perte_pct = (i_s - i_l) / (i_s + 1e-9) * 100
         lines = [
             "=" * 68,
-            "  Brique 3 — RL — Rapport",
-            f"  Généré le : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+            "  Brick 3 - RL - Report",
+            f"  Generated on : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
             "=" * 68, "",
-            "── REPRODUCTIBILITÉ ─────────────────────────────────────────────────",
+            "-- REPRODUCIBILITY --------------------------------------------------",
             f"  seed_ocean    : {args.seed_ocean}",
             f"  seed_buoys    : {args.seed_buoys}",
             "",
-            "── PARAMÈTRES RL ────────────────────────────────────────────────────",
+            "-- RL PARAMETERS ----------------------------------------------------",
             f"  rl_steps      : {args.rl_steps}",
             f"  grid          : {args.grid_x}×{args.grid_y}  ({env.K} candidats)",
             f"  n_min / n_max : {args.n_min} / {args.n_max}",
@@ -1849,31 +1848,31 @@ if __name__ == "__main__":
         if pareto_data:
             lines += [
                 "",
-                "── RÉSULTATS PARETO ─────────────────────────────────────────────────",
-                f"  N★ (coude)              : {pareto_data['n_star']} capteurs",
-                f"  Score info N★           : {pareto_data['info_star']:.3f}",
+                "-- PARETO RESULTS ---------------------------------------------------",
+                f"  N* (elbow)              : {pareto_data['n_star']} sensors",
+                f"  Info score at N*        : {pareto_data['info_star']:.3f}",
                 f"  Score info maximum      : {pareto_data['info_max']:.3f}",
-                f"  Config légère N         : {pareto_data['n_light']} capteurs",
-                f"  Score info légère       : {pareto_data['info_light']:.3f}",
-                f"  Perte info dense→légère : {perte_pct:.1f} %",
+                f"  Light config N          : {pareto_data['n_light']} sensors",
+                f"  Light info score        : {pareto_data['info_light']:.3f}",
+                f"  Info loss dense->light  : {perte_pct:.1f} %",
                 f"  Configs Pareto-optimales: {pareto_data['n_pareto_opt']}",
             ]
         if multiobj_data.get("recommandations"):
-            lines += ["", "── RÉSEAUX OPTIMAUX SOUS BUDGET ─────────────────────────────────────",
-                      f"  {'budget':>9} | {'N':>3} | {'info':>6} | {'coût':>8} | tCO2/an"]
+            lines += ["", "-- OPTIMAL NETWORKS UNDER BUDGET ------------------------------------",
+                      f"  {'budget':>9} | {'N':>3} | {'info':>6} | {'cost':>8} | tCO2/yr"]
             for r in multiobj_data["recommandations"]:
                 lines.append(f"  {r['budget_keur']:>7} k€ | {r['n_buoys']:>3d} | "
                              f"{r['info']:>6.3f} | {r['cost_keur']:>6.0f} k€ | "
                              f"{r['co2_t']:>7.1f}")
-            lines.append(f"  Configurations non dominées : "
+            lines.append(f"  Non-dominated configurations: "
                          f"{int(multiobj_data['front_mask'].sum())}")
         lines += ["", "── FICHIERS PRODUITS ────────────────────────────────────────────────"]
         for f in sorted(out.iterdir()):
             if f.suffix in {".pt", ".png", ".gif"}:
                 lines.append(f"  {f.name:<44} {f.stat().st_size//1024:>5} KB")
         lines += ["", "=" * 68]
-        rpt = out / f"rapport_rl_{ts}.txt"
+        rpt = out / f"report_rl_{ts}.txt"
         rpt.write_text("\n".join(lines), encoding="utf-8")
-        print(f"\n  Rapport RL → {rpt}")
+        print(f"\n  RL report -> {rpt}")
 
-    print("\n  Brique 3 terminee.")
+    print("\n  Brick 3 done.")

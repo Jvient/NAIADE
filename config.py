@@ -27,6 +27,34 @@ TS_CORRELATION = 0.7
 N_BUOYS = 30
 OBS_NOISE_STD = 0.05
 
+# =============================================================================
+#  Contrainte de séparation minimale entre bouées
+# =============================================================================
+# Exprimée en KILOMÈTRES (et non en cellules de grille comme sur main) : la
+# grille candidate de glo12 est filtrée par le masque océan, donc l'indice
+# candidat ne mappe plus sur (gx, gy) ; et en GLORYS la taille physique d'une
+# cellule dépend de la latitude.
+#
+# ATTENTION au calage : la contrainte n'a d'effet que si MIN_BUOY_SEP_KM est
+# SUPÉRIEUR au pas de la grille candidate.
+#   synthétique 160x240 px, DX=5 km, grille 16x24  ->  pas = 50 km
+#   GLORYS 1/12° boîte PIRATA,       grille 16x24  ->  pas ~ 200-250 km
+# Une valeur inférieure au pas de grille génère ZÉRO conflit.
+# Référence physique : échelle de décorrélation du champ (~90 km sur le nature
+# run synthétique ; à rediagnostiquer sur GLORYS, plus grande en Atlantique
+# tropical).
+MIN_BUOY_SEP_KM = 90.0
+
+# False désactive complètement la contrainte (comportement historique glo12)
+MIN_SEP_ENABLED = True
+
+# Pas de grille du nature run synthétique, pour convertir pixels -> km.
+# En mode GLORYS ce paramètre est ignoré : on passe par la haversine sur
+# GlorysData.lat / .lon.
+DX_KM = 5.0
+
+R_EARTH_KM = 6371.0
+
 
 def set_global_seed(seed: int):
     """Fixe toutes les sources d'aléa pour la reproductibilité."""

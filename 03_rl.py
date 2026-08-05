@@ -320,6 +320,36 @@ except Exception:
 
 
 # =========================================================================
+#  GÉOMÉTRIE — distances physiques entre positions candidates
+# =========================================================================
+
+def pairwise_km(positions, geo=None, dx_km=DX_KM):
+    """Matrice (n, n) des distances en km entre positions pixel (i, j).
+
+    geo = GlorysData -> haversine vectorisée sur geo.lat / geo.lon.
+                        Convention GLORYS : axe 0 = latitude, axe 1 = longitude
+                        (cf. GlorysData.latlon_to_ij).
+    geo = None       -> grille plane régulière de pas dx_km (synthétique).
+
+    Vectorisé à dessein : GlorysData.distance_km() est correcte mais scalaire,
+    et K~350 candidats font ~120k paires — inutilisable en boucle Python.
+    """
+    P = np.asarray(positions, dtype=np.float64)
+    if len(P) == 0:
+        return np.zeros((0, 0))
+    if geo is None:
+        d = P[:, None, :] - P[None, :, :]
+        return np.sqrt((d ** 2).sum(-1)) * dx_km
+
+    la = np.radians(np.asarray(geo.lat)[P[:, 0].astype(int)])
+    lo = np.radians(np.asarray(geo.lon)[P[:, 1].astype(int)])
+    dla, dlo = la[:, None] - la[None, :], lo[:, None] - lo[None, :]
+    a = (np.sin(dla / 2) ** 2
+         + np.cos(la)[:, None] * np.cos(la)[None, :] * np.sin(dlo / 2) ** 2)
+    return 2 * R_EARTH_KM * np.arcsin(np.sqrt(np.clip(a, 0.0, 1.0)))
+
+
+# =========================================================================
 #  ENVIRONNEMENT MDP
 # =========================================================================
 
@@ -336,7 +366,8 @@ class OceanNetworkEnv:
                  ocean_mask=None,
                  reward_mode="heuristic", reward_model=None,
                  sage_scale=0.3, w_terminal=5.0,
-                 fixed_positions=None, init_mode="auto", mdp="toggle"):
+                 fixed_positions=None, init_mode="auto", mdp="toggle",
+                 min_sep_km=MIN_BUOY_SEP_KM, geo=None):
         self.T = T.astype(np.float32)
         self.S = S.astype(np.float32)
         self.grid_x, self.grid_y = grid_x, grid_y
@@ -408,11 +439,147 @@ class OceanNetworkEnv:
                 print(f"  Candidats dédupliqués vs stations fixes : "
                       f"{self.K}/{n0}")
 
+        # ── Séparation minimale entre bouées ─────────────────────────────────
+        self.geo = geo
+        self.min_sep_km = float(min_sep_km) if MIN_SEP_ENABLED else 0.0
+
+        # Un candidat trop proche d'une station IMPOSÉE est définitivement
+        # inachetable : on le sort de l'espace d'action plutôt que de le
+        # masquer à chaque pas (K plus petit = exploration plus efficace).
+        if self.fixed_positions and self.min_sep_km > 0:
+            D = pairwise_km(self.candidate_positions + self.fixed_positions,
+                            self.geo)
+            nf = len(self.fixed_positions)
+            blocked = (D[:-nf, -nf:] < self.min_sep_km).any(axis=1)
+            n0 = len(self.candidate_positions)
+            self.candidate_positions = [
+                p for p, b in zip(self.candidate_positions, blocked) if not b]
+            self.K = len(self.candidate_positions)
+            if self.K < n0:
+                print(f"  Séparation {self.min_sep_km:.0f} km : {n0 - self.K} "
+                      f"candidats retirés (trop près d'une station imposée) "
+                      f"-> K={self.K}")
+            if self.K < max(2, self.n_min):
+                raise ValueError(
+                    f"Espace d'action vide après contrainte de séparation "
+                    f"({self.min_sep_km:.0f} km) : réduire --min_sep_km ou "
+                    f"augmenter --grid_x / --grid_y")
+
+        self._build_conflict_matrix()
         self._precompute_field_stats()
         self.active_mask = None
         self.step_count = 0
         self.obs_dim = self.K + len(self.field_stats) \
             + (1 if self.mdp == "additive" else 0)
+
+    # ---------------------------------------------------------------------
+    #  Contrainte de séparation minimale
+    # ---------------------------------------------------------------------
+    def _build_conflict_matrix(self):
+        """_conflict[i, j] = True si les candidats i et j sont trop proches
+        pour être actifs simultanément (distance physique < min_sep_km)."""
+        if self.min_sep_km <= 0:
+            self._conflict = np.zeros((self.K, self.K), dtype=bool)
+            self.n_feasible_max = self.K
+            return
+
+        D = pairwise_km(self.candidate_positions, self.geo)
+        self._conflict = D < self.min_sep_km
+        np.fill_diagonal(self._conflict, False)
+
+        # Plafond de faisabilité : pas de formule fermée ici (grille irrégulière
+        # après masque océan), on l'estime par packing glouton.
+        self.n_feasible_max = self._estimate_packing()
+        n_conf = int(self._conflict.sum() // 2)
+        print(f"  Séparation minimale : {self.min_sep_km:.0f} km | "
+              f"{n_conf} paires en conflit | packing max ~ "
+              f"{self.n_feasible_max} bouées")
+        if n_conf == 0:
+            print(f"  [ATTENTION] aucun conflit : min_sep_km est inférieur au "
+                  f"pas de la grille candidate, la contrainte est inopérante")
+        if self.n_max > self.n_feasible_max:
+            print(f"  [CONTRAINTE] n_max={self.n_max} > max faisable "
+                  f"({self.n_feasible_max}) -> clippé")
+            self.n_max = self.n_feasible_max
+        self.n_min = int(min(self.n_min, self.n_max))
+
+    def _estimate_packing(self, n_trials=12, seed=0):
+        """Borne inférieure du plus grand ensemble indépendant (problème
+        NP-difficile) : glouton par degré croissant + tirages aléatoires,
+        on garde le meilleur."""
+        rng = np.random.default_rng(seed)
+        orders = [np.argsort(self._conflict.sum(1))]
+        orders += [rng.permutation(self.K) for _ in range(n_trials)]
+        best = 0
+        for order in orders:
+            sel = []
+            for c in order:
+                if not sel or not self._conflict[c, sel].any():
+                    sel.append(int(c))
+            best = max(best, len(sel))
+        return best
+
+    def feasible_candidates(self, active_idx):
+        """Candidats activables sans violer la séparation."""
+        a = np.asarray(active_idx, dtype=int)
+        ok = np.ones(self.K, dtype=bool)
+        if len(a):
+            ok &= ~self._conflict[a].any(axis=0)
+            ok[a] = False
+        return np.where(ok)[0]
+
+    def is_feasible(self, active_idx):
+        a = np.asarray(active_idx, dtype=int)
+        if len(a) < 2:
+            return True
+        return not self._conflict[np.ix_(a, a)].any()
+
+    def sample_feasible(self, n, rng=None):
+        """Tirage de n candidats respectant la séparation (insertion gloutonne
+        randomisée). Si n dépasse le plafond, renvoie le plus grand ensemble
+        faisable trouvé."""
+        if rng is None or not hasattr(rng, "integers"):
+            rng = np.random.default_rng()
+        n = int(min(n, self.n_feasible_max))
+        if n <= 0:
+            return np.array([], dtype=int)
+        best = np.array([], dtype=int)
+        for _ in range(30):
+            sel = []
+            for c in rng.permutation(self.K):
+                if len(sel) >= n:
+                    break
+                if not sel or not self._conflict[c, sel].any():
+                    sel.append(int(c))
+            if len(sel) >= n:
+                return np.array(sel[:n], dtype=int)
+            if len(sel) > len(best):
+                best = np.array(sel, dtype=int)
+        # repli : glouton par degré croissant, atteint le packing max estimé
+        sel = []
+        for c in np.argsort(self._conflict.sum(1)):
+            if not sel or not self._conflict[c, sel].any():
+                sel.append(int(c))
+        sel = np.array(sel, dtype=int)
+        if len(sel) >= n:
+            return np.array(sorted(rng.choice(sel, n, replace=False)),
+                            dtype=int)
+        return sel if len(sel) > len(best) else best
+
+    def invalid_action_mask(self, active=None):
+        """Masque (K,) ou (B, K) des actions interdites : activer un candidat
+        en conflit avec une bouée déjà posée. Désactiver reste TOUJOURS permis.
+
+        Fonction déterministe du masque actif -> recalculable depuis l'obs
+        stockée dans le buffer PPO, donc identique au rollout et à l'update
+        (ratio PPO exact, pas de biais)."""
+        a = self.active_mask if active is None else np.asarray(active)
+        single = (a.ndim == 1)
+        A = a.reshape(1, -1) if single else a
+        act = (A > 0.5)
+        conflicts = act.astype(np.float32) @ self._conflict.astype(np.float32)
+        invalid = (conflicts > 0) & ~act
+        return invalid[0] if single else invalid
 
     def _precompute_field_stats(self):
         stats = []
@@ -438,8 +605,10 @@ class OceanNetworkEnv:
         self.active_mask = np.zeros(self.K, dtype=np.float32)
         if self.init_mode == "random":
             n_init = np.random.randint(self.n_min, self.n_max + 1)
-            self.active_mask[np.random.choice(self.K, n_init,
-                                              replace=False)] = 1.0
+            # sample_feasible remplace le tirage uniforme : un réseau initial
+            # infaisable rendrait la quasi-totalité des actions illégales dès
+            # le premier pas de l'épisode.
+            self.active_mask[self.sample_feasible(n_init)] = 1.0
         # init_mode "empty" : la politique construit ses ajouts de zéro
         if self.mdp == "additive":
             self.active_mask[:] = 0.0          # additif : toujours de zéro
@@ -547,6 +716,20 @@ class OceanNetworkEnv:
 
     def step(self, action):
         assert 0 <= action < self.K
+        # Garde-fou : la politique PPO est déjà empêchée par le masquage des
+        # logits. Ce test protège les appels HORS PPO (rollouts manuels,
+        # baselines, chargement d'un checkpoint entraîné sans contrainte).
+        if self.min_sep_km > 0 and self.active_mask[action] <= 0.5:
+            act = np.where(self.active_mask > 0.5)[0]
+            if len(act) and self._conflict[action, act].any():
+                self.step_count += 1
+                done = (self.step_count >= (4 * self.n_max
+                                            if self.mdp == "additive"
+                                            else self.ep_len))
+                return self._get_obs(), -0.25, done, {
+                    "n_active": int(self.active_mask.sum()),
+                    "total_info": float("nan"), "delta_info": 0.0,
+                    "infaisable": True}
         if self.mdp == "additive":
             return self._step_additive(action)
         was_active = self.active_mask[action] > 0.5
@@ -621,8 +804,10 @@ class OceanNetworkEnv:
 
 
 def _baseline_random(env, n, rng, fixed=None):
-    """n ajouts aléatoires (les stations fixes ne comptent pas dans n)."""
-    idx = rng.choice(env.K, n, replace=False)
+    """n ajouts aléatoires (les stations fixes ne comptent pas dans n).
+    Respecte la séparation minimale : sinon la comparaison opposerait un RL
+    contraint à une baseline libre, ce qui biaise le verdict."""
+    idx = env.sample_feasible(n, rng)
     return [env.candidate_positions[i] for i in idx]
 
 
@@ -639,7 +824,13 @@ def _baseline_maximin(env, n, rng, fixed=None):
         chosen = [int(rng.integers(0, env.K))]
         d = np.linalg.norm(pos - pos[chosen[0]], axis=1)
     while len(chosen) < n:
-        k = int(d.argmax())
+        # Restriction aux candidats faisables (séparation minimale).
+        ok = np.zeros(env.K, dtype=bool)
+        ok[env.feasible_candidates(chosen)] = True
+        if not ok.any():
+            break
+        dd = np.where(ok, d, -np.inf)
+        k = int(dd.argmax())
         chosen.append(k)
         d = np.minimum(d, np.linalg.norm(pos - pos[k], axis=1))
     return [env.candidate_positions[i] for i in chosen[:n]]
@@ -657,6 +848,12 @@ def _baseline_greedy_variance(env, n, fixed=None):
         for k in order:
             if len(chosen) >= n:
                 break
+            if int(k) in chosen:
+                continue
+            # Séparation minimale : contrainte DURE, elle ne se relâche pas
+            # quand on descend dans le barème d_min -> d_min/2 -> 0.
+            if chosen and env._conflict[int(k), chosen].any():
+                continue
             far_chosen = all(np.linalg.norm(pos[k] - pos[c]) > dm
                              for c in chosen)
             far_fixed = all(np.linalg.norm(pos[k] - f) > dm for f in fx)
@@ -678,8 +875,17 @@ def _baseline_greedy_sage(env, rm, n, cand_stride=1, verbose=True, fixed=None):
     if len(fixed) < 2:
         chosen = _baseline_greedy_variance(env, min(2 - len(fixed), n),
                                            fixed=fixed)
-    cand = list(range(0, env.K, cand_stride))
+    pos2idx = {p: i for i, p in enumerate(env.candidate_positions)}
     for i in range(len(chosen), n):
+        # Le vivier de candidats est recalculé à chaque ajout : la séparation
+        # minimale dépend du réseau courant.
+        chosen_idx = [pos2idx[p] for p in chosen if p in pos2idx]
+        cand = env.feasible_candidates(chosen_idx)[::cand_stride]
+        if len(cand) == 0:
+            print(f"    greedy-SAGE : plus de candidat faisable à "
+                  f"{len(chosen)} ajouts (séparation "
+                  f"{env.min_sep_km:.0f} km)")
+            break
         best_k, best_s = None, -np.inf
         for k in cand:
             p = env.candidate_positions[k]
@@ -688,6 +894,8 @@ def _baseline_greedy_sage(env, rm, n, cand_stride=1, verbose=True, fixed=None):
             s = rm.sage_score(p, fixed + chosen)
             if s > best_s:
                 best_k, best_s = k, s
+        if best_k is None:
+            break
         chosen.append(env.candidate_positions[best_k])
         if verbose and ((i + 1) % 10 == 0 or i == n - 1):
             print(f"    greedy-SAGE : {i + 1}/{n} ajouts "
@@ -1142,7 +1350,7 @@ def plot_synthesis(args, env, rm, policies):
 # =========================================================================
 
 class ActorCritic(nn.Module):
-    def __init__(self, obs_dim, n_actions, hidden=256):
+    def __init__(self, obs_dim, n_actions, hidden=256, conflict=None):
         super().__init__()
         self.trunk = nn.Sequential(
             nn.Linear(obs_dim, hidden), nn.LayerNorm(hidden), nn.GELU(),
@@ -1155,18 +1363,41 @@ class ActorCritic(nn.Module):
                 nn.init.zeros_(m.bias)
         nn.init.orthogonal_(self.actor.weight, gain=0.01)
 
+        # Matrice de conflit en buffer : la séparation minimale devient une
+        # fonction de la seule obs, comme forbid_active. Sauvegardée avec le
+        # state_dict -> un checkpoint reste rejouable à l'identique.
+        if conflict is None:
+            conflict = np.zeros((n_actions, n_actions), dtype=bool)
+        self.register_buffer("conflict",
+                             torch.as_tensor(np.asarray(conflict),
+                                             dtype=torch.bool))
+
     def forward(self, x):
         h = self.trunk(x)
         return self.actor(h), self.critic(h).squeeze(-1)
 
     def masked_logits(self, obs, forbid_active=False):
-        """MDP additif : les candidats déjà actifs sont interdits. Le masque
-        se dérive de l'obs (obs[..., :K] = active_mask) : identique à
-        l'échantillonnage et à l'update PPO — pas de biais de ratio."""
+        """Deux masques cumulés, tous deux dérivés de l'obs
+        (obs[..., :K] = active_mask) : identiques à l'échantillonnage et à
+        l'update PPO — pas de biais de ratio.
+          1. MDP additif : les candidats déjà actifs sont interdits.
+          2. Séparation minimale : un candidat en conflit avec une bouée déjà
+             posée est interdit. Le DÉSACTIVER reste permis (MDP toggle).
+        """
         logits, value = self(obs)
+        K = logits.shape[-1]
+        active = obs[..., :K] > 0.5
+        invalid = torch.zeros_like(active)
         if forbid_active:
-            K = logits.shape[-1]
-            logits = logits.masked_fill(obs[..., :K] > 0.5, -1e9)
+            invalid = invalid | active
+        if bool(self.conflict.any()):
+            conf = active.float() @ self.conflict.float()
+            invalid = invalid | ((conf > 0) & ~active)
+        # Filet de sécurité : une ligne entièrement masquée produit des NaN
+        # dans Categorical. Ne devrait pas arriver (n_max <= n_feasible_max),
+        # mais un checkpoint rechargé avec d'autres n_min/n_max le pourrait.
+        invalid = invalid & ~invalid.all(dim=-1, keepdim=True)
+        logits = logits.masked_fill(invalid, -1e9)
         return logits, value
 
     def get_action(self, obs, deterministic=False, forbid_active=False):
@@ -1217,7 +1448,7 @@ def train_ppo(args, env, label=""):
     prefix = f" [{label}]" if label else ""
     print(f"  PPO{prefix} : {args.rl_steps} steps")
 
-    policy = ActorCritic(env.obs_dim, env.K).to(DEVICE)
+    policy = ActorCritic(env.obs_dim, env.K, conflict=env._conflict).to(DEVICE)
     optim = torch.optim.Adam(policy.parameters(), lr=args.lr, eps=1e-5)
     buf = RolloutBuffer(args.buffer_size, env.obs_dim)
     clip_eps, vf_c, ent_c, n_ep, mb = 0.2, 0.5, 0.01, 4, 64
@@ -1474,7 +1705,10 @@ def compute_scalarized(env_T, env_S, policy_std, args):
                                    sage_scale=getattr(args, "sage_scale", 0.3),
                                    w_terminal=getattr(args, "w_terminal", 5.0),
                                    fixed_positions=getattr(args, "_fixed", None),
-                                   init_mode=getattr(args, "init", "auto"))
+                                   init_mode=getattr(args, "init", "auto"),
+                                   min_sep_km=getattr(args, "min_sep_km",
+                                                      MIN_BUOY_SEP_KM),
+                                   geo=GLORYS)
         args_lam = argparse.Namespace(**vars(args)); args_lam.rl_steps = steps_lam
         pol_lam, _ = train_ppo(args_lam, env_lam, label=f"lam={lam}")
         idx, info = _run_policy_config(env_lam, pol_lam, env_lam.n_max)
@@ -1705,6 +1939,10 @@ def parse_args():
     p.add_argument("--n_min", type=int, default=10)
     p.add_argument("--n_max", type=int, default=40)
     p.add_argument("--episode_len", type=int, default=20)
+    p.add_argument("--min_sep_km", type=float, default=MIN_BUOY_SEP_KM,
+                   help="Séparation minimale entre bouées, en km. 0 désactive. "
+                        "Sans effet si inférieure au pas de la grille "
+                        "candidate (synthétique 16x24 : 50 km).")
     p.add_argument("--w_info", type=float, default=1.0)
     p.add_argument("--w_budget", type=float, default=0.5)
     p.add_argument("--gif_frames", type=int, default=80)
@@ -1822,7 +2060,8 @@ if __name__ == "__main__":
                           reward_mode=args.reward, reward_model=rm,
                           sage_scale=args.sage_scale,
                           w_terminal=args.w_terminal, mdp=args.mdp,
-                          fixed_positions=fixed_positions, init_mode=args.init)
+                          fixed_positions=fixed_positions, init_mode=args.init,
+                          min_sep_km=args.min_sep_km, geo=GLORYS)
     args._rm = rm
     if args.reward != "heuristic":
         print(f"  Reward couplée : mode '{args.reward}'"
@@ -1850,14 +2089,14 @@ if __name__ == "__main__":
         save_rl_gif(env, policy, args, n_frames=args.gif_frames)
     if args.evaluate:
         if policy is None:
-            policy = ActorCritic(env.obs_dim, env.K).to(DEVICE)
+            policy = ActorCritic(env.obs_dim, env.K, conflict=env._conflict).to(DEVICE)
             cp = Path(args.output_dir)/"rl_best.pt"
             if cp.exists():
                 policy.load_state_dict(torch.load(cp, map_location=DEVICE, weights_only=False)["policy_state"])
         pts, n_star = run_rl_method(env, policy, args)
         visualize_two_configs(env, n_star, policy, args)
     if args.gif and policy is None:
-        policy = ActorCritic(env.obs_dim, env.K).to(DEVICE)
+        policy = ActorCritic(env.obs_dim, env.K, conflict=env._conflict).to(DEVICE)
         cp = Path(args.output_dir)/"rl_best.pt"
         if cp.exists():
             policy.load_state_dict(torch.load(cp, map_location=DEVICE, weights_only=False)["policy_state"])
@@ -1870,7 +2109,7 @@ if __name__ == "__main__":
                   [Path(args.output_dir) / "rl_best.pt"]
             for cp in cps:
                 if cp.exists():
-                    pol = ActorCritic(env.obs_dim, env.K).to(DEVICE)
+                    pol = ActorCritic(env.obs_dim, env.K, conflict=env._conflict).to(DEVICE)
                     pol.load_state_dict(torch.load(
                         cp, map_location=DEVICE,
                         weights_only=False)["policy_state"])

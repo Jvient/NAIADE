@@ -185,24 +185,64 @@ def preprocess(nc_path=DEFAULT_NC, cache_dir=DEFAULT_CACHE,
     print(f"  Variables : {keep}  |  {len(times)} jours "
           f"({years.min()}–{years.max()})  |  grille {len(lat)}x{len(lon)}")
 
-    meta = {
-        "source": str(nc_path),
-        "variables": keep,
-        "splits": {k: list(v) for k, v in splits.items()},
-        "detrend": bool(detrend),
-        "clim_window_days": CLIM_WINDOW,
-        "nlat": int(len(lat)), "nlon": int(len(lon)), "nt": int(len(times)),
-        "norm": {},
-    }
-
-    ocean_mask = None
+    fields = {}
     for key in keep:
         var = VAR_MAP[key]
         print(f"  [{key}] chargement de '{var}'...")
         da = ds[var]
         if "depth" in da.dims:                       # thetao/so : niveau 0.49 m
             da = da.isel(depth=0)
-        arr = da.transpose("time", lat_name, lon_name).values.astype(np.float32)
+        fields[key] = da.transpose("time", lat_name, lon_name
+                                   ).values.astype(np.float32)
+
+    times64 = ds["time"].values
+    ds.close()
+    return write_cache(fields, lat, lon, times64, years, doy_idx,
+                       cache_dir=cache, splits=splits, detrend=detrend,
+                       source=str(nc_path))
+
+
+def write_cache(fields, lat, lon, times64, years, doy_idx,
+                cache_dir=DEFAULT_CACHE, splits=None, detrend=False,
+                source="unknown"):
+    """Écrit le cache NAIADE à partir de champs bruts en mémoire.
+
+    Séparé de preprocess() pour que la fixture de test (make_fixture) emprunte
+    EXACTEMENT le même chemin de code : climatologie, détrend, stats de
+    normalisation, masque océan, format des .npy et de meta.json. Toute dérive
+    entre le cache réel et le cache de test devient ainsi impossible.
+
+    fields : dict {"T": (nt, nlat, nlon) float32, "S": ..., ...}
+             NaN sur les pixels terre — c'est ce qui définit le masque océan.
+    """
+    splits = splits or DEFAULT_SPLITS
+    cache = Path(cache_dir)
+    cache.mkdir(parents=True, exist_ok=True)
+
+    keep = list(fields)
+    missing = [v for v in REQUIRED_VARS if v not in keep]
+    if missing:
+        raise ValueError(f"Variables obligatoires absentes : {missing}")
+
+    train_sel = (years >= splits["train"][0]) & (years <= splits["train"][1])
+    if not train_sel.any():
+        raise ValueError(f"Aucun pas de temps train dans {splits['train']} — "
+                         f"années disponibles : {years.min()}–{years.max()}")
+    nt = len(years)
+
+    meta = {
+        "source": source,
+        "variables": keep,
+        "splits": {k: list(v) for k, v in splits.items()},
+        "detrend": bool(detrend),
+        "clim_window_days": CLIM_WINDOW,
+        "nlat": int(len(lat)), "nlon": int(len(lon)), "nt": int(nt),
+        "norm": {},
+    }
+
+    ocean_mask = None
+    for key in keep:
+        arr = fields[key]
 
         # Masque océan : pixels finis sur toute la série, commun aux variables
         var_ocean = np.isfinite(arr).all(axis=0)
@@ -216,7 +256,7 @@ def preprocess(nc_path=DEFAULT_NC, cache_dir=DEFAULT_CACHE,
         anom = arr - clim[doy_idx]
 
         if detrend:
-            t_axis = np.arange(len(times), dtype=np.float32)
+            t_axis = np.arange(nt, dtype=np.float32)
             tc = t_axis - t_axis[train_sel].mean()
             num = np.tensordot(tc[train_sel], anom[train_sel], axes=(0, 0))
             den = float((tc[train_sel] ** 2).sum())
@@ -237,22 +277,192 @@ def preprocess(nc_path=DEFAULT_NC, cache_dir=DEFAULT_CACHE,
             dtype=np.float32, shape=anom.shape)
         mm[:] = anom
         mm.flush()
-        del arr, anom, mm
+        del anom, mm
 
     np.save(cache / "ocean_mask.npy", ocean_mask)
-    np.save(cache / "lat.npy", lat)
-    np.save(cache / "lon.npy", lon)
-    np.save(cache / "years.npy", years)
-    np.save(cache / "doy_idx.npy", doy_idx)
-    np.save(cache / "time.npy", ds["time"].values)  # datetime64
+    np.save(cache / "lat.npy", np.asarray(lat, dtype=np.float32))
+    np.save(cache / "lon.npy", np.asarray(lon, dtype=np.float32))
+    np.save(cache / "years.npy", np.asarray(years, dtype=np.int32))
+    np.save(cache / "doy_idx.npy", np.asarray(doy_idx, dtype=np.int32))
+    np.save(cache / "time.npy", times64)             # datetime64
 
     meta["ocean_fraction"] = float(ocean_mask.mean())
     with open(cache / "meta.json", "w") as f:
         json.dump(meta, f, indent=2)
-    ds.close()
 
     print(f"  Fraction océan : {100 * meta['ocean_fraction']:.1f} %")
     print(f"  Cache écrit -> {cache}/")
+    return meta
+
+
+# =============================================================================
+#  Fixture de test — cache GLORYS synthétique, sans NetCDF ni téléchargement
+# =============================================================================
+
+FIXTURE_CACHE = "data/glorys_fixture"
+
+FIXTURE_SPLITS = {"train": (2005, 2008), "val": (2009, 2009),
+                  "test": (2010, 2010)}
+
+
+def make_fixture(cache_dir=FIXTURE_CACHE, years=(2005, 2010),
+                 lat_range=(-8.0, 14.0), lon_range=(-40.0, -8.0),
+                 resolution=0.5, step_days=2, seed=0, splits=None):
+    """Écrit un cache au FORMAT GLORYS12 rempli de champs SYNTHÉTIQUES.
+
+    But : exercer en quelques secondes tout le code GLORYS-spécifique —
+    masque terre, haversine, latlon_to_ij, pirata_positions, splits par
+    années, climatologie journalière, stats de normalisation train-only —
+    sans compte Copernicus, sans NetCDF, sans les 40 Go de réanalyse.
+
+    ┌──────────────────────────────────────────────────────────────────┐
+    │ CE N'EST PAS UN JUMEAU PHYSIQUE DE L'ATLANTIQUE TROPICAL.        │
+    │ Les champs sont des blobs advectés + AR(1) : ils n'ont ni ondes  │
+    │ équatoriales, ni TIWs, ni upwelling, ni bilan de chaleur. Aucun  │
+    │ résultat scientifique ne doit être produit sur cette fixture.    │
+    │ Elle sert à répondre à « le code tourne-t-il ? », jamais à       │
+    │ « la réponse est-elle physiquement juste ? ».                    │
+    └──────────────────────────────────────────────────────────────────┘
+
+    Propriétés délibérément conservées du vrai domaine, parce que le code
+    testé en dépend :
+      - coordonnées réelles à cheval sur l'équateur (cos(lat) non trivial) ;
+      - un trait de côte, donc des pixels terre en NaN -> masque océan ;
+      - plusieurs mouillages PIRATA nominaux à l'intérieur de la boîte ;
+      - un cycle saisonnier marqué, pour que retirer la climatologie change
+        réellement le signal ;
+      - une décorrélation spatiale finie, pour que corrélations et EVF ne
+        soient pas dégénérées.
+    """
+    import pandas as pd
+
+    splits = splits or FIXTURE_SPLITS
+    rng = np.random.default_rng(seed)
+
+    lat = np.arange(lat_range[0], lat_range[1], resolution, dtype=np.float32)
+    lon = np.arange(lon_range[0], lon_range[1], resolution, dtype=np.float32)
+    nlat, nlon = len(lat), len(lon)
+
+    times = pd.date_range(f"{years[0]}-01-01", f"{years[1]}-12-31",
+                          freq=f"{step_days}D")
+    nt = len(times)
+    yr = times.year.values.astype(np.int32)
+    doy = (times.dayofyear.values - 1).astype(np.int32)
+
+    print(f"  Fixture : grille {nlat}x{nlon} @ {resolution} deg "
+          f"({lat[0]:.1f}..{lat[-1]:.1f}N, {lon[0]:.1f}..{lon[-1]:.1f}E)")
+    print(f"            {nt} pas de temps ({years[0]}-{years[1]}, "
+          f"1 sur {step_days} jours)")
+
+    LA = lat[:, None] * np.ones((1, nlon), dtype=np.float32)
+    LO = np.ones((nlat, 1), dtype=np.float32) * lon[None, :]
+
+    # ── Trait de côte : Brésil au SO, Afrique de l'Ouest au NE ──────────────
+    # Approximation grossière mais calée pour que TOUS les mouillages PIRATA
+    # nominaux tombent en mer : sinon latlon_to_ij(require_ocean=True) les
+    # rabat silencieusement de plusieurs centaines de km et le scénario
+    # `--fixed pirata` teste une géométrie qui n'est pas celle qu'on croit.
+    land = (((LA < -2.5) & (LO < -35.0 - 1.0 * (LA + 2.5)))       # Brésil
+            | ((LA > 3.0) & (LO > -6.5 - 0.85 * (LA - 3.0))))      # Afrique
+    if land.mean() > 0.40 or land.mean() < 0.02:
+        print(f"  [ATTENTION] fraction terre = {100*land.mean():.0f} % — "
+              f"géométrie de côte peu réaliste, ajuster lat/lon_range")
+
+    # ── Climatologie : gradient méridien + cycle saisonnier + langue froide ──
+    doy_all = np.arange(366, dtype=np.float32)
+    phase = 2 * np.pi * (doy_all - 60.0) / 365.25
+    clim_T = (27.5 - 0.10 * np.abs(LA)[None] ** 1.6
+              + 1.8 * np.sin(phase)[:, None, None] * (1 + 0.05 * LA)[None]
+              - 1.2 * np.exp(-(LA / 2.5) ** 2)[None]
+              * np.clip(np.sin(phase - 1.0), 0, 1)[:, None, None])
+    clim_S = (35.6 - 0.6 * np.exp(-((LA - 6) / 4.0) ** 2)[None]
+              - 0.35 * np.cos(phase)[:, None, None])
+
+    # ── Anomalies : blobs advectés vers l'ouest + AR(1) lissé ───────────────
+    tt = np.arange(nt, dtype=np.float32)
+
+    def _blobs(n_blob, amp, radius_deg, drift):
+        """Blobs gaussiens advectés vers l'ouest. Vectorisé sur l'axe temps et
+        restreint à la fenêtre de vie de chaque blob : une boucle Python sur nt
+        coûtait une minute pour un cache de 30 Mo."""
+        out = np.zeros((nt, nlat, nlon), dtype=np.float32)
+        rlat, rlon = radius_deg, radius_deg * 1.6
+        for _ in range(n_blob):
+            la0 = rng.uniform(lat[0], lat[-1])
+            lo0 = rng.uniform(lon[0], lon[-1])
+            t0 = rng.uniform(0, nt)
+            life = rng.uniform(nt / 30, nt / 8)
+            a = amp * rng.normal()
+            env = np.exp(-((tt - t0) / life) ** 2)
+            k = np.where(env > 1e-3)[0]
+            if len(k) == 0:
+                continue
+            lo_t = (lo0 + drift * (tt[k] - t0)).astype(np.float32)
+            dlat2 = ((lat[None, :, None] - la0) / rlat) ** 2      # (1,nlat,1)
+            dlon2 = ((lon[None, None, :] - lo_t[:, None, None])
+                     / rlon) ** 2                                  # (k,1,nlon)
+            out[k] += (a * env[k, None, None]
+                       * np.exp(-(dlat2 + dlon2))).astype(np.float32)
+        return out
+
+    from scipy.ndimage import gaussian_filter
+
+    def _red_noise():
+        """Bruit rouge : AR(1) en temps + lissage spatial. Beaucoup moins cher
+        qu'un gaussian_filter 3D sur (nt, nlat, nlon)."""
+        w = rng.normal(size=(nt, nlat, nlon)).astype(np.float32)
+        w = gaussian_filter(w, sigma=(0.0, 2.0, 2.0))
+        rho = 0.85
+        for t in range(1, nt):
+            w[t] += rho * w[t - 1]
+        w /= w.std() + 1e-9
+        return w
+
+    noise = _red_noise()
+
+    anom_T = _blobs(40, 0.9, 2.2, -0.012) + 0.35 * noise
+    # S partiellement corrélée à T (compensation partielle, comme en vrai)
+    anom_S = (0.15 * anom_T
+              + 0.10 * _blobs(30, 0.9, 2.8, -0.008)
+              + 0.05 * _red_noise())
+
+    T = (clim_T[doy] + anom_T).astype(np.float32)
+    S = (clim_S[doy] + anom_S).astype(np.float32)
+    T[:, land] = np.nan          # la terre définit le masque océan
+    S[:, land] = np.nan
+
+    meta = write_cache({"T": T, "S": S}, lat, lon,
+                       times.values, yr, doy,
+                       cache_dir=cache_dir, splits=splits,
+                       source="FIXTURE SYNTHETIQUE — pas de donnees reelles")
+
+    # Trace explicite dans le cache : un run lancé par erreur sur la fixture
+    # doit être identifiable a posteriori dans meta.json.
+    meta["fixture"] = True
+    meta["warning"] = ("Cache de TEST genere par make_fixture(). Champs "
+                       "synthetiques sans validite physique. Ne jamais "
+                       "utiliser pour un resultat scientifique.")
+    with open(Path(cache_dir) / "meta.json", "w") as f:
+        json.dump(meta, f, indent=2)
+
+    d = GlorysData(cache_dir)
+    pir = d.pirata_positions()
+    print(f"  Mouillages PIRATA dans la boîte : {len(pir)} "
+          f"({', '.join(pir) if pir else 'aucun — élargir lon/lat_range'})")
+
+    # Contrôle : un mouillage tombé sur la terre est rabattu en silence par
+    # latlon_to_ij(require_ocean=True). On veut le savoir.
+    tol = 1.5 * resolution
+    for name, (i, j) in pir.items():
+        la_n, lo_n = PIRATA_NOMINAL[name]
+        la_g, lo_g = d.ij_to_latlon(i, j)
+        if abs(la_g - la_n) > tol or abs(lo_g - lo_n) > tol:
+            print(f"  [ATTENTION] {name} rabattu de "
+                  f"({la_n:+.1f},{lo_n:+.1f}) vers ({la_g:+.1f},{lo_g:+.1f}) "
+                  f"— il tombe sur la terre de la fixture, ajuster le "
+                  f"trait de côte")
+    size_mb = sum(f.stat().st_size for f in Path(cache_dir).glob("*")) / 1e6
+    print(f"  Taille du cache : {size_mb:.1f} Mo")
     return meta
 
 
@@ -596,6 +806,16 @@ def _parse_years(txt):
 if __name__ == "__main__":
     p = argparse.ArgumentParser(description="GLORYS12 -> NAIADE")
     p.add_argument("--preprocess", action="store_true")
+    p.add_argument("--make-fixture", dest="make_fixture", action="store_true",
+                   help="Génère un cache de TEST synthétique au format GLORYS "
+                        "(aucun téléchargement). Champs sans validité "
+                        "physique — pour tester le code, pas la science.")
+    p.add_argument("--fixture_cache", type=str, default=FIXTURE_CACHE)
+    p.add_argument("--fixture_step",  type=int, default=2,
+                   help="1 pas de temps tous les N jours (2 = cache ~20 Mo)")
+    p.add_argument("--fixture_res",   type=float, default=0.5,
+                   help="Résolution en degrés (0.5 par défaut ; le vrai "
+                        "GLORYS12 est à 1/12 deg)")
     p.add_argument("--info",       action="store_true")
     p.add_argument("--figures",    action="store_true")
     p.add_argument("--nc",     type=str, default=DEFAULT_NC)
@@ -608,9 +828,17 @@ if __name__ == "__main__":
     p.add_argument("--out", type=str, default="outputs/glorys_nature_run.png")
     args = p.parse_args()
 
-    if not any([args.preprocess, args.info, args.figures]):
+    if not any([args.preprocess, args.make_fixture, args.info, args.figures]):
         p.print_help()
         raise SystemExit(0)
+
+    if args.make_fixture:
+        make_fixture(cache_dir=args.fixture_cache,
+                     step_days=args.fixture_step,
+                     resolution=args.fixture_res)
+        if not (args.info or args.figures):
+            args.cache = args.fixture_cache
+            args.info = True
 
     if args.preprocess:
         splits = {"train": _parse_years(args.train_years),

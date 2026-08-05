@@ -55,6 +55,41 @@ DX_KM = 5.0
 
 R_EARTH_KM = 6371.0
 
+# =============================================================================
+#  Critère d'information EVF (Explained Variance Fraction)
+# =============================================================================
+# Échelle de décorrélation spatiale du champ, rayon d'influence d'un capteur.
+# 90 km = valeur diagnostiquée par main sur le nature run synthétique de
+# moyenne latitude. EN ATLANTIQUE TROPICAL CETTE VALEUR EST FAUSSE : le rayon
+# de déformation croît fortement vers l'équateur et les échelles zonales des
+# ondes équatoriales dépassent le millier de kilomètres.
+# -> à rediagnostiquer sur GLORYS (autocorrélation spatiale de l'anomalie)
+#    avant tout résultat quantitatif ; utiliser --influence_km en attendant.
+INFLUENCE_RADIUS_KM = 90.0
+
+# Shrinkage de la covariance empirique vers le modèle paramétrique
+# sigma_i sigma_j rho(d_ij/L) c_vw.  0 = covariance empirique pure,
+# 1 = modèle paramétrique pur.
+# Justification (mesurée par main) : avec un temps de décorrélation de ~12 j,
+# un an de nature run ne contient qu'une trentaine de réalisations
+# indépendantes pour 2n paramètres à estimer. La covariance d'échantillon
+# sur-apprend — la variance expliquée hors échantillon devient NÉGATIVE.
+EVF_SHRINKAGE = 0.9
+
+# Remet delta_EVF (typiquement 1e-3..1e-2) à une échelle comparable aux
+# pénalités de budget, sinon le budget domine la reward.
+RL_INFO_GAIN = 20.0
+
+# Sous-échantillonnage de la grille d'évaluation de l'EVF (1 cellule sur N
+# dans chaque direction). Compromis coût / résolution du critère.
+EVAL_STRIDE = 8
+
+# Bruit instrumental PAR VARIABLE, en unités physiques. Un OBS_NOISE_STD
+# unique n'a pas de sens : 0.05 représente ~2 % du signal en température et
+# ~25 % en salinité.
+OBS_NOISE_T = 0.05       # degC
+OBS_NOISE_S = 0.02       # psu
+
 
 def set_global_seed(seed: int):
     """Fixe toutes les sources d'aléa pour la reproductibilité."""

@@ -323,8 +323,12 @@ except Exception:
 #  GÉOMÉTRIE — distances physiques entre positions candidates
 # =========================================================================
 
-def pairwise_km(positions, geo=None, dx_km=DX_KM):
-    """Matrice (n, n) des distances en km entre positions pixel (i, j).
+def pairwise_km(positions, geo=None, dx_km=DX_KM, other=None):
+    """Matrice des distances en km entre positions pixel (i, j).
+
+    other=None -> matrice carrée (n, n) sur `positions`
+    other      -> matrice croisée (n, m) entre `positions` et `other`
+                  (noyau candidat -> cellule d'évaluation, pour l'EVF)
 
     geo = GlorysData -> haversine vectorisée sur geo.lat / geo.lon.
                         Convention GLORYS : axe 0 = latitude, axe 1 = longitude
@@ -335,18 +339,42 @@ def pairwise_km(positions, geo=None, dx_km=DX_KM):
     et K~350 candidats font ~120k paires — inutilisable en boucle Python.
     """
     P = np.asarray(positions, dtype=np.float64)
-    if len(P) == 0:
-        return np.zeros((0, 0))
+    Q = P if other is None else np.asarray(other, dtype=np.float64)
+    if len(P) == 0 or len(Q) == 0:
+        return np.zeros((len(P), len(Q)))
     if geo is None:
-        d = P[:, None, :] - P[None, :, :]
+        d = P[:, None, :] - Q[None, :, :]
         return np.sqrt((d ** 2).sum(-1)) * dx_km
 
-    la = np.radians(np.asarray(geo.lat)[P[:, 0].astype(int)])
-    lo = np.radians(np.asarray(geo.lon)[P[:, 1].astype(int)])
-    dla, dlo = la[:, None] - la[None, :], lo[:, None] - lo[None, :]
+    lat_a, lon_a = np.asarray(geo.lat), np.asarray(geo.lon)
+    la1 = np.radians(lat_a[P[:, 0].astype(int)])
+    lo1 = np.radians(lon_a[P[:, 1].astype(int)])
+    la2 = np.radians(lat_a[Q[:, 0].astype(int)])
+    lo2 = np.radians(lon_a[Q[:, 1].astype(int)])
+    dla, dlo = la1[:, None] - la2[None, :], lo1[:, None] - lo2[None, :]
     a = (np.sin(dla / 2) ** 2
-         + np.cos(la)[:, None] * np.cos(la)[None, :] * np.sin(dlo / 2) ** 2)
+         + np.cos(la1)[:, None] * np.cos(la2)[None, :] * np.sin(dlo / 2) ** 2)
     return 2 * R_EARTH_KM * np.arcsin(np.sqrt(np.clip(a, 0.0, 1.0)))
+
+
+def mesoscale_anomaly(F, ocean=None):
+    """Retire à chaque pas de temps la moyenne spatiale du domaine.
+
+    Le mode grande échelle est quasi uniforme : le garder corrèle tous les
+    capteurs entre eux quelle que soit leur distance, et l'EVF devient plat
+    en N. En mode GLORYS les champs sont déjà des anomalies climatologiques,
+    mais la moyenne de boîte résiduelle (ENSO, dérive) reste un mode global.
+
+    ocean : masque (nlat, nlon) — la moyenne est prise sur la mer seulement,
+            sinon les zéros de la terre la biaisent vers 0.
+    """
+    F = np.asarray(F, dtype=np.float32)
+    if ocean is None:
+        m = F.reshape(len(F), -1).mean(axis=1)
+    else:
+        w = np.asarray(ocean, dtype=np.float32)
+        m = (F * w[None]).reshape(len(F), -1).sum(1) / (w.sum() + 1e-9)
+    return F - m[:, None, None]
 
 
 # =========================================================================
@@ -367,7 +395,11 @@ class OceanNetworkEnv:
                  reward_mode="heuristic", reward_model=None,
                  sage_scale=0.3, w_terminal=5.0,
                  fixed_positions=None, init_mode="auto", mdp="toggle",
-                 min_sep_km=MIN_BUOY_SEP_KM, geo=None):
+                 min_sep_km=MIN_BUOY_SEP_KM, geo=None,
+                 info_mode="evf", influence_km=INFLUENCE_RADIUS_KM,
+                 evf_shrink=EVF_SHRINKAGE, evf_cv=False,
+                 eval_stride=EVAL_STRIDE, info_gain=RL_INFO_GAIN,
+                 obs_noise=(OBS_NOISE_T, OBS_NOISE_S)):
         self.T = T.astype(np.float32)
         self.S = S.astype(np.float32)
         self.grid_x, self.grid_y = grid_x, grid_y
@@ -467,6 +499,23 @@ class OceanNetworkEnv:
 
         self._build_conflict_matrix()
         self._precompute_field_stats()
+
+        # ── Critère d'information ────────────────────────────────────────────
+        self.info_mode    = info_mode
+        self.influence_km = float(influence_km)
+        self.evf_shrink   = float(evf_shrink)
+        self.evf_cv       = bool(evf_cv)
+        self.eval_stride  = int(eval_stride)
+        self.obs_noise    = tuple(obs_noise)
+        # info_gain remet delta_EVF (1e-3..1e-2) à une échelle comparable aux
+        # pénalités de budget ; sans lui le budget écrase le signal info.
+        self.info_gain = float(info_gain) if info_mode in ("evf",) else 1.0
+        if info_mode == "evf":
+            self._precompute_information_basis()
+        elif info_mode != "legacy":
+            raise ValueError(f"info_mode inconnu : {info_mode} "
+                             f"(attendu 'evf' ou 'legacy')")
+
         self.active_mask = None
         self.step_count = 0
         self.obs_dim = self.K + len(self.field_stats) \
@@ -601,6 +650,152 @@ class OceanNetworkEnv:
             fs.append((v - s_min) / (s_max - s_min + 1e-9))
         self.fixed_stats = np.array(fs, dtype=np.float32)
 
+    # ---------------------------------------------------------------------
+    #  EVF — variance expliquée par interpolation optimale (BLUE)
+    # ---------------------------------------------------------------------
+    def _precompute_information_basis(self):
+        """La qualité d'un réseau n'est pas une couverture géométrique mais la
+        FRACTION DE VARIABILITÉ DU SYSTÈME reconstructible depuis les seules
+        observations, évaluée par estimation linéaire optimale (BLUE /
+        interpolation optimale), critère standard en OSSE :
+
+            EVF = Σ_c C_cO (C_OO + R)^-1 C_Oc  /  Σ_c C_cc
+
+        Le vecteur d'observation contient T ET S à chaque site (2n valeurs),
+        chacune normalisée par son propre écart-type et affectée de son propre
+        bruit instrumental — la salinité compte donc réellement.
+
+        Pourquoi la covariance n'est pas empirique
+        ------------------------------------------
+        Le temps de décorrélation limite le nombre de réalisations
+        indépendantes ; la covariance d'échantillon sur-apprend et la variance
+        expliquée mesurée hors échantillon devient NÉGATIVE. On la contracte
+        donc vers un modèle paramétrique bâti sur les diagnostics du champ :
+
+            C[(i,v),(j,w)] = sigma_v(i) sigma_w(j) exp(-d_ij^2 / 2L^2) c_vw
+
+        avec d_ij la distance PHYSIQUE (haversine en mode GLORYS) et
+        L = influence_km.
+
+        Spécificités glo12 par rapport au portage de main :
+          - les sites sont candidats + STATIONS FIXES : l'EVF d'un ajout se
+            mesure conditionnellement au réseau imposé, jamais dans le vide ;
+          - la grille d'évaluation exclut la terre ;
+          - les distances sont en km, pas en pixels.
+        """
+        d = self.evf_shrink
+        st = self.eval_stride
+
+        ocean = OCEAN if OCEAN is not None else None
+        Ta = mesoscale_anomaly(self.T, ocean) / (self.T.std() + 1e-9)
+        Sa = mesoscale_anomaly(self.S, ocean) / (self.S.std() + 1e-9)
+        nt = len(Ta)
+
+        # ── Grille d'évaluation : sous-échantillonnée, mer uniquement ────────
+        xs, ys = np.arange(0, NX, st), np.arange(0, NY, st)
+        GX, GY = np.meshgrid(xs, ys, indexing="ij")
+        cells = np.stack([GX.ravel(), GY.ravel()], 1)
+        if ocean is not None:
+            keep = ocean[cells[:, 0], cells[:, 1]] > 0.5
+            cells = cells[keep]
+        if len(cells) < 4:
+            raise ValueError(f"Grille d'évaluation EVF trop petite "
+                             f"({len(cells)} cellules) : réduire eval_stride")
+        self._eval_xy = cells
+
+        # ── Sites d'observation : candidats PUIS stations fixes ──────────────
+        self.n_fixed = len(self.fixed_positions)
+        sites = list(self.candidate_positions) + list(self.fixed_positions)
+        self._n_sites = len(sites)
+        self._fixed_slots = np.arange(self.K, self._n_sites)
+
+        yT = Ta[:, cells[:, 0], cells[:, 1]]
+        yS = Sa[:, cells[:, 0], cells[:, 1]]
+        st_arr = np.array(sites, dtype=int)
+        oT = Ta[:, st_arr[:, 0], st_arr[:, 1]]
+        oS = Sa[:, st_arr[:, 0], st_arr[:, 1]]
+        Y = np.concatenate([yT, yS], 1)
+        O = np.concatenate([oT, oS], 1)
+        Y = Y - Y.mean(0)
+        O = O - O.mean(0)
+
+        tr = slice(0, nt // 2) if self.evf_cv else slice(0, nt)
+        Otr, Ytr = O[tr], Y[tr]
+        n_tr = max(len(Ytr), 1)
+
+        # ── Modèle paramétrique (distances physiques) ───────────────────────
+        L2 = 2.0 * self.influence_km ** 2
+        Roo = np.exp(-pairwise_km(sites, self.geo) ** 2 / L2)
+        Roc = np.exp(-pairwise_km(sites, self.geo, other=cells) ** 2 / L2)
+
+        sT_o, sS_o = oT[tr].std(0), oS[tr].std(0)
+        sT_c, sS_c = yT[tr].std(0), yS[tr].std(0)
+        rTS = float(np.clip(np.mean([
+            np.corrcoef(oT[tr, k], oS[tr, k])[0, 1]
+            for k in range(self._n_sites)]), -1, 1))
+
+        def _b(Rm, sa, sb, cross):
+            return (sa[:, None] * sb[None, :]) * Rm * (rTS if cross else 1.0)
+
+        C_OO_p = np.block([[_b(Roo, sT_o, sT_o, 0), _b(Roo, sT_o, sS_o, 1)],
+                           [_b(Roo, sS_o, sT_o, 1), _b(Roo, sS_o, sS_o, 0)]])
+        C_OY_p = np.block([[_b(Roc, sT_o, sT_c, 0), _b(Roc, sT_o, sS_c, 1)],
+                           [_b(Roc, sS_o, sT_c, 1), _b(Roc, sS_o, sS_c, 0)]])
+
+        # ── Contraction empirique -> paramétrique ───────────────────────────
+        self._C_OO = ((1 - d) * (Otr.T @ Otr / n_tr) + d * C_OO_p).astype(np.float64)
+        self._C_OY = ((1 - d) * (Otr.T @ Ytr / n_tr) + d * C_OY_p).astype(np.float64)
+        self._rho_TS = rTS
+
+        var_par = np.concatenate([sT_c, sS_c]) ** 2
+        var_smp = (Ytr ** 2).mean(0)
+        if self.evf_cv:
+            self._O_va = O[nt // 2:].astype(np.float64)
+            self._Y_va = Y[nt // 2:].astype(np.float64)
+            self._var_total = float((self._Y_va ** 2).mean(0).sum())
+        else:
+            self._var_total = float(((1 - d) * var_smp + d * var_par).sum())
+
+        # Bruit instrumental, dans les unités normalisées de chaque variable
+        rT = (self.obs_noise[0] / (self.T.std() + 1e-9)) ** 2
+        rS = (self.obs_noise[1] / (self.S.std() + 1e-9)) ** 2
+        self._R_diag = np.concatenate([np.full(self._n_sites, rT),
+                                       np.full(self._n_sites, rS)])
+
+        print(f"  EVF : {len(cells)} cellules d'évaluation (stride {st}, mer) "
+              f"| L={self.influence_km:.0f} km | shrink={d:.2f} "
+              f"| rho_TS={rTS:+.2f}" + ("  [CV hors échantillon]"
+                                        if self.evf_cv else ""))
+        if self.n_fixed:
+            print(f"        EVF du réseau imposé seul : "
+                  f"{self.explained_variance([]):.4f}")
+        chk = self.sample_feasible(min(self.n_max, self.n_feasible_max),
+                                   np.random.default_rng(0))
+        print(f"        EVF + {len(chk)} ajouts tirés au hasard : "
+              f"{self.explained_variance(chk):.4f}")
+
+    def explained_variance(self, active_idx):
+        """Fraction de la variabilité du système expliquée par le réseau
+        COMPLET : stations fixes (toujours présentes) + ajouts actifs."""
+        a = np.asarray(active_idx, dtype=int)
+        sites = np.concatenate([a, self._fixed_slots]).astype(int)
+        if len(sites) == 0:
+            return 0.0
+        idx = np.concatenate([sites, sites + self._n_sites])
+        G = self._C_OO[np.ix_(idx, idx)] + np.diag(self._R_diag[idx])
+        C = self._C_OY[idx]
+        try:
+            B = np.linalg.solve(G, C)          # gain d'interpolation optimale
+        except np.linalg.LinAlgError:
+            B = np.linalg.lstsq(G, C, rcond=None)[0]
+
+        if not self.evf_cv:
+            return float((C * B).sum() / (self._var_total + 1e-12))
+
+        resid = self._Y_va - self._O_va[:, idx] @ B
+        expl = (self._Y_va ** 2).mean(0).sum() - (resid ** 2).mean(0).sum()
+        return float(expl / (self._var_total + 1e-12))
+
     def reset(self):
         self.active_mask = np.zeros(self.K, dtype=np.float32)
         if self.init_mode == "random":
@@ -645,6 +840,12 @@ class OceanNetworkEnv:
         if len(active_idx) == 0 and n_fixed == 0:
             return 0.0
 
+        if self.info_mode == "evf":
+            return self.explained_variance(active_idx)
+
+        # ── legacy : couverture saturante + bonus d'espacement ───────────────
+        # Conservé pour comparaison. NON MONOTONE en N sur main (mesuré) :
+        # le coude lu sur le front de Pareto n'est pas interprétable.
         # Couverture avec saturation (Michaelis-Menten) :
         # alpha calibré sur n_max → demi-saturation quand ~n_max capteurs actifs.
         # Les stations fixes contribuent à la couverture (elles observent).
@@ -695,7 +896,10 @@ class OceanNetworkEnv:
             new_info = self._compute_info_reward()
             delta_info = new_info - prev_info
 
-        reward = self.w_info * delta_info
+        # info_gain ne s'applique qu'au delta issu de _compute_info_reward
+        # (modes heuristic/EVF) : sage et ae ont leur propre mise à l'échelle.
+        gain = self.info_gain if self.reward_mode == "heuristic" else 1.0
+        reward = self.w_info * gain * delta_info
         if self.marginal_cost > 0:               # sweep scalarisé Pareto
             reward -= self.marginal_cost
 
@@ -768,16 +972,17 @@ class OceanNetworkEnv:
             new_info = self._compute_info_reward()
             delta_info = new_info - prev_info
 
+        gain = self.info_gain if self.reward_mode == "heuristic" else 1.0
         if self.marginal_cost > 0:
             cost = self.marginal_cost if not was_active else -self.marginal_cost * 0.5
-            reward = self.w_info * delta_info - cost
+            reward = self.w_info * gain * delta_info - cost
         else:
             penalty = 0.0
             if n_active < self.n_min:
                 penalty = float(self.n_min - n_active) / self.n_min
             elif n_active > self.n_max:
                 penalty = float(n_active - self.n_max) / self.n_max
-            reward = self.w_info * delta_info - self.w_budget * penalty
+            reward = self.w_info * gain * delta_info - self.w_budget * penalty
 
         self.step_count += 1
         done = self.step_count >= self.ep_len
@@ -1708,7 +1913,15 @@ def compute_scalarized(env_T, env_S, policy_std, args):
                                    init_mode=getattr(args, "init", "auto"),
                                    min_sep_km=getattr(args, "min_sep_km",
                                                       MIN_BUOY_SEP_KM),
-                                   geo=GLORYS)
+                                   geo=GLORYS,
+                                   info_mode=getattr(args, "info_mode", "evf"),
+                                   influence_km=getattr(args, "influence_km",
+                                                        INFLUENCE_RADIUS_KM),
+                                   evf_shrink=getattr(args, "evf_shrink",
+                                                      EVF_SHRINKAGE),
+                                   evf_cv=getattr(args, "evf_cv", False),
+                                   obs_noise=getattr(args, "_obs_noise",
+                                                     (OBS_NOISE_T, OBS_NOISE_S)))
         args_lam = argparse.Namespace(**vars(args)); args_lam.rl_steps = steps_lam
         pol_lam, _ = train_ppo(args_lam, env_lam, label=f"lam={lam}")
         idx, info = _run_policy_config(env_lam, pol_lam, env_lam.n_max)
@@ -1945,6 +2158,22 @@ def parse_args():
                         "candidate (synthétique 16x24 : 50 km).")
     p.add_argument("--w_info", type=float, default=1.0)
     p.add_argument("--w_budget", type=float, default=0.5)
+    # Critère d'information
+    p.add_argument("--info_mode", choices=["evf", "legacy"], default="evf",
+                   help="evf : variance expliquée par interpolation optimale "
+                        "(BLUE) sur la covariance du nature run — DÉFAUT. "
+                        "legacy : couverture saturante + espacement "
+                        "(historique glo12, non monotone en N)")
+    p.add_argument("--influence_km", type=float, default=INFLUENCE_RADIUS_KM,
+                   help="Échelle de décorrélation L du modèle paramétrique. "
+                        "90 km = valeur MOYENNE LATITUDE héritée de main, "
+                        "à rediagnostiquer sur GLORYS tropical")
+    p.add_argument("--evf_shrink", type=float, default=EVF_SHRINKAGE,
+                   help="Contraction vers la covariance paramétrique (0..1)")
+    p.add_argument("--evf_cv", action="store_true",
+                   help="Score EVF valide HORS ÉCHANTILLON (stats sur la 1re "
+                        "moitié, score sur la 2e) : moins optimiste, plus "
+                        "bruité — le chiffre honnête à publier")
     p.add_argument("--gif_frames", type=int, default=80)
     p.add_argument("--data", choices=["synthetic", "glorys"], default="synthetic")
     p.add_argument("--glorys_cache", type=str, default="data/glorys_cache")
@@ -2053,6 +2282,17 @@ if __name__ == "__main__":
             n_t=args.reward_nt, n_mc=args.reward_mc,
             seed=args.seed_ocean)
 
+    # Bruit d'observation dans les MÊMES UNITÉS que les tableaux T/S remis à
+    # l'environnement : physiques en synthétique, normalisées en GLORYS (où
+    # get_arrays(normalized=True) a déjà divisé par l'écart-type train).
+    if GLORYS is not None:
+        from dataset_glorys import OBS_NOISE_PHYS
+        obs_noise = (OBS_NOISE_PHYS["T"] / (GLORYS.norm["T"]["std"] + 1e-9),
+                     OBS_NOISE_PHYS["S"] / (GLORYS.norm["S"]["std"] + 1e-9))
+    else:
+        obs_noise = (OBS_NOISE_T, OBS_NOISE_S)
+    args._obs_noise = obs_noise
+
     env = OceanNetworkEnv(T, S, grid_x=args.grid_x, grid_y=args.grid_y,
                           n_min=args.n_min, n_max=args.n_max,
                           episode_len=args.episode_len, w_info=args.w_info,
@@ -2061,7 +2301,11 @@ if __name__ == "__main__":
                           sage_scale=args.sage_scale,
                           w_terminal=args.w_terminal, mdp=args.mdp,
                           fixed_positions=fixed_positions, init_mode=args.init,
-                          min_sep_km=args.min_sep_km, geo=GLORYS)
+                          min_sep_km=args.min_sep_km, geo=GLORYS,
+                          info_mode=args.info_mode,
+                          influence_km=args.influence_km,
+                          evf_shrink=args.evf_shrink, evf_cv=args.evf_cv,
+                          obs_noise=obs_noise)
     args._rm = rm
     if args.reward != "heuristic":
         print(f"  Reward couplée : mode '{args.reward}'"

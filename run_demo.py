@@ -24,7 +24,18 @@ from config import DEVICE, NX, NY, NT, N_BUOYS, set_global_seed, make_output_dir
 try:
     from dataset import SyntheticOceanGenerator, build_datasets
 except ModuleNotFoundError:
-    from data.dataset import SyntheticOceanGenerator, build_datasets
+    # dataset.py absent : le nature run SYNTHÉTIQUE est indisponible, mais le
+    # mode --data glorys ne l'utilise jamais. On diffère donc l'erreur au
+    # moment de l'appel au lieu de la lever à l'import, sinon tout le pipeline
+    # GLORYS devient inutilisable pour un fichier dont il n'a pas besoin.
+    # (l'ancien repli `from data.dataset import ...` est retiré : glo12 n'a
+    #  jamais eu de paquet data/, il ne produisait qu'un second traceback)
+    def _no_synthetic(*_a, **_k):
+        raise ModuleNotFoundError(
+            "dataset.py est introuvable : le nature run synthétique n'est pas "
+            "disponible.\n  -> utilisez --data glorys, ou restaurez le "
+            "fichier : git checkout glo12 -- dataset.py")
+    SyntheticOceanGenerator = build_datasets = _no_synthetic
 
 
 # ══════════════════════════════════════════════════════════════════════════════

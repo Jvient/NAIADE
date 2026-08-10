@@ -70,12 +70,26 @@ from torch.utils.data import Dataset
 DEFAULT_NC    = "data/glorys12_pirata_surface.nc"
 DEFAULT_CACHE = "data/glorys_cache"
 
+# Boîte par défaut : emprise du réseau PIRATA (lat -18.9..+20.5, lon -38.0..-2.7)
+# élargie d'environ 5 degrés. La marge n'est pas cosmétique : l'EVF évalue la
+# reconstruction sur TOUTE la boîte, donc une boîte collée aux bouées les
+# flatterait, et une boîte trop large (Atlantique entier) mesurerait surtout
+# des régions qu'aucun mouillage PIRATA ne peut contraindre.
+DEFAULT_BOX = {"lat": (-25.0, 26.0), "lon": (-45.0, 3.0)}
+
+# Dégradation de la grille 1/12° par moyenne de blocs COARSEN x COARSEN.
+# 2 -> 1/6° (18.5 km) : ~10 points par longueur de décorrélation (L ~ 180 km),
+# cache de 3.3 Go, charge GPU 1.8x celle d'une grille 205x241 déjà validée.
+# Moyenne de blocs et non sous-échantillonnage : filtre passe-bas, pas de
+# repliement de la mésoéchelle sur les grandes échelles.
+DEFAULT_COARSEN = 2
+
 # Nom NAIADE -> nom GLORYS. T et S obligatoires, le reste optionnel.
 VAR_MAP = {"T": "thetao", "S": "so", "Z": "zos", "MLD": "mlotst"}
 REQUIRED_VARS = ("T", "S")
 
-# Splits par années entières (bornes incluses)
-DEFAULT_SPLITS = {"train": (2005, 2016), "val": (2017, 2018), "test": (2019, 2020)}
+# Splits par années entières (bornes incluses) — jeu 2007-2019
+DEFAULT_SPLITS = {"train": (2007, 2016), "val": (2017, 2018), "test": (2019, 2019)}
 
 CLIM_WINDOW = 31          # lissage circulaire de la climatologie (jours)
 
@@ -83,20 +97,30 @@ CLIM_WINDOW = 31          # lissage circulaire de la climatologie (jours)
 OBS_NOISE_PHYS = {"T": 0.10,    # °C  (précision mouillage + représentativité)
                   "S": 0.02}    # psu
 
-# Positions nominales de mouillages PIRATA dans/près de la boîte.
-# ATTENTION : positions NOMINALES de déploiement — à vérifier/compléter
-# depuis les métadonnées GTMBA/PMEL (https://www.pmel.noaa.gov/gtmba/)
-# avant toute utilisation quantitative (scoring LOO du réseau réel).
+# Réseau PIRATA — positions de campagne relevées (lat, lon).
+# Source : fichier bouées du projet. Ce sont des positions RÉELLES de
+# mouillages, et non plus les positions nominales arrondies utilisées
+# auparavant : 0N23W nominal devient PT076 à (0.0017, -22.9883).
+# PT075 est ambigu selon la campagne (parfois référencé PI287A) — le doublon
+# n'est pas dupliqué ici, une seule position est retenue.
 PIRATA_NOMINAL = {
-    "0N23W":  (0.0,  -23.0),
-    "0N10W":  (0.0,  -10.0),
-    # Hors boîte par défaut (30W-10W, 5S-12N) mais utiles si élargie :
-    "0N35W":  (0.0,  -35.0),
-    "0N0E":   (0.0,    0.0),
-    "6S10W":  (-6.0, -10.0),
-    "4N38W":  (4.0,  -38.0),
-    "8N38W":  (8.0,  -38.0),
-    "12N38W": (12.0, -38.0),
+    "PI289A": (  0.0000,  -2.6850),
+    "PI288A": (  0.0200,  -9.8467),
+    "PI280A": (-18.8517, -34.6583),
+    "PI285A": (  0.0100, -34.9967),
+    "PI284A": (  7.9467, -38.0300),
+    "PI283A": (  4.0083, -37.9367),
+    "PT077":  ( -6.0333,  -9.9983),
+    "PT078":  ( -9.9067,  -9.9817),
+    "PT065":  ( 20.4517, -23.1417),
+    "PT068":  ( 11.4883, -22.9867),
+    "PT069":  (  4.0450, -22.9867),
+    "PT076":  (  0.0017, -22.9883),
+    "PT070":  ( -8.0083, -30.6333),
+    "PT062":  (-13.5233, -32.5967),
+    "PT063":  ( 20.0250, -37.8467),
+    "PT072":  ( 15.0033, -37.9917),
+    "PT075":  (  2.4133,  -4.6300),
 }
 
 
@@ -466,6 +490,337 @@ def make_fixture(cache_dir=FIXTURE_CACHE, years=(2005, 2010),
     return meta
 
 
+def _block_mean(a, f, min_frac=0.5):
+    """Moyenne par blocs f x f sur les deux derniers axes, robuste aux NaN.
+
+    Une cellule dégradée est déclarée MER si au moins min_frac de ses cellules
+    fines le sont, et vaut alors la moyenne des seules cellules mer. Sans ce
+    seuil, une cellule côtière contenant un unique pixel d'eau deviendrait un
+    point de mer à part entière, et le masque océan grossi mordrait sur la
+    terre.
+    """
+    if f == 1:
+        return a
+    nt, nlat, nlon = a.shape
+    h, w = nlat // f, nlon // f
+    b = a[:, :h * f, :w * f].reshape(nt, h, f, w, f)
+    finite = np.isfinite(b)
+    cnt = finite.sum(axis=(2, 4))
+    s = np.where(finite, b, 0.0).sum(axis=(2, 4))
+    out = np.where(cnt >= max(1, int(min_frac * f * f)),
+                   s / np.maximum(cnt, 1), np.nan)
+    return out.astype(np.float32)
+
+
+def _block_mean_1d(x, f):
+    if f == 1:
+        return np.asarray(x)
+    n = (len(x) // f) * f
+    return np.asarray(x)[:n].reshape(-1, f).mean(1)
+
+
+def preprocess_multi(nc_dir, cache_dir=DEFAULT_CACHE, box=None,
+                     coarsen=DEFAULT_COARSEN, splits=None, variables=("T", "S"),
+                     years=None, detrend=False, pattern="*.nc"):
+    """Prétraite un RÉPERTOIRE de NetCDF GLORYS annuels vers un cache NAIADE.
+
+    Conçu pour le jeu Atlantique complet 2007-2019 : chaque fichier annuel pèse
+    ~14 Go avec ses 5 variables, et l'ensemble au 1/12° sur le domaine complet
+    représenterait 35 Go de cache pour deux variables. Trois réductions sont
+    donc appliquées AVANT tout chargement en mémoire :
+
+      1. sélection des seules variables demandées (thetao, so) au niveau de
+         surface (depth = 0.494 m) ;
+      2. découpe sur la boîte, par sel() paresseux — xarray ne lit que le
+         sous-domaine sur le disque ;
+      3. dégradation par moyenne de blocs coarsen x coarsen.
+
+    Le pic mémoire est ainsi d'environ 1 Go (une année, une variable, le
+    sous-domaine avant dégradation), quel que soit le nombre d'années.
+
+    L'écriture du cache passe par write_cache(), donc par exactement le même
+    code que preprocess() et make_fixture() : climatologie journalière lissée,
+    stats de normalisation train uniquement, masque océan, meta.json.
+    """
+    import pandas as pd
+    import xarray as xr
+
+    box = box or DEFAULT_BOX
+    splits = splits or DEFAULT_SPLITS
+    keep = [v for v in variables if v in VAR_MAP]
+    missing = [v for v in REQUIRED_VARS if v not in keep]
+    if missing:
+        raise ValueError(f"Variables obligatoires absentes : {missing}")
+
+    files = sorted(Path(nc_dir).glob(pattern))
+    if not files:
+        raise FileNotFoundError(f"Aucun fichier {pattern} dans {nc_dir}")
+    print(f"  {len(files)} fichiers NetCDF dans {nc_dir}")
+    print(f"  Boîte : lat {box['lat'][0]:+.1f}..{box['lat'][1]:+.1f} | "
+          f"lon {box['lon'][0]:+.1f}..{box['lon'][1]:+.1f} | "
+          f"dégradation 1/{12 // coarsen}° (blocs {coarsen}x{coarsen})")
+
+    lat = lon = None
+    chunks = {k: [] for k in keep}
+    times = []
+
+    for f in files:
+        ds = xr.open_dataset(f)
+        sub = ds.sel(latitude=slice(*box["lat"]), longitude=slice(*box["lon"]))
+        t = pd.to_datetime(sub["time"].values)
+        if years is not None:
+            m = (t.year >= years[0]) & (t.year <= years[1])
+            if not m.any():
+                ds.close()
+                continue
+            sub, t = sub.isel(time=np.where(m)[0]), t[m]
+
+        if lat is None:
+            lat = _block_mean_1d(sub["latitude"].values, coarsen).astype(np.float32)
+            lon = _block_mean_1d(sub["longitude"].values, coarsen).astype(np.float32)
+            print(f"  Grille dégradée : {len(lat)}x{len(lon)} "
+                  f"({lat[0]:+.2f}..{lat[-1]:+.2f}N, {lon[0]:+.2f}..{lon[-1]:+.2f}E)")
+
+        for k in keep:
+            da = sub[VAR_MAP[k]]
+            if "depth" in da.dims:
+                da = da.isel(depth=0)
+            arr = da.transpose("time", "latitude", "longitude").values
+            chunks[k].append(_block_mean(arr.astype(np.float32), coarsen))
+            del arr
+        times.append(t.values)
+        ds.close()
+        print(f"    {f.name} : {len(t)} dates", flush=True)
+
+    fields = {k: np.concatenate(chunks[k], axis=0) for k in keep}
+    for k in keep:
+        chunks[k] = None
+    times64 = np.concatenate(times)
+    tt = pd.to_datetime(times64)
+    yr = tt.year.values.astype(np.int32)
+    doy = (tt.dayofyear.values - 1).astype(np.int32)
+
+    order = np.argsort(times64)          # les fichiers peuvent être désordonnés
+    if not (order == np.arange(len(order))).all():
+        print("  Fichiers non chronologiques : réordonnancement")
+        for k in keep:
+            fields[k] = fields[k][order]
+        times64, yr, doy = times64[order], yr[order], doy[order]
+
+    gb = sum(v.nbytes for v in fields.values()) / 1e9
+    print(f"  {len(times64)} dates | {gb:.1f} Go en mémoire "
+          f"| années {yr.min()}-{yr.max()}")
+
+    return write_cache(fields, lat, lon, times64, yr, doy,
+                       cache_dir=cache_dir, splits=splits, detrend=detrend,
+                       source=f"{nc_dir} ({len(files)} fichiers), "
+                              f"boîte {box}, coarsen {coarsen}")
+
+
+# =============================================================================
+#  Diagnostic des échelles de décorrélation spatiale
+# =============================================================================
+
+def _fit_scale(centers, prof, max_km):
+    """Ajuste la corrélation binnée par une gaussienne ET une exponentielle.
+
+    Gaussienne exp(-d^2/2L^2) : c'est la forme EXACTE du noyau paramétrique de
+    l'EVF (03_rl.py). Exponentielle exp(-d/Le) : forme concurrente classique en
+    géostatistique. Si l'exponentielle ajuste nettement mieux, c'est le noyau
+    de l'EVF lui-même qui est mal spécifié, pas seulement sa portée.
+
+    Recherche sur grille plutôt que régression sur log(rho) : les profils sont
+    bruités et changent de signe en queue, où le log n'est pas défini.
+    Renvoie aussi le e-folding lu sur la courbe, valeur SANS modèle.
+    """
+    ok = np.isfinite(prof)
+    if ok.sum() < 5:
+        return dict(L=np.nan, Le=np.nan, e_fold=np.nan, forme="indéterminée")
+    c, p = centers[ok], prof[ok]
+    grid = np.linspace(20.0, max(3000.0, 1.5 * max_km), 500)
+    sse_g = np.array([np.sum((p - np.exp(-c ** 2 / (2 * L ** 2))) ** 2)
+                      for L in grid])
+    sse_e = np.array([np.sum((p - np.exp(-c / Le)) ** 2) for Le in grid])
+    L, Le = float(grid[sse_g.argmin()]), float(grid[sse_e.argmin()])
+
+    e_fold = np.nan
+    below = np.where(p < np.exp(-1.0))[0]
+    if len(below) and below[0] > 0:
+        i = below[0]
+        f = (p[i - 1] - np.exp(-1.0)) / (p[i - 1] - p[i] + 1e-12)
+        e_fold = float(c[i - 1] + f * (c[i] - c[i - 1]))
+
+    g, e = float(sse_g.min()), float(sse_e.min())
+    forme = ("gaussienne" if g < 0.8 * e else
+             "EXPONENTIELLE" if e < 0.8 * g else "indiscernables")
+    return dict(L=L, Le=Le, e_fold=e_fold, forme=forme)
+
+
+def decorrelation_scales(data, split="train", n_sites=700, step=1,
+                         max_km=2500.0, n_bins=40, seed=0,
+                         bands=((-3.0, 3.0), (3.0, 15.0))):
+    """Estime L, l'échelle de décorrélation spatiale des anomalies.
+
+    Pourquoi ce diagnostic n'est pas optionnel
+    ------------------------------------------
+    INFLUENCE_RADIUS_KM pilote le modèle paramétrique vers lequel la covariance
+    de l'EVF est contractée. Avec EVF_SHRINKAGE = 0.9, c'est donc à 90 % CE
+    MODÈLE qui décide du score, et L en est le seul paramètre de forme. La
+    valeur 90 km héritée de main provient d'un nature run de moyenne latitude.
+
+    Trois décompositions, parce que trois biais différents guettent :
+      - L global : la valeur à mettre dans --influence_km ;
+      - zonal contre méridien : en régime équatorial l'anisotropie est forte
+        (ondes de Kelvin, TIWs). Le noyau de l'EVF est ISOTROPE — ce
+        diagnostic dit à quel point c'est une approximation ;
+      - par bande de latitude : le rayon de déformation croît vers l'équateur.
+        Si les bandes divergent, un L unique est un compromis, pas une mesure.
+
+    La moyenne spatiale de domaine est retirée à chaque pas de temps, comme
+    dans mesoscale_anomaly() (03_rl.py) : sans ça le mode global corrèle tous
+    les sites entre eux et L part à l'infini.
+    """
+    R_KM = 6371.0
+    rng = np.random.default_rng(seed)
+    idx = data.split_indices(split)[::step]
+    nt = len(idx)
+    ocean = data.ocean
+    sites = np.asarray(sample_ocean_positions(
+        ocean, min(n_sites, int(ocean.sum())), rng=rng), dtype=int)
+
+    print(f"  {nt} pas de temps x {len(sites)} sites océan (split {split})")
+    if nt < 100:
+        print(f"  [ATTENTION] {nt} pas de temps : corrélations très bruitées, "
+              f"réduire --scales_step")
+
+    la = np.radians(data.lat[sites[:, 0]])
+    lo = np.radians(data.lon[sites[:, 1]])
+    lat_deg = data.lat[sites[:, 0]]
+    dla, dlo = la[:, None] - la[None, :], lo[:, None] - lo[None, :]
+    hav = (np.sin(dla / 2) ** 2
+           + np.cos(la)[:, None] * np.cos(la)[None, :] * np.sin(dlo / 2) ** 2)
+    D = 2 * R_KM * np.arcsin(np.sqrt(np.clip(hav, 0, 1)))
+    # composante purement zonale (même latitude) de la séparation
+    DZ = 2 * R_KM * np.arcsin(np.sqrt(np.clip(
+        np.cos(la)[:, None] * np.cos(la)[None, :] * np.sin(dlo / 2) ** 2, 0, 1)))
+
+    iu = np.triu_indices(len(sites), 1)
+    d = D[iu]
+    frac_z = np.divide(DZ[iu], d, out=np.zeros_like(d), where=d > 0)
+    lat_a, lat_b = lat_deg[iu[0]], lat_deg[iu[1]]
+    edges = np.linspace(0, max_km, n_bins + 1)
+    centers = 0.5 * (edges[:-1] + edges[1:])
+    in_range = d <= max_km
+
+    def _profile(c, mask):
+        m = mask & in_range & np.isfinite(c)
+        if m.sum() < 200:
+            return np.full(n_bins, np.nan)
+        k = np.clip(np.digitize(d[m], edges) - 1, 0, n_bins - 1)
+        cnt = np.bincount(k, minlength=n_bins)
+        s = np.bincount(k, weights=c[m], minlength=n_bins)
+        return np.where(cnt >= 20, s / np.maximum(cnt, 1), np.nan)
+
+    subsets = {"global": np.ones(len(d), bool),
+               "zonal": frac_z > 0.9,
+               "méridien": frac_z < 0.4}
+    for lo_b, hi_b in bands:
+        subsets[f"lat [{lo_b:+.0f},{hi_b:+.0f}]"] = (
+            (lat_a >= lo_b) & (lat_a < hi_b) & (lat_b >= lo_b) & (lat_b < hi_b))
+
+    results, curves = {}, {}
+    for key in data.variables:
+        A = np.asarray(data.anomalies[key][idx], dtype=np.float32)
+        w = ocean.astype(np.float32)
+        A = A - (A * w[None]).reshape(nt, -1).sum(1)[:, None, None] / (w.sum() + 1e-9)
+        X = A[:, sites[:, 0], sites[:, 1]]
+        X = X - X.mean(0)
+        X /= (X.std(0) + 1e-9)
+        C = ((X.T @ X) / nt)[iu]
+
+        curves[key], results[key] = {}, {}
+        print(f"\n  --- {key} ---")
+        for name, mask in subsets.items():
+            prof = _profile(C, mask)
+            fit = _fit_scale(centers, prof, max_km)
+            curves[key][name], results[key][name] = prof, fit
+            if np.isfinite(fit["L"]):
+                print(f"    {name:<16s} L ={fit['L']:7.0f} km | "
+                      f"e-folding ={fit['e_fold']:7.0f} km | "
+                      f"meilleure forme : {fit['forme']}")
+            else:
+                print(f"    {name:<16s} pas assez de couples")
+
+        z, m = results[key]["zonal"]["L"], results[key]["méridien"]["L"]
+        if np.isfinite(z) and np.isfinite(m) and m > 0:
+            results[key]["global"]["anisotropie"] = z / m
+            print(f"    anisotropie zonal/méridien = {z / m:.2f}" +
+                  ("  -> noyau isotrope acceptable" if z / m < 1.5 else
+                   "  -> ANISOTROPIE FORTE : le noyau isotrope de l'EVF est "
+                   "une approximation à justifier"))
+
+    # ── Recommandation, PAR VARIABLE ────────────────────────────────────────
+    # Une portée unique est un mauvais compromis dès que L_T et L_S diffèrent
+    # nettement (facteur 2.7 sur la boîte PIRATA). On sort donc les deux, dans
+    # l'ordre attendu par --influence_km, et pour les deux formes de noyau.
+    order = [k for k in ("T", "S") if k in results]
+    order += [k for k in results if k not in order]
+    Lg = [results[k]["global"]["L"] for k in order]
+    Le = [results[k]["global"]["e_fold"] for k in order]
+    if Lg and np.isfinite(Lg[0]):
+        print("\n  Portées globales par variable :")
+        for k, a, b in zip(order, Lg, Le):
+            print(f"    {k:<4s} gaussienne L = {a:6.0f} km | "
+                  f"exponentielle (e-folding) = {b:6.0f} km")
+        gauss = " ".join(f"{v:.0f}" for v in Lg[:2])
+        expo = " ".join(f"{v:.0f}" for v in Le[:2] if np.isfinite(v))
+        print(f"\n  --influence_km {gauss}                      (noyau gaussien)")
+        if expo:
+            print(f"  --influence_km {expo} --evf_kernel exp   (noyau exponentiel)")
+        reco = float(np.nanmean(Lg))
+        print(f"  INFLUENCE_RADIUS_KM recommandé : {reco:.0f} km"
+              f"   (scalaire, compromis)")
+        if "EXPONENTIELLE" in {results[k]["global"]["forme"] for k in results}:
+            print("  [!] La décroissance est mieux décrite par exp(-d/Le) que "
+                  "par la gaussienne\n      du noyau EVF. La portée reste "
+                  "utilisable, mais la FORME du noyau\n      paramétrique est "
+                  "discutable — à mentionner dans les limites.")
+        if getattr(data, "meta", {}).get("fixture"):
+            print("  [!] Diagnostic mené sur la FIXTURE : aucune signification "
+                  "physique.\n      Relancer sur le cache GLORYS réel.")
+    return dict(centers=centers, curves=curves, fits=results)
+
+
+def plot_decorrelation(res, out_path="outputs/decorrelation_scales.png"):
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    centers, curves, fits = res["centers"], res["curves"], res["fits"]
+    keys = list(curves)
+    fig, axes = plt.subplots(1, len(keys), figsize=(6.2 * len(keys), 4.6),
+                             squeeze=False)
+    for ax, key in zip(axes[0], keys):
+        for name, prof in curves[key].items():
+            ax.plot(centers, prof, marker="o", ms=3, lw=1.3, label=name)
+        L = fits[key]["global"]["L"]
+        if np.isfinite(L):
+            ax.plot(centers, np.exp(-centers ** 2 / (2 * L ** 2)), "k--", lw=1.3,
+                    label=f"gaussienne L={L:.0f} km")
+        ax.axhline(np.exp(-1), color="grey", lw=0.8, ls=":")
+        ax.axhline(0.0, color="k", lw=0.6)
+        ax.set_xlabel("distance (km)")
+        ax.set_ylabel("corrélation moyenne")
+        ax.set_title(f"Décorrélation spatiale — {key}")
+        ax.legend(fontsize=8)
+        ax.grid(alpha=0.3)
+    fig.tight_layout()
+    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=130)
+    plt.close(fig)
+    print(f"  Figure -> {out_path}")
+
+
 # =============================================================================
 #  Accès aux données prétraitées
 # =============================================================================
@@ -806,6 +1161,19 @@ def _parse_years(txt):
 if __name__ == "__main__":
     p = argparse.ArgumentParser(description="GLORYS12 -> NAIADE")
     p.add_argument("--preprocess", action="store_true")
+    p.add_argument("--preprocess_multi", action="store_true",
+                   help="Prétraite un RÉPERTOIRE de NetCDF annuels (jeu "
+                        "Atlantique 2007-2019) : découpe boîte + dégradation "
+                        "par moyenne de blocs, en flux pour tenir la RAM")
+    p.add_argument("--nc_dir", type=str, default="data/glorys_nc",
+                   help="Répertoire des NetCDF annuels")
+    p.add_argument("--box", type=float, nargs=4, default=None,
+                   metavar=("LAT0", "LAT1", "LON0", "LON1"),
+                   help="Boîte (défaut : emprise PIRATA + 5 deg)")
+    p.add_argument("--coarsen", type=int, default=DEFAULT_COARSEN,
+                   help="Facteur de dégradation (2 -> 1/6 deg, 3 -> 1/4 deg)")
+    p.add_argument("--years", type=int, nargs=2, default=None,
+                   metavar=("Y0", "Y1"))
     p.add_argument("--make-fixture", dest="make_fixture", action="store_true",
                    help="Génère un cache de TEST synthétique au format GLORYS "
                         "(aucun téléchargement). Champs sans validité "
@@ -817,6 +1185,13 @@ if __name__ == "__main__":
                    help="Résolution en degrés (0.5 par défaut ; le vrai "
                         "GLORYS12 est à 1/12 deg)")
     p.add_argument("--info",       action="store_true")
+    p.add_argument("--scales",     action="store_true",
+                   help="Diagnostic des échelles de décorrélation spatiale "
+                        "-> valeur à donner à --influence_km (brique 3)")
+    p.add_argument("--scales_sites", type=int, default=700,
+                   help="Sites océan échantillonnés (coût en n^2)")
+    p.add_argument("--scales_step",  type=int, default=1,
+                   help="Sous-échantillonnage temporel du diagnostic")
     p.add_argument("--figures",    action="store_true")
     p.add_argument("--nc",     type=str, default=DEFAULT_NC)
     p.add_argument("--cache",  type=str, default=DEFAULT_CACHE)
@@ -828,7 +1203,8 @@ if __name__ == "__main__":
     p.add_argument("--out", type=str, default="outputs/glorys_nature_run.png")
     args = p.parse_args()
 
-    if not any([args.preprocess, args.make_fixture, args.info, args.figures]):
+    if not any([args.preprocess, args.preprocess_multi, args.make_fixture,
+                args.info, args.figures, args.scales]):
         p.print_help()
         raise SystemExit(0)
 
@@ -840,14 +1216,29 @@ if __name__ == "__main__":
             args.cache = args.fixture_cache
             args.info = True
 
+    if args.preprocess_multi:
+        box = None
+        if args.box:
+            box = {"lat": (args.box[0], args.box[1]),
+                   "lon": (args.box[2], args.box[3])}
+        preprocess_multi(args.nc_dir, cache_dir=args.cache, box=box,
+                         coarsen=args.coarsen, years=args.years)
+        if not (args.info or args.figures or args.scales):
+            args.info = True
+
     if args.preprocess:
         splits = {"train": _parse_years(args.train_years),
                   "val":   _parse_years(args.val_years),
                   "test":  _parse_years(args.test_years)}
         preprocess(args.nc, args.cache, splits=splits, detrend=args.detrend)
 
-    if args.info or args.figures:
+    if args.info or args.figures or args.scales:
         data = GlorysData(args.cache)
         print(data.summary())
         if args.figures:
             plot_glorys_summary(data, out_path=args.out)
+        if args.scales:
+            res = decorrelation_scales(data, n_sites=args.scales_sites,
+                                       step=args.scales_step)
+            plot_decorrelation(res, out_path=str(
+                Path(args.cache) / "decorrelation_scales.png"))

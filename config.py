@@ -65,7 +65,8 @@ R_EARTH_KM = 6371.0
 # ondes équatoriales dépassent le millier de kilomètres.
 # -> à rediagnostiquer sur GLORYS (autocorrélation spatiale de l'anomalie)
 #    avant tout résultat quantitatif ; utiliser --influence_km en attendant.
-INFLUENCE_RADIUS_KM = 90.0
+INFLUENCE_RADIUS_KM = (483.0, 177.0)
+EVF_KERNEL = "exp"
 
 # Shrinkage de la covariance empirique vers le modèle paramétrique
 # sigma_i sigma_j rho(d_ij/L) c_vw.  0 = covariance empirique pure,

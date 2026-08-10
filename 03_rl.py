@@ -408,7 +408,7 @@ class OceanNetworkEnv:
                  fixed_positions=None, init_mode="auto", mdp="toggle",
                  min_sep_km=MIN_BUOY_SEP_KM, geo=None,
                  info_mode="evf", influence_km=INFLUENCE_RADIUS_KM,
-                 evf_shrink=EVF_SHRINKAGE, evf_cv=False,
+                 evf_kernel=EVF_KERNEL, evf_shrink=EVF_SHRINKAGE, evf_cv=False,
                  eval_stride=EVAL_STRIDE, info_gain=RL_INFO_GAIN,
                  obs_noise=(OBS_NOISE_T, OBS_NOISE_S)):
         self.T = T.astype(np.float32)
@@ -513,7 +513,17 @@ class OceanNetworkEnv:
 
         # ── Critère d'information ────────────────────────────────────────────
         self.info_mode    = info_mode
-        self.influence_km = float(influence_km)
+        # Une portée par variable. Un scalaire est accepté et dupliqué, pour
+        # que les anciennes commandes restent valides.
+        ik = np.atleast_1d(np.asarray(influence_km, dtype=float)).ravel()
+        if len(ik) == 1:
+            ik = np.repeat(ik, 2)
+        if len(ik) != 2:
+            raise ValueError("influence_km attend 1 ou 2 valeurs (L_T, L_S)")
+        self.influence_km = (float(ik[0]), float(ik[1]))
+        self.evf_kernel   = str(evf_kernel)
+        if self.evf_kernel not in ("gauss", "exp"):
+            raise ValueError(f"evf_kernel inconnu : {self.evf_kernel}")
         self.evf_shrink   = float(evf_shrink)
         self.evf_cv       = bool(evf_cv)
         self.eval_stride  = int(eval_stride)
@@ -735,9 +745,26 @@ class OceanNetworkEnv:
         n_tr = max(len(Ytr), 1)
 
         # ── Modèle paramétrique (distances physiques) ───────────────────────
-        L2 = 2.0 * self.influence_km ** 2
-        Roo = np.exp(-pairwise_km(sites, self.geo) ** 2 / L2)
-        Roc = np.exp(-pairwise_km(sites, self.geo, other=cells) ** 2 / L2)
+        # ── Modèle paramétrique : une portée PAR VARIABLE ────────────────────
+        # Le diagnostic mesure L_T ~ 483 km et L_S ~ 177 km sur la boîte PIRATA,
+        # soit un facteur 2.7. Une portée unique est donc trop courte pour la
+        # température et trop longue pour la salinité, simultanément.
+        LT, LS = self.influence_km
+        # Portée croisée : moyenne QUADRATIQUE et non géométrique. Pour le
+        # modèle bivarié gaussien, la validité (positivité du spectre croisé)
+        # impose L_X^2 >= (L_T^2 + L_S^2)/2 ; la moyenne géométrique donne
+        # L_T*L_S, qui est INFÉRIEUR par l'inégalité arithmético-géométrique
+        # et viole donc la condition. La moyenne quadratique est le cas limite
+        # admissible.
+        LX = float(np.sqrt(0.5 * (LT ** 2 + LS ** 2)))
+
+        def _rho(D, L):
+            if self.evf_kernel == "exp":
+                return np.exp(-D / L)
+            return np.exp(-D ** 2 / (2.0 * L ** 2))
+
+        D_oo = pairwise_km(sites, self.geo)
+        D_oc = pairwise_km(sites, self.geo, other=cells)
 
         sT_o, sS_o = oT[tr].std(0), oS[tr].std(0)
         sT_c, sS_c = yT[tr].std(0), yS[tr].std(0)
@@ -745,25 +772,66 @@ class OceanNetworkEnv:
             np.corrcoef(oT[tr, k], oS[tr, k])[0, 1]
             for k in range(self._n_sites)]), -1, 1))
 
-        def _b(Rm, sa, sb, cross):
-            return (sa[:, None] * sb[None, :]) * Rm * (rTS if cross else 1.0)
+        def _b(Rm, sa, sb, cross, r=None):
+            r = rTS if r is None else r
+            return (sa[:, None] * sb[None, :]) * Rm * (r if cross else 1.0)
 
-        C_OO_p = np.block([[_b(Roo, sT_o, sT_o, 0), _b(Roo, sT_o, sS_o, 1)],
-                           [_b(Roo, sS_o, sT_o, 1), _b(Roo, sS_o, sS_o, 0)]])
-        C_OY_p = np.block([[_b(Roc, sT_o, sT_c, 0), _b(Roc, sT_o, sS_c, 1)],
-                           [_b(Roc, sS_o, sT_c, 1), _b(Roc, sS_o, sS_c, 0)]])
+        def _assemble(r):
+            oo = np.block(
+                [[_b(_rho(D_oo, LT), sT_o, sT_o, 0),
+                  _b(_rho(D_oo, LX), sT_o, sS_o, 1, r)],
+                 [_b(_rho(D_oo, LX), sS_o, sT_o, 1, r),
+                  _b(_rho(D_oo, LS), sS_o, sS_o, 0)]])
+            oy = np.block(
+                [[_b(_rho(D_oc, LT), sT_o, sT_c, 0),
+                  _b(_rho(D_oc, LX), sT_o, sS_c, 1, r)],
+                 [_b(_rho(D_oc, LX), sS_o, sT_c, 1, r),
+                  _b(_rho(D_oc, LS), sS_o, sS_c, 0)]])
+            return oo, oy
+
+        # Portées distinctes par bloc : la validité théorique du modèle bivarié
+        # n'est plus garantie a priori (elle l'est pour la gaussienne avec LX
+        # quadratique, pas pour l'exponentielle). On la VÉRIFIE, et on atténue
+        # la corrélation croisée jusqu'à retrouver une matrice semi-définie
+        # positive — une covariance non SDP produirait des EVF aberrantes,
+        # éventuellement supérieures à 1.
+        #
+        # Tolérance RELATIVE à la plus grande valeur propre : le noyau gaussien
+        # est notoirement mal conditionné (spectre à décroissance super-
+        # exponentielle), ses plus petites valeurs propres tombent dans le
+        # bruit machine et une tolérance absolue déclencherait l'atténuation
+        # sur un modèle pourtant valide.
+        C_OO_p, C_OY_p = _assemble(rTS)
+        ev = np.linalg.eigvalsh(C_OO_p)
+        tol = -1e-6 * max(float(ev.max()), 1e-30)
+        scale = 1.0
+        if float(ev.min()) < tol:
+            for scale in (0.8, 0.6, 0.4, 0.2, 0.0):
+                C_OO_p, C_OY_p = _assemble(rTS * scale)
+                ev = np.linalg.eigvalsh(C_OO_p)
+                if float(ev.min()) >= tol:
+                    break
+            print(f"  [EVF] modèle bivarié non SDP : corrélation croisée T/S "
+                  f"atténuée x{scale:.1f} -> rho_TS effectif {rTS * scale:+.2f}")
+        rTS_eff = rTS * scale
 
         # ── Contraction empirique -> paramétrique ───────────────────────────
         self._C_OO = ((1 - d) * (Otr.T @ Otr / n_tr) + d * C_OO_p).astype(np.float64)
         self._C_OY = ((1 - d) * (Otr.T @ Ytr / n_tr) + d * C_OY_p).astype(np.float64)
-        self._rho_TS = rTS
+        self._rho_TS = rTS_eff
 
         var_par = np.concatenate([sT_c, sS_c]) ** 2
         var_smp = (Ytr ** 2).mean(0)
+
         if self.evf_cv:
-            self._O_va = O[nt // 2:].astype(np.float64)
-            self._Y_va = Y[nt // 2:].astype(np.float64)
-            self._var_total = float((self._Y_va ** 2).mean(0).sum())
+            # float64 AVANT le produit : en float32 l'accumulation sur les
+            # ~700 dates de validation coûte 5 chiffres significatifs.
+            O_va = O[nt // 2:].astype(np.float64)
+            Y_va = Y[nt // 2:].astype(np.float64)
+            n_va = max(len(Y_va), 1)
+            self._C_OY_va = O_va.T @ Y_va / n_va
+            self._C_OO_va = O_va.T @ O_va / n_va
+            self._var_total = float((Y_va ** 2).mean(0).sum())
         else:
             self._var_total = float(((1 - d) * var_smp + d * var_par).sum())
 
@@ -773,10 +841,11 @@ class OceanNetworkEnv:
         self._R_diag = np.concatenate([np.full(self._n_sites, rT),
                                        np.full(self._n_sites, rS)])
 
+        kn = "exp(-d/L)" if self.evf_kernel == "exp" else "exp(-d²/2L²)"
         print(f"  EVF : {len(cells)} cellules d'évaluation (stride {st}, mer) "
-              f"| L={self.influence_km:.0f} km | shrink={d:.2f} "
-              f"| rho_TS={rTS:+.2f}" + ("  [CV hors échantillon]"
-                                        if self.evf_cv else ""))
+              f"| noyau {kn} | L_T={LT:.0f} L_S={LS:.0f} L_TS={LX:.0f} km "
+              f"| shrink={d:.2f} | rho_TS={rTS_eff:+.2f}"
+              + ("  [CV hors échantillon]" if self.evf_cv else ""))
         if self.n_fixed:
             print(f"        EVF du réseau imposé seul : "
                   f"{self.explained_variance([]):.4f}")
@@ -803,8 +872,9 @@ class OceanNetworkEnv:
         if not self.evf_cv:
             return float((C * B).sum() / (self._var_total + 1e-12))
 
-        resid = self._Y_va - self._O_va[:, idx] @ B
-        expl = (self._Y_va ** 2).mean(0).sum() - (resid ** 2).mean(0).sum()
+        Cy = self._C_OY_va[idx]
+        expl = 2.0 * float((B * Cy).sum()) \
+            - float((B * (self._C_OO_va[np.ix_(idx, idx)] @ B)).sum())
         return float(expl / (self._var_total + 1e-12))
 
     def reset(self):
@@ -1756,23 +1826,37 @@ def train_ppo(args, env, label=""):
 # =========================================================================
 
 def _sweep_info(env, policy, n_range, n_trials=20):
-    policy.eval(); points = []
+    policy.eval()
+    points = []
     for nt_ in n_range:
-        scores = []
-        for trial in range(n_trials):
-            env.active_mask[:] = 0.0
-            env.active_mask[np.random.choice(env.K, min(nt_, env.K), replace=False)] = 1.0
-            if trial < n_trials//2:
+        scores, n_reached = [], []
+        for _ in range(n_trials):
+            if env.mdp == "additive":
+                env.eval_k = int(nt_)          # sinon k_target reste celui du
+                obs = env.reset()              # dernier épisode d'entraînement
+                max_steps = 4 * env.n_max
+            else:
+                env.active_mask[:] = 0.0
+                env.active_mask[env.sample_feasible(nt_)] = 1.0
                 obs = env._get_obs()
-                with torch.no_grad():
-                    for _ in range(env.ep_len):
-                        ot = torch.tensor(obs, dtype=torch.float32, device=DEVICE).unsqueeze(0)
-                        a, _, _, _ = policy.get_action(ot, deterministic=False)
-                        obs, _, d, _ = env.step(a.item())
-                        if d: break
+                max_steps = env.ep_len
+            with torch.no_grad():
+                for _ in range(max_steps):
+                    ot = torch.tensor(obs, dtype=torch.float32,
+                                      device=DEVICE).unsqueeze(0)
+                    a, _, _, _ = policy.get_action(ot, deterministic=False)
+                    obs, _, d, _ = env.step(a.item())
+                    if d:
+                        break
             scores.append(env._compute_info_reward())
-        points.append({"n_buoys": nt_, "info_mean": float(np.mean(scores)),
-                        "info_std": float(np.std(scores))})
+            n_reached.append(int(env.active_mask.sum()))
+        env.eval_k = None
+        n_eff = float(np.mean(n_reached))
+        if abs(n_eff - nt_) > 0.5:
+            print(f"    [!] N visé {nt_} mais {n_eff:.1f} bouées atteintes")
+        points.append({"n_buoys": nt_, "n_effectif": n_eff,
+                       "info_mean": float(np.mean(scores)),
+                       "info_std": float(np.std(scores))})
     return points
 
 def _run_policy_config(env, policy, n_target):
@@ -1928,6 +2012,8 @@ def compute_scalarized(env_T, env_S, policy_std, args):
                                    info_mode=getattr(args, "info_mode", "evf"),
                                    influence_km=getattr(args, "influence_km",
                                                         INFLUENCE_RADIUS_KM),
+                                   evf_kernel=getattr(args, "evf_kernel",
+                                                      EVF_KERNEL),
                                    evf_shrink=getattr(args, "evf_shrink",
                                                       EVF_SHRINKAGE),
                                    evf_cv=getattr(args, "evf_cv", False),
@@ -2175,10 +2261,16 @@ def parse_args():
                         "(BLUE) sur la covariance du nature run — DÉFAUT. "
                         "legacy : couverture saturante + espacement "
                         "(historique glo12, non monotone en N)")
-    p.add_argument("--influence_km", type=float, default=INFLUENCE_RADIUS_KM,
-                   help="Échelle de décorrélation L du modèle paramétrique. "
-                        "90 km = valeur MOYENNE LATITUDE héritée de main, "
-                        "à rediagnostiquer sur GLORYS tropical")
+    p.add_argument("--evf_kernel", choices=["gauss", "exp"], default=EVF_KERNEL,
+                   help="Forme du noyau paramétrique. Le diagnostic "
+                        "--scales indique laquelle ajuste le mieux ; avec "
+                        "'exp' les portées à passer sont les e-folding.")
+    p.add_argument("--influence_km", type=float, nargs="+",
+                   default=[INFLUENCE_RADIUS_KM],
+                   help="Portée(s) du modèle paramétrique, en km : une "
+                        "valeur (commune) ou DEUX (L_T L_S). Les mesures sur "
+                        "la boîte PIRATA donnent L_T~483 et L_S~177 — un "
+                        "scalaire est un mauvais compromis. Voir --scales.")
     p.add_argument("--evf_shrink", type=float, default=EVF_SHRINKAGE,
                    help="Contraction vers la covariance paramétrique (0..1)")
     p.add_argument("--evf_cv", action="store_true",
@@ -2315,6 +2407,7 @@ if __name__ == "__main__":
                           min_sep_km=args.min_sep_km, geo=GLORYS,
                           info_mode=args.info_mode,
                           influence_km=args.influence_km,
+                          evf_kernel=args.evf_kernel,
                           evf_shrink=args.evf_shrink, evf_cv=args.evf_cv,
                           obs_noise=obs_noise)
     args._rm = rm

@@ -39,6 +39,7 @@ answer.
 5. [Brick 2 — Graph neural network](#5-brick-2--graph-neural-network)
 6. [Brick 3 — Reinforcement learning](#6-brick-3--reinforcement-learning)
 7. [Orchestrator](#7-orchestrator)
+7b. [Maintenance-aware design](README_MAINTENANCE.md) — separate document
 8. [Configuration reference](#8-configuration-reference)
 9. [Output files](#9-output-files)
 10. [Known limitations](#10-known-limitations)
@@ -557,6 +558,32 @@ Quick smoke test:
 ```bash
 python run_demo.py --mode pipeline --nt 365 --ae_epochs 1 --ae_base_ch 8 \
     --gnn_epochs 15 --rl_steps 1000 --gif_frames 5 --no_nature_fig
+```
+
+---
+
+## 7b. Maintenance-aware design
+
+The `cost ∝ number of buoys` proxy used by Brick 3 is replaced by an explicit
+upkeep model that feeds back into the information criterion through **data
+availability**: budget → affordable campaigns → visit interval → availability →
+effective observation error → variance explained.
+
+Headline result: a network designed while ignoring maintenance loses 50–96 % of
+the information delivered by one designed under the single rule *do not deploy
+what you cannot service once a year*. Five seeds, two domains, two ship
+profiles. Nine maintained buoys beat thirty abandoned ones.
+
+The same document reports what did **not** work — reinforcement learning for
+static placement, the GNN as a decision input, a learned recurrent
+reconstruction — and, importantly, the calibration traps that produced
+plausible but wrong numbers before being caught.
+
+**→ [README_MAINTENANCE.md](README_MAINTENANCE.md)**
+
+```bash
+NAIADE_DOMAIN=large python 03_rl.py --maintenance pirata --campaign \
+    --influence_fit --evf_cv 1 --n_max 30
 ```
 
 ---

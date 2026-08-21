@@ -74,11 +74,32 @@ def parse_args():
                    help="RL information score")
     p.add_argument("--rl_min_sep", type=int, default=MIN_SEP_CELLS,
                    help="Minimum buoy separation (grid cells)")
+    p.add_argument("--rl_influence_fit", action="store_true",
+                   help="Ajuster le rayon d influence sur la correlation "
+                        "empirique 2D plutot que sur la constante de config. "
+                        "Indispensable des que le domaine change.")
+    p.add_argument("--rl_evf_shrink", type=float, default=EVF_SHRINKAGE,
+                   help="Contraction empirique -> parametrique du critere EVF")
     p.add_argument("--rl_influence_km", type=float, default=INFLUENCE_RADIUS_KM,
                    help="Sensor influence radius (km)")
     p.add_argument("--rl_episode_len", type=int, default=20,
                    help="Actions per RL episode (default 20, same as standalone)")
     p.add_argument("--gif_frames",  type=int, default=40)
+    # Maintien en condition operationnelle (brique 3 etendue)
+    p.add_argument("--maintenance", type=str, default="off",
+                   choices=["off", "regional", "pirata"],
+                   help="Modele de maintien des bouees. Active l'etape 4 : "
+                        "reseau optimal et trajectoire de campagne par niveau "
+                        "de budget, avec retroaction du maintien sur "
+                        "l'information via la disponibilite des donnees.")
+    p.add_argument("--budgets",     type=float, nargs="+", default=None,
+                   help="Niveaux de budget annuel (k€). Par defaut : calibres "
+                        "automatiquement sur le budget minimum viable.")
+    p.add_argument("--budget_keur", type=float, default=None,
+                   help="Budget impose a l'agent RL pendant l'entrainement")
+    p.add_argument("--reward_mode", type=str, default="info",
+                   choices=["info", "ratio", "penalized"],
+                   help="Critere optimise par le RL (voir 03_rl.py)")
     p.add_argument("--output_dir",  type=str, default="outputs")
     p.add_argument("--no_nature_fig", action="store_true",
                    help="Skip the nature run diagnostic figure")
@@ -336,8 +357,13 @@ def main():
         n_min=args.rl_n_min, n_max=args.rl_n_max,
         episode_len=args.rl_episode_len, w_info=1.0, w_budget=0.5,
         info_mode=args.rl_info_mode, influence_km=args.rl_influence_km,
+        influence_fit=args.rl_influence_fit, evf_shrink=args.rl_evf_shrink,
         n_random=15,
         gif_frames=args.gif_frames,
+        maintenance=args.maintenance, budget_keur=args.budget_keur,
+        reward_mode=args.reward_mode, w_cost=0.5, cost_ref=COST_REF_KEUR,
+        maint_refine=False, budgets=args.budgets, min_sep=args.rl_min_sep,
+        evf_cv=0, checkpoint=str(out / "rl_best.pt"),
         seed_ocean=args.seed_ocean, seed_buoys=args.seed_buoys)
 
     report_sections = _report_header(args.mode, args, T, init_pos, ts,
@@ -355,6 +381,34 @@ def main():
 # ══════════════════════════════════════════════════════════════════════════════
 #  INDIVIDUAL MODE: AE -> GNN -> RL  (each on the initial network)
 # ══════════════════════════════════════════════════════════════════════════════
+
+def _run_campaign_step(env, rl_ns, out, metrics, report_sections, policy=None):
+    """
+    Etape 4 -- maintien en condition operationnelle.
+
+    Pour chaque niveau de budget : reseau optimal sous contrainte, plan de
+    campagnes, trajectoire du navire, et ratio information / cout de maintien.
+    Ne s'execute que si --maintenance est actif.
+    """
+    from campaign import run_campaign_demo, campaign_report_lines
+    print(f"\n{SEP}\n  ETAPE 4 -- Maintien : reseau et campagnes par budget\n{SEP}")
+    t0 = time.time()
+    results, fig_path, json_path = run_campaign_demo(
+        env, rl_ns.budgets, str(out), policy=policy)
+    dt = round(time.time() - t0, 1)
+    report_sections += campaign_report_lines(env, results)
+    best = max(results, key=lambda r: r["ev"]["ratio"])
+    metrics.update({
+        "maint_profile": env.maint.p.name,
+        "maint_n_budgets": len(results),
+        "maint_best_ratio_budget": best["budget"],
+        "maint_best_ratio": best["ev"]["ratio"],
+        "maint_time": dt})
+    print(f"  [ok] Campagnes  {len(results)} niveaux de budget  [{dt}s]")
+    print(f"       meilleur rendement : {best['ev']['ratio']:.3f} EVF/100k€ "
+          f"a {best['budget']:.0f} k€/an")
+    return results
+
 
 def _run_individual(args, T, S, positions, b1, b2, b3,
                     ae_ns, gnn_ns, rl_ns, metrics, report_sections, out, ts, t0):
@@ -407,9 +461,17 @@ def _run_individual(args, T, S, positions, b1, b2, b3,
     # -- Brick 3 -- RL ----------------------------------------------------------
     print(f"\n{SEP}\n  BRICK 3 -- RL optimisation\n{SEP}")
     t0_rl = time.time()
+    maint = b3.build_maintenance(rl_ns)
     env   = b3.OceanNetworkEnv(T, S, grid_x=rl_ns.grid_x, grid_y=rl_ns.grid_y,
                                 n_min=rl_ns.n_min, n_max=rl_ns.n_max,
-                                episode_len=rl_ns.episode_len)
+                                episode_len=rl_ns.episode_len,
+                                fit_influence=rl_ns.influence_fit,
+                                shrinkage=rl_ns.evf_shrink,
+                                maintenance=maint,
+                                budget_keur=rl_ns.budget_keur,
+                                reward_mode=rl_ns.reward_mode,
+                                w_cost=rl_ns.w_cost,
+                                cost_ref_keur=rl_ns.cost_ref)
     policy = b3.train_ppo(rl_ns, env)
     pareto_pts, pareto_mask, n_star = b3.compute_pareto_front(
         env, policy, rl_ns, n_random=15)
@@ -432,6 +494,11 @@ def _run_individual(args, T, S, positions, b1, b2, b3,
     report_sections += _report_rl(m_rl)
     print(f"  [ok] RL   N*={n_star}  [{rl_time}s]")
 
+    # -- Step 4 -- maintenance campaigns per budget level ------------------------
+    if env.maint is not None:
+        _run_campaign_step(env, rl_ns, out, metrics, report_sections,
+                           policy=policy)
+
     # -- Report -----------------------------------------------------------------
     total = time.time() - t0
     report_sections += _report_footer("individual", total, args, metrics, str(out))
@@ -451,12 +518,20 @@ def _run_pipeline(args, T, S, init_pos, b1, b2, b3,
     # -- Step 1: RL proposes the optimal network ---------------------------------
     print(f"\n{SEP}\n  STEP 1/3 -- RL: search for the optimal network\n{SEP}")
     t0_rl = time.time()
+    maint  = b3.build_maintenance(rl_ns)
     env    = b3.OceanNetworkEnv(T, S, grid_x=rl_ns.grid_x, grid_y=rl_ns.grid_y,
                                  n_min=rl_ns.n_min, n_max=rl_ns.n_max,
                                  episode_len=rl_ns.episode_len,
                                  info_mode=rl_ns.info_mode,
                                  influence_km=rl_ns.influence_km,
-                                 min_sep=args.rl_min_sep)
+                                 min_sep=args.rl_min_sep,
+                                 fit_influence=rl_ns.influence_fit,
+                                 shrinkage=rl_ns.evf_shrink,
+                                 maintenance=maint,
+                                 budget_keur=rl_ns.budget_keur,
+                                 reward_mode=rl_ns.reward_mode,
+                                 w_cost=rl_ns.w_cost,
+                                 cost_ref_keur=rl_ns.cost_ref)
     policy = b3.train_ppo(rl_ns, env)
     pareto_pts, pareto_mask, n_star = b3.compute_pareto_front(
         env, policy, rl_ns, n_random=15)
@@ -561,6 +636,11 @@ def _run_pipeline(args, T, S, init_pos, b1, b2, b3,
     report_sections += _report_ae(m_ae)
     print(f"  ✓ AE  RMSE_val={val_rmse:.4f}  "
           f"({rmse_T_phys:.3f} °C | {rmse_S_phys:.4f} psu)  [{ae_time}s]")
+
+    # -- Step 4 -- maintenance campaigns per budget level ------------------------
+    if env.maint is not None:
+        _run_campaign_step(env, rl_ns, out, metrics, report_sections,
+                           policy=policy)
 
     # -- Report -----------------------------------------------------------------
     total = time.time() - t0

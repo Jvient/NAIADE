@@ -40,6 +40,9 @@ try:
 except ImportError:
     AE_AVAILABLE = False
 
+# --- Maintenance model (buoy upkeep, availability, campaign planning) --------
+from maintenance import MaintenanceModel, get_params, availability_from_visits
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  ENVIRONNEMENT MDP
@@ -78,10 +81,19 @@ class OceanNetworkEnv:
                  info_mode="evf",          # "evf" (defaut) | "coverage" | "legacy"
                  influence_km=INFLUENCE_RADIUS_KM,
                  info_gain=RL_INFO_GAIN,
-                 eval_stride=8,            # evaluation-grid subsampling
+                 eval_stride=EVAL_STRIDE,  # evaluation-grid subsampling
                  evf_cv=False,             # score EVF valide hors echantillon
+                 shrinkage=None,           # contraction empirique -> parametrique
                  min_sep=MIN_SEP_CELLS,    # minimum separation, in grid cells
-                 ae_model=None):           # optional autoencoder (Brick 1)
+                 ae_model=None,            # optional autoencoder (Brick 1)
+                 # ---- maintien en condition opérationnelle -------------------
+                 maintenance=None,         # MaintenanceModel | None (proxy N)
+                 budget_keur=None,         # budget annuel de maintien (k€)
+                 reward_mode="info",       # info | ratio | penalized
+                 w_cost=0.5,               # poids du coût en mode "penalized"
+                 cost_ref_keur=COST_REF_KEUR,
+                 maint_refine=False,       # 2-opt complet (lent) pendant le RL
+                 fit_influence=False):     # ajuster L sur la correlation empirique
         self.T = T.astype(np.float32)
         self.S = S.astype(np.float32)
         self.grid_x  = grid_x
@@ -93,9 +105,14 @@ class OceanNetworkEnv:
         self.w_info, self.w_budget = w_info, w_budget
         self.info_mode    = info_mode
         self.influence_px = influence_km / DX_KM
+        self.influence_km = float(influence_km)
+        self.fit_influence = bool(fit_influence)
         self.info_gain    = info_gain if info_mode in ("coverage", "evf") else 1.0
         self.eval_stride  = eval_stride
         self.evf_cv       = bool(evf_cv)
+        # None = valeur de config. Cet argument etait parse en ligne de commande
+        # mais jamais transmis : --evf_shrink n'avait aucun effet.
+        self._shrink_arg  = shrinkage
         self.min_sep      = int(min_sep)
         self.ae_model = ae_model
         self.nt = len(T)
@@ -116,11 +133,32 @@ class OceanNetworkEnv:
         # Global nature run statistics (precomputed once)
         self._precompute_field_stats()
 
+        # ── Maintien en condition opérationnelle ─────────────────────────────
+        # Quand un MaintenanceModel est fourni, le coût n'est plus un proxy du
+        # nombre de bouées : c'est le coût réel d'un plan de campagnes sous
+        # budget, et ce plan rétroagit sur l'information via la disponibilité
+        # des données. Sans modèle, le comportement historique est conservé.
+        self.maint         = maintenance
+        self.budget_keur   = budget_keur
+        self.reward_mode   = reward_mode
+        self.w_cost        = float(w_cost)
+        self.cost_ref      = float(cost_ref_keur)
+        self.maint_refine  = bool(maint_refine)
+        self._eval_cache   = {}
+        self._cache_max    = 20000
+        # priorité de maintenance = variabilité locale au point candidat
+        # (proxy statique de l'information portée, indépendant du plan courant
+        #  donc non circulaire — l'EVF marginale est utilisée hors boucle RL)
+        self._maint_priority = (self.field_stats - self.field_stats.min())
+        self._maint_priority /= (self._maint_priority.max() + 1e-9)
+        self._maint_priority += 0.05
+
         # Current state
         self.active_mask = None    # (K,) binaire
         self.step_count  = 0
         self.t_current   = 0
-        self.obs_dim = self.K + len(self.field_stats)
+        n_extra = 2 if self.maint is not None else 0   # coût/budget, dispo moy.
+        self.obs_dim = self.K + len(self.field_stats) + n_extra
 
     def _build_conflict_matrix(self):
         """
@@ -221,6 +259,20 @@ class OceanNetworkEnv:
         A = a.reshape(1, -1) if single else a
         conflicts = (A > 0.5) @ self._conflict          # (B, K)
         invalid = (conflicts > 0) & (A <= 0.5)
+
+        # Contrainte de budget de maintien : interdire l'ajout d'une bouée que
+        # le budget ne permettrait plus d'entretenir. Le budget n'est pas une
+        # pénalité molle, c'est une contrainte dure de l'armement.
+        # Plafond exact et instantané : le capex amorti est incompressible, donc
+        # un réseau de n bouées est infinançable dès que n * capex > budget.
+        # Le dépassement dû aux jours de mer, lui, reste traité en pénalité
+        # (l'évaluer par candidat coûterait K plans de campagne par pas).
+        if self.maint is not None and self.budget_keur is not None:
+            capex1 = (self.maint.p.buoy_capex_keur
+                      / max(self.maint.p.buoy_life_years, 1e-6))
+            n_cap = int(self.budget_keur // max(capex1, 1e-9))
+            n_act = (A > 0.5).sum(axis=1)
+            invalid |= ((n_act >= n_cap)[:, None] & (A <= 0.5))
         return invalid[0] if single else invalid
 
     def _precompute_field_stats(self):
@@ -304,6 +356,8 @@ class OceanNetworkEnv:
         on the first half, score on the second): it is the honest figure to
         report, slightly noisier.
         """
+        if shrinkage is None:
+            shrinkage = getattr(self, "_shrink_arg", None)
         d = EVF_SHRINKAGE if shrinkage is None else float(shrinkage)
         cv = getattr(self, "evf_cv", False) if cv is None else bool(cv)
 
@@ -325,6 +379,9 @@ class OceanNetworkEnv:
         # -- parametric model -------------------------------------------------
         cnd  = np.array(self.candidate_positions, dtype=np.float64)
         cell = self._eval_xy.astype(np.float64)
+        if self.fit_influence:
+            self.influence_px = self._fit_influence_px(cnd, oT[tr], oS[tr])
+            self.influence_km = self.influence_px * DX_KM
         L2   = 2.0 * self.influence_px ** 2
 
         def _rho(A, B):
@@ -361,6 +418,9 @@ class OceanNetworkEnv:
             self._O_va = O[nt // 2:].astype(np.float64)
             self._Y_va = Y[nt // 2:].astype(np.float64)
             self._var_total = float((self._Y_va ** 2).mean(0).sum())
+            # motif de lacunes figé (voir explained_variance)
+            self._u_va = np.random.default_rng(12345).random(
+                (len(self._Y_va), self.K))
         else:
             self._var_total = float(((1 - d) * var_smp + d * var_par).sum())
 
@@ -369,13 +429,43 @@ class OceanNetworkEnv:
         rS = (OBS_NOISE_S / (self.S.std() + 1e-9)) ** 2
         self._R_diag = np.concatenate([np.full(self.K, rT), np.full(self.K, rS)])
 
-    def explained_variance(self, active_idx):
-        """Fraction of the system mesoscale variability explained by the network."""
+    def explained_variance(self, active_idx, availability=None):
+        """
+        Fraction of the system mesoscale variability explained by the network.
+
+        `availability` (n,) in (0, 1] — fraction of the time each buoy actually
+        delivers data, as produced by the maintenance plan. An intermittent
+        sensor is treated exactly as what it is: a noisier sensor.
+
+        Derivation. Let m_i ~ Bernoulli(a_i) be the presence indicator and
+        z_i = m_i y_i the observation actually received (zero = climatology
+        when the buoy is down). Then
+
+            Cov(z_i, z_j) = a_i a_j C_ij            (i != j)
+            Var(z_i)      = a_i (C_ii + R_ii)
+            Cov(z_i, x_c) = a_i C_ic
+
+        so the BLUE built on z is the BLUE built on y with the covariance
+        C_OO unchanged and the noise inflated to
+
+            R_eff_i = R_ii / a_i + C_ii (1 - a_i) / a_i
+
+        The second term dominates: at a = 0.5 a buoy carries a noise of the
+        order of the signal variance itself, i.e. almost no information.
+        This is the mechanism by which a maintenance budget moves the
+        information score, and it costs one diagonal update.
+        """
         active_idx = np.asarray(active_idx, dtype=int)
         if len(active_idx) == 0:
             return 0.0
         idx = np.concatenate([active_idx, active_idx + self.K])
-        G = self._C_OO[np.ix_(idx, idx)] + np.diag(self._R_diag[idx])
+        R = self._R_diag[idx].copy()
+        if availability is not None:
+            a = np.clip(np.asarray(availability, dtype=np.float64).ravel(),
+                        1e-3, 1.0)
+            a2 = np.concatenate([a, a])                    # même bouée, T et S
+            R = R / a2 + np.diag(self._C_OO)[idx] * (1.0 - a2) / a2
+        G = self._C_OO[np.ix_(idx, idx)] + np.diag(R)
         C = self._C_OY[idx]
         try:
             B = np.linalg.solve(G, C)              # gain d'interpolation optimale
@@ -385,7 +475,16 @@ class OceanNetworkEnv:
         if not self._evf_cv:
             return float((C * B).sum() / (self._var_total + 1e-12))
 
-        resid = self._Y_va - self._O_va[:, idx] @ B
+        O_va = self._O_va[:, idx]
+        if availability is not None:
+            # Gaps actually realised on the validation half. The pattern is
+            # drawn once and frozen (`_u_va`), so the score stays a
+            # deterministic function of the network and of its availability:
+            # no stochastic noise injected into the RL reward.
+            pres = (self._u_va[:, active_idx] < a[None, :])
+            pres = np.concatenate([pres, pres], axis=1)
+            O_va = O_va * pres / a2[None, :]
+        resid = self._Y_va - O_va @ B
         expl = (self._Y_va ** 2).mean(0).sum() - (resid ** 2).mean(0).sum()
         return float(expl / (self._var_total + 1e-12))
 
@@ -403,11 +502,18 @@ class OceanNetworkEnv:
         information/cost trade-off genuinely antagonistic.
 
         Retourne (cout_keur, co2_tonnes, longueur_km).
+
+        Si un `MaintenanceModel` est attaché à l'environnement, ce proxy est
+        remplacé par le coût réel du plan de maintien sous budget (capex
+        amorti + jours de mer + consommables), cf. `evaluate()`.
         """
         active_idx = np.asarray(active_idx, dtype=int)
         n = len(active_idx)
         if n == 0:
             return 0.0, 0.0, 0.0
+        if self.maint is not None:
+            ev = self.evaluate(active_idx)
+            return ev["cost_keur"], ev["co2_t"], ev["km"]
         pts = np.array([self.candidate_positions[i] for i in active_idx],
                        dtype=np.float64) * DX_KM
         port = np.array([PORT_XY_FRAC[0] * NX, PORT_XY_FRAC[1] * NY]) * DX_KM
@@ -425,6 +531,121 @@ class OceanNetworkEnv:
         co2  = km_an * CO2_SHIP_PER_KM
         return float(cost), float(co2), float(length)
 
+    # -------------------------------------------------------------------------
+    #  Évaluation couplée information / maintien
+    # -------------------------------------------------------------------------
+    def _fit_influence_px(self, cnd, oT_tr, oS_tr, verbose=True):
+        """
+        Ajuste l'échelle L du noyau exp(-d^2 / 2L^2) sur la corrélation
+        EMPIRIQUE entre positions candidates.
+
+        Pourquoi ne pas se contenter du diagnostic du nature run : celui-ci
+        mesure une décorrélation ZONALE sur UN instantané. Or le jet est
+        zonalement cohérent par construction, donc cette mesure capte d'abord
+        la structure du jet, pas la mésoéchelle — sur le préréglage `large`
+        elle renvoie ~430 km là où les tourbillons font 56-120 km de rayon.
+        Et le noyau, lui, est ISOTROPE : le calibrer sur une décorrélation
+        d'une seule direction le rend faux dans l'autre.
+
+        Ici on utilise toutes les paires de candidats, toutes les directions et
+        tous les pas de temps, et on ajuste exactement la forme fonctionnelle
+        que le modèle emploie. C'est la seule calibration cohérente avec
+        l'usage qui en est fait.
+        """
+        R = np.corrcoef(np.concatenate([oT_tr, oS_tr], axis=1), rowvar=False)
+        K = self.K
+        R = 0.5 * (R[:K, :K] + R[K:, K:])            # moyenne des canaux T et S
+        d = np.sqrt(((cnd[:, None, :] - cnd[None, :, :]) ** 2).sum(-1))
+        iu = np.triu_indices(K, k=1)
+        dv, rv = d[iu], R[iu]
+        grid = np.linspace(0.05, 1.5, 200) * max(NX, NY) * 0.5
+        err = [(np.exp(-dv ** 2 / (2.0 * L ** 2)) - rv) ** 2 for L in grid]
+        L = float(grid[int(np.argmin([e.sum() for e in err]))])
+        if verbose:
+            resid = np.sqrt(np.mean((np.exp(-dv ** 2 / (2 * L ** 2)) - rv) ** 2))
+            print(f"  Noyau ajuste  : L = {L * DX_KM:.0f} km "
+                  f"(configure {self.influence_km:.0f} km) | "
+                  f"RMS residuel sur la correlation = {resid:.3f}")
+        return L
+
+    def positions_km(self, active_idx):
+        """Positions physiques (km) des bouées actives."""
+        active_idx = np.asarray(active_idx, dtype=int)
+        return np.array([self.candidate_positions[i] for i in active_idx],
+                        dtype=np.float64) * DX_KM
+
+    def evaluate(self, active_idx, budget_keur="default", refine=None,
+                 priority=None, with_plan=False):
+        """
+        Évaluation complète d'une configuration sous contrainte de maintien.
+
+            réseau  ->  plan de campagnes (budget)  ->  disponibilité
+                    ->  information (EVF dégradée)  ->  ratio info / coût
+
+        Retourne un dict :
+            info          EVF effective, disponibilité prise en compte
+            info_nominal  EVF si toutes les bouées étaient disponibles à 100 %
+            cost_keur     coût annuel total de maintien
+            co2_t, km, days_at_sea
+            availability  (n,) disponibilité par bouée
+            visits        (n,) campagnes/an accordées à chaque bouée
+            ratio         info par 100 k€/an  -- le critère info/coût
+            over_budget   dépassement (k€), 0 si le plan tient dans le budget
+        """
+        active_idx = np.asarray(active_idx, dtype=int)
+        budget = self.budget_keur if budget_keur == "default" else budget_keur
+        refine = self.maint_refine if refine is None else bool(refine)
+
+        if len(active_idx) == 0:
+            return {"info": 0.0, "info_nominal": 0.0, "cost_keur": 0.0,
+                    "co2_t": 0.0, "km": 0.0, "days_at_sea": 0.0,
+                    "availability": np.array([]), "visits": np.array([]),
+                    "ratio": 0.0, "over_budget": 0.0, "plan": None}
+
+        key = None
+        if priority is None and not with_plan:
+            key = (tuple(np.sort(active_idx).tolist()),
+                   None if budget is None else round(float(budget), 3), refine)
+            hit = self._eval_cache.get(key)
+            if hit is not None:
+                return hit
+
+        pts = self.positions_km(active_idx)
+        prio = (self._maint_priority[active_idx] if priority is None
+                else np.asarray(priority, dtype=np.float64))
+        plan = self.maint.plan(pts, budget_keur=budget, priority=prio,
+                               buoy_ids=active_idx, refine=refine)
+
+        info_nom = self.explained_variance(active_idx)
+        info_eff = self.explained_variance(active_idx, plan.availability)
+        cost = plan.total_cost_keur
+        over = 0.0 if budget is None else max(0.0, cost - budget)
+        ratio = info_eff / max(cost, 1e-6) * 100.0
+
+        out = {"info": float(info_eff), "info_nominal": float(info_nom),
+               "cost_keur": float(cost), "co2_t": float(plan.co2_t),
+               "km": float(plan.km), "days_at_sea": float(plan.days_at_sea),
+               "availability": plan.availability, "visits": plan.visits,
+               "ratio": float(ratio), "over_budget": float(over),
+               "plan": plan if with_plan else None}
+        if key is not None:
+            if len(self._eval_cache) > self._cache_max:
+                self._eval_cache.clear()
+            self._eval_cache[key] = out
+        return out
+
+    def efficiency(self, active_idx):
+        """
+        Critère scalaire information / coût de maintien, normalisé.
+
+            E = EVF_effective / (coût annuel / COST_REF)
+
+        Divisé par un coût de référence pour rester d'ordre 1. C'est la
+        quantité maximisée en mode de récompense `ratio`.
+        """
+        ev = self.evaluate(active_idx)
+        return ev["info"] / max(ev["cost_keur"] / self.cost_ref, 1e-6)
+
     def reset(self):
         """Initialise an episode: random placement of n_init buoys."""
         n_init = np.random.randint(self.n_min, self.n_max + 1)
@@ -435,8 +656,25 @@ class OceanNetworkEnv:
         return self._get_obs()
 
     def _get_obs(self):
-        """State vector: active mask || field statistics."""
-        return np.concatenate([self.active_mask, self.field_stats])
+        """
+        State vector: active mask || field statistics
+                      [|| coût/budget || disponibilité moyenne]
+
+        Les deux scalaires supplémentaires ne sont ajoutés que si un modèle de
+        maintien est actif. Sans eux, la politique ne peut pas savoir où elle
+        se situe par rapport au budget : elle est aveugle à la contrainte
+        qu'on lui demande de respecter.
+        """
+        base = np.concatenate([self.active_mask, self.field_stats])
+        if self.maint is None:
+            return base
+        idx = np.where(self.active_mask > 0.5)[0]
+        ev = self.evaluate(idx)
+        ref = self.budget_keur if self.budget_keur else self.cost_ref
+        return np.concatenate([base, np.array(
+            [min(ev["cost_keur"] / max(ref, 1e-6), 3.0),
+             (float(np.mean(ev["availability"])) if len(idx) else 0.0)],
+            dtype=np.float32)])
 
     def _compute_info_reward(self):
         """
@@ -466,6 +704,10 @@ class OceanNetworkEnv:
             return 0.0
 
         if self.info_mode == "evf":
+            if self.maint is not None:
+                # information EFFECTIVE : ce que le réseau délivre vraiment
+                # compte tenu du plan de maintien finançable
+                return self.evaluate(active_idx)["info"]
             return self.explained_variance(active_idx)
 
         if self.info_mode == "coverage":
@@ -527,6 +769,44 @@ class OceanNetworkEnv:
         reward = (self.w_info   * self.info_gain * delta_info
                   - self.w_budget * budget_penalty)
 
+        extra = {}
+        if self.maint is not None and self.reward_mode != "info":
+            idx_new = np.where(self.active_mask > 0.5)[0]
+            idx_old = idx_new.copy()
+            if was_active:
+                idx_old = np.sort(np.append(idx_old, action))
+            else:
+                idx_old = idx_old[idx_old != action]
+            ev_new = self.evaluate(idx_new)
+            ev_old = self.evaluate(idx_old)
+
+            if self.reward_mode == "ratio":
+                # Récompense sur la variation du RATIO information / coût de
+                # maintien. La somme sur l'épisode télescope vers
+                # E(final) - E(initial) : le retour mesure exactement le gain
+                # d'efficacité du réseau, sans biais d'échelle par pas.
+                e_new = ev_new["info"] / max(ev_new["cost_keur"] / self.cost_ref, 1e-6)
+                e_old = ev_old["info"] / max(ev_old["cost_keur"] / self.cost_ref, 1e-6)
+                reward = (self.w_info * RL_RATIO_GAIN * (e_new - e_old)
+                          - self.w_budget * budget_penalty)
+                extra["efficiency"] = float(e_new)
+            else:   # "penalized" : information moins coût, scalarisation
+                d_cost = (ev_new["cost_keur"] - ev_old["cost_keur"]) / self.cost_ref
+                reward = (self.w_info * self.info_gain * delta_info
+                          - self.w_cost * d_cost
+                          - self.w_budget * budget_penalty)
+
+            # Dépassement de budget : pénalité proportionnelle. Le masquage
+            # d'actions (invalid_action_mask) empêche déjà la politique PPO
+            # d'y aller ; cette pénalité protège les appels hors PPO.
+            if ev_new["over_budget"] > 0:
+                reward -= self.w_budget * ev_new["over_budget"] / self.cost_ref
+            extra.update({"cost_keur": ev_new["cost_keur"],
+                          "availability": float(np.mean(ev_new["availability"]))
+                          if len(idx_new) else 0.0,
+                          "ratio": ev_new["ratio"],
+                          "over_budget": ev_new["over_budget"]})
+
         self.step_count += 1
         done = (self.step_count >= self.ep_len)
 
@@ -536,6 +816,7 @@ class OceanNetworkEnv:
             "budget_penalty": budget_penalty,
             "total_info":     new_info,
         }
+        info.update(extra)
         return self._get_obs(), float(reward), done, info
 
 
@@ -1729,30 +2010,122 @@ def parse_args():
                    help="Random draws per N for the Pareto cloud")
     p.add_argument("--influence_km", type=float, default=INFLUENCE_RADIUS_KM,
                    help="Influence radius of one sensor (km)")
+    p.add_argument("--influence_fit", action="store_true",
+                   help="Ajuster le rayon d influence sur la correlation "
+                        "empirique entre positions candidates (2D, toutes "
+                        "directions, tous pas de temps). Plus fiable que "
+                        "--influence_auto, qui repose sur une decorrelation "
+                        "zonale mesuree sur un seul instantane.")
+    p.add_argument("--influence_auto", action="store_true",
+                   help="Lire le rayon d influence sur le nature run "
+                        "(longueur de decorrelation diagnostiquee) au lieu de "
+                        "la constante de config. Recommande des que le "
+                        "domaine change.")
     p.add_argument("--w_info",       type=float, default=1.0)
     p.add_argument("--w_budget",     type=float, default=0.5)
     p.add_argument("--gif_frames",   type=int, default=80)
+    # ── maintien en condition opérationnelle ─────────────────────────────────
+    p.add_argument("--maintenance",  type=str, default="off",
+                   choices=["off", "regional", "pirata"],
+                   help="Modele de maintien des bouees. 'off' = proxy "
+                        "historique (cout ~ N + tournee). Sinon : plan de "
+                        "campagnes sous budget, avec retroaction sur "
+                        "l'information via la disponibilite des donnees.")
+    p.add_argument("--budget_keur",  type=float, default=None,
+                   help="Budget annuel de maintien (k€). Non renseigne = "
+                        "budget illimite (maintenance nominale).")
+    p.add_argument("--reward_mode",  type=str, default="info",
+                   choices=["info", "ratio", "penalized"],
+                   help="info = information seule (historique) | ratio = "
+                        "information par k€ de maintien | penalized = "
+                        "information moins w_cost * cout")
+    p.add_argument("--w_cost",       type=float, default=0.5,
+                   help="Poids du cout en mode de recompense 'penalized'")
+    p.add_argument("--cost_ref",     type=float, default=COST_REF_KEUR,
+                   help="Cout de reference (k€/an) normalisant le ratio")
+    p.add_argument("--maint_refine", action="store_true",
+                   help="2-opt complet sur les tournees pendant le RL "
+                        "(plus fidele, ~3x plus lent)")
+    p.add_argument("--campaign",     action="store_true",
+                   help="Demo campagnes : reseau optimal et trajectoire de "
+                        "maintenance pour plusieurs niveaux de budget")
+    p.add_argument("--budgets",      type=float, nargs="+",
+                   default=(list(BUDGET_LEVELS_KEUR)
+                            if BUDGET_LEVELS_KEUR else None),
+                   help="Niveaux de budget balayes par --campaign (k€/an)")
     return p.parse_args()
+
+
+def diagnose_influence_km(gen, run, configured=INFLUENCE_RADIUS_KM,
+                          tol=INFLUENCE_AUTO_TOL, verbose=True):
+    """
+    Longueur de decorrelation lue SUR LE NATURE RUN, et confrontee a la valeur
+    configuree.
+
+    Le rayon d'influence pilote le noyau de covariance parametrique du critere
+    EVF. S'il est faux, le critere est mal specifie et le classement des
+    configurations ne veut rien dire -- y compris la comparaison au temoin
+    "sans maintien". C'est un piege silencieux : rien ne plante, les chiffres
+    sortent, ils sont simplement sans valeur. D'ou l'avertissement explicite.
+
+    Retourne (L_diagnostique_km, ecart_relatif).
+    """
+    d = gen.diagnostics(run)
+    L = float(d["L_decorr_SST_km"])
+    rel = abs(L - configured) / max(configured, 1e-9)
+    if verbose:
+        print(f"  Decorrelation : diagnostiquee {L:.0f} km  |  configuree "
+              f"{configured:.0f} km  (ecart {rel*100:.0f} %)")
+        if rel > tol:
+            print(f"  [ALERTE] Ecart > {tol*100:.0f} % : le noyau de covariance "
+                  f"de l EVF est probablement mal specifie.\n"
+                  f"           Relancer avec --influence_fit (recommande : "
+                  f"ajuste sur la correlation 2D).\n"
+                  f"           NE PAS utiliser {L:.0f} km tel quel : ce "
+                  f"diagnostic est ZONAL et pris sur un seul instantane, il "
+                  f"capte\n"
+                  f"           la coherence du jet plus que la mesoechelle et "
+                  f"surestime largement l echelle isotrope.")
+    return L, rel
+
+
+def build_maintenance(args):
+    """Construit le MaintenanceModel demande en ligne de commande (ou None)."""
+    if getattr(args, "maintenance", "off") in (None, "off"):
+        return None
+    params = get_params(args.maintenance)
+    port = np.array([PORT_XY_FRAC[0] * NX, PORT_XY_FRAC[1] * NY]) * DX_KM
+    return MaintenanceModel(params, port)
 
 
 if __name__ == "__main__":
     from datetime import datetime
     args = parse_args()
 
-    if not (args.train or args.pareto or args.gif or args.multiobj):
+    if not (args.train or args.pareto or args.gif or args.multiobj
+            or args.campaign):
         print("Usage: python 03_rl.py --train [--pareto] [--multiobj] "
-              "[--gif] [--report]")
+              "[--gif] [--report]\n"
+              "       python 03_rl.py --maintenance regional --campaign "
+              "--budgets 300 500 800 1200")
         sys.exit(0)
 
     print(f"\n[1/2] Generating the nature run (seed_ocean={args.seed_ocean})...")
     gen = SyntheticOceanGenerator()
-    T, S = gen.generate_dataset(nt=args.nt, seed=args.seed_ocean)
+    run = gen.generate_full(nt=args.nt, seed=args.seed_ocean)
+    T, S = run["T"], run["S"]
+    L_diag, _ = diagnose_influence_km(gen, run, args.influence_km)
+    if args.influence_auto:
+        args.influence_km = L_diag
+        print(f"  --influence_auto : rayon d influence porte a {L_diag:.0f} km")
+    del run, gen.last_run
 
     print("[2/2] Initialising the MDP environment...")
     if args.nt < 365:
         print(f"  [ATTENTION] nt={args.nt} < 365 : cycle saisonnier "
               f"incomplet, statistiques biaisees.")
 
+    maint = build_maintenance(args)
     env = OceanNetworkEnv(
         T, S,
         grid_x=args.grid_x, grid_y=args.grid_y,
@@ -1760,14 +2133,36 @@ if __name__ == "__main__":
         episode_len=args.episode_len,
         w_info=args.w_info, w_budget=args.w_budget,
         info_mode=args.info_mode, influence_km=args.influence_km,
-        evf_cv=bool(args.evf_cv), min_sep=args.min_sep)
+        evf_cv=bool(args.evf_cv), min_sep=args.min_sep,
+        shrinkage=args.evf_shrink, fit_influence=args.influence_fit,
+        maintenance=maint, budget_keur=args.budget_keur,
+        reward_mode=args.reward_mode, w_cost=args.w_cost,
+        cost_ref_keur=args.cost_ref, maint_refine=args.maint_refine)
+    if maint is not None:
+        p = maint.p
+        print(f"  Maintien      : profil '{p.name}' | navire "
+              f"{p.ship_day_rate_keur:.0f} k€/j a {p.ship_speed_kn:.0f} nds | "
+              f"MTBF {p.mtbf_days:.0f} j | max {p.max_visits_per_year} "
+              f"campagne(s)/an")
+        print(f"  Disponibilite : "
+              + " | ".join(f"{v} visite(s)={availability_from_visits(v, p):.2f}"
+                           for v in range(p.max_visits_per_year + 1)))
+        print(f"  Budget        : "
+              + (f"{args.budget_keur:.0f} k€/an" if args.budget_keur
+                 else "non contraint")
+              + f" | recompense '{args.reward_mode}'")
     print(f"  K = {env.K} positions candidates ({args.grid_x}x{args.grid_y})")
     print(f"  Buoy budget   : [{env.n_min}, {env.n_max}]")
     print(f"  Separation    : >= {env.min_sep} case(s) "
           f"({'8-neighbourhood' if MIN_SEP_DIAGONAL else '4-neighbourhood'}) "
           f"-> feasible maximum = {env.n_feasible_max} buoys")
+    # Lire la valeur PORTEE PAR L'ENVIRONNEMENT, pas l'argument : --influence_fit
+    # la remplace apres coup, et afficher l'argument donnait un libelle en km
+    # incoherent avec les pixels reellement utilises.
     print(f"  Score info    : {env.info_mode} | rayon d influence "
-          f"{args.influence_km:.0f} km ({env.influence_px:.1f} px)")
+          f"{env.influence_px * DX_KM:.0f} km ({env.influence_px:.1f} px)"
+          + ("  [ajuste sur la correlation empirique]" if args.influence_fit
+             else ""))
 
     policy = None; pareto_data = {}
     if args.train:
@@ -1810,6 +2205,27 @@ if __name__ == "__main__":
                                                   weights_only=False)["policy_state"])
         multiobj_data = compute_multiobjective_front(
             env, policy, args, n_random=max(5, args.n_random // 2))
+
+    campaign_results = []
+    if args.campaign:
+        from campaign import run_campaign_demo
+        if maint is None:
+            print("\n  [ERREUR] --campaign exige --maintenance regional|pirata")
+        else:
+            if policy is None:
+                ck = Path(args.output_dir) / "rl_best.pt"
+                if ck.exists():
+                    cand = ActorCritic(env.obs_dim, env.K).to(DEVICE)
+                    try:
+                        cand.load_state_dict(torch.load(
+                            ck, map_location=DEVICE,
+                            weights_only=False)["policy_state"])
+                        policy = cand
+                    except (RuntimeError, KeyError):
+                        print("  [info] checkpoint incompatible avec "
+                              "l'espace d'observation courant - ignore")
+            campaign_results, _, _ = run_campaign_demo(
+                env, args.budgets, args.output_dir, policy=policy)
 
     if args.gif:
         print("\n  Generating the RL progression GIF...")
@@ -1866,6 +2282,9 @@ if __name__ == "__main__":
                              f"{r['co2_t']:>7.1f}")
             lines.append(f"  Non-dominated configurations: "
                          f"{int(multiobj_data['front_mask'].sum())}")
+        if campaign_results:
+            from campaign import campaign_report_lines
+            lines += campaign_report_lines(env, campaign_results)
         lines += ["", "── FICHIERS PRODUITS ────────────────────────────────────────────────"]
         for f in sorted(out.iterdir()):
             if f.suffix in {".pt", ".png", ".gif"}:

@@ -44,9 +44,13 @@ from numpy.fft import fft2, ifft2, fftfreq
 from pathlib import Path
 import sys
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # allow `python data/dataset.py`
-import torch
-from torch.utils.data import Dataset
 from config import *
+
+if HAS_TORCH:
+    from torch.utils.data import Dataset
+else:                                   # numpy-only fallback: the generator and
+    class Dataset:                      # its diagnostics stay usable without torch
+        pass
 
 
 # =============================================================================
@@ -342,7 +346,7 @@ class SyntheticOceanGenerator:
         return _Stencil(ix - cx, np.clip(iy - cy, 0, self.ny - 1),
                         self.nx, self.ny)
 
-    def _integrate(self, nt, spinup, record=True):
+    def _integrate(self, nt, spinup, record=True, stride=1, light=False):
         dt_out = DT_DAYS
         nsub   = max(1, int(N_SUBSTEPS))
         dt_s   = dt_out * DAY / nsub
@@ -372,12 +376,18 @@ class SyntheticOceanGenerator:
             t += dt_out
 
             if record and n >= spinup:
-                T_out.append(self.T.copy()); S_out.append(self.S.copy())
+                sl = (slice(None, None, stride), slice(None, None, stride))
+                T_out.append(self.T[sl].copy()); S_out.append(self.S[sl].copy())
+                if light:            # long runs: T/S only, 5x less memory
+                    continue
                 H_out.append(self.f0 * psi / G_GRAV)
                 U_out.append(u.copy()); V_out.append(v.copy())
 
         if not record:
             return None
+        if light:
+            return (np.stack(T_out).astype(np.float32),
+                    np.stack(S_out).astype(np.float32), None, None, None)
         return (np.stack(T_out).astype(np.float32),
                 np.stack(S_out).astype(np.float32),
                 np.stack(H_out).astype(np.float32),
@@ -416,6 +426,26 @@ class SyntheticOceanGenerator:
             "dt_days": DT_DAYS, "lat0": self.lat0, "seed": seed,
         }
         return self.last_run
+
+    def generate_light(self, nt=NT, seed=None, stride=1, spinup_days=None):
+        """
+        Multi-year nature run without blowing up memory.
+
+        Same dynamics as `generate_full`, but only T and S are recorded, and
+        only every `stride`-th grid point. A 13-year run on a 192x288 domain
+        costs 5.2 GB with `generate_full` and 130 MB here at stride 4 -- which
+        is all the OED bricks need, since the mesoscale decorrelation scale
+        (~100 km) is 20x the grid spacing.
+
+        Returns (T, S) shaped (nt, ceil(nx/stride), ceil(ny/stride)).
+        """
+        self._seed(seed)
+        spinup = int(SPINUP_DAYS if spinup_days is None else spinup_days)
+        self.T = self._T_clim(-spinup * DT_DAYS) + 0.25 * self._colored_field(3.0)
+        self.S = self._S_clim(-spinup * DT_DAYS) + 0.03 * self._colored_field(3.0)
+        T, S, _, _, _ = self._integrate(nt, spinup, stride=stride, light=True)
+        self.stride = stride
+        return T, S
 
     def generate_dataset(self, nt=NT, seed=None):
         """Pipeline compatibility: returns (SST, SSS) shaped (nt, nx, ny)."""
@@ -688,6 +718,117 @@ def build_datasets(T, S, split=0.8, augment_train=False, **kwargs):
 #  Figure Nature Run
 # =============================================================================
 
+def animate_nature_run(run, out_path="outputs/ocean_nature_run.gif",
+                       every=5, var="T,GRADT,S,GRADS", fps=8, max_frames=120):
+    """
+    Animate the nature run, one frame every `every` days.
+
+    Parameters
+    ----------
+    run : dict from generate_full, fields shaped (nt, nx, ny)
+    every : stride in days between two frames
+    var : one field, or several separated by commas. Understood names:
+          T, S, SSH, ZETA, GRADT, GRADS. The two gradient moduli show the
+          fronts and filaments far better than the fields themselves, which
+          are dominated by the seasonal cycle.
+          Default: the four panels SST, |grad SST|, SSS, |grad SSS|.
+    fps : frames per second
+    max_frames : hard cap, the stride is raised if needed
+
+    Every panel keeps a colour scale fixed over the whole run, so what moves
+    is the ocean and not the normalisation.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.animation import FuncAnimation, PillowWriter
+
+    SPEC = {
+        "T":     ("T",   "SST",           "degC",    "RdYlBu_r", False),
+        "S":     ("S",   "SSS",           "psu",     "BrBG_r",   False),
+        "SSH":   ("SSH", "SSH",           "m",       "RdBu_r",   True),
+        "ZETA":  ("ZETA", "Vorticity",    "s^-1",    "RdBu_r",   True),
+        "GRADT": ("T",   "|grad SST|",    "degC/km", "afmhot_r", False),
+        "GRADS": ("S",   "|grad SSS|",    "psu/km",  "afmhot_r", False),
+    }
+
+    names = [v.strip().upper() for v in str(var).split(",") if v.strip()]
+    names = [n for n in names if n in SPEC] or ["T"]
+
+    nt = np.asarray(run["T"]).shape[0]
+    every = max(1, int(every))
+    if len(range(0, nt, every)) > max_frames:
+        every = int(np.ceil(nt / max_frames))
+        print(f"  [gif] stride raised to {every} days to stay under "
+              f"{max_frames} frames")
+    idx = list(range(0, nt, every))
+
+    panels = []
+    for n in names:
+        field_key, label, unit, cmap, diverging = SPEC[n]
+        if field_key not in run:
+            print(f"  [gif] field {field_key} missing, panel {n} skipped")
+            continue
+        A = np.asarray(run[field_key])
+        if n.startswith("GRAD"):
+            gy, gx = np.gradient(A, axis=(1, 2))
+            A = np.sqrt(gx ** 2 + gy ** 2) / DX_KM
+        vmin, vmax = np.percentile(A[idx], [1, 99])
+        if diverging:
+            m = max(abs(vmin), abs(vmax)); vmin, vmax = -m, m
+        panels.append({"A": A, "label": label, "unit": unit, "cmap": cmap,
+                       "vmin": float(vmin), "vmax": float(vmax)})
+
+    if not panels:
+        print("  [gif] nothing to animate")
+        return None
+
+    ncol = len(panels)
+    nx, ny = panels[0]["A"].shape[1], panels[0]["A"].shape[2]
+    fig, axes = plt.subplots(1, ncol, figsize=(3.1 * ncol + 0.6, 5.4),
+                             facecolor="white")
+    axes = np.atleast_1d(axes)
+
+    ims = []
+    for ax, pan in zip(axes, panels):
+        im = ax.imshow(pan["A"][idx[0]].T, origin="lower", cmap=pan["cmap"],
+                       vmin=pan["vmin"], vmax=pan["vmax"], aspect="auto",
+                       extent=[0, nx * DX_KM, 0, ny * DX_KM])
+        cb = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.02)
+        cb.ax.tick_params(labelsize=7)
+        cb.set_label(pan["unit"], fontsize=8)
+        ax.set_title(pan["label"], fontsize=10, fontweight="bold")
+        ax.set_xlabel("x (km)", fontsize=8)
+        ax.tick_params(labelsize=7)
+        ims.append(im)
+    axes[0].set_ylabel("y (km)", fontsize=8)
+    for ax in axes[1:]:
+        ax.set_yticklabels([])
+
+    sup = fig.suptitle("", fontsize=12, fontweight="bold")
+    fig.tight_layout(rect=[0, 0, 1, 0.94])
+
+    def _draw(k):
+        t = idx[k]
+        for im, pan in zip(ims, panels):
+            im.set_data(pan["A"][t].T)
+        sup.set_text(f"Nature run, day {t} of {nt}")
+        return tuple(ims) + (sup,)
+
+    anim = FuncAnimation(fig, _draw, frames=len(idx),
+                         interval=1000 / max(1, fps), blit=False)
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    anim.save(str(out_path), writer=PillowWriter(fps=fps),
+              savefig_kwargs={"facecolor": "white"})
+    plt.close()
+    size_mb = out_path.stat().st_size / 1e6
+    print(f"  Nature run GIF -> {out_path}  ({len(idx)} frames, "
+          f"1 every {every} d, {ncol} panel{'s' if ncol > 1 else ''}, "
+          f"{size_mb:.1f} MB)")
+    return str(out_path)
+
+
 def plot_nature_run(run, out_path="outputs/ocean_nature_run.png", S_arr=None):
     """
     Diagnostic figure for the nature run.
@@ -714,7 +855,7 @@ def plot_nature_run(run, out_path="outputs/ocean_nature_run.png", S_arr=None):
         ["#003c30","#01665e","#35978f","#80cdc1","#f5f5f5",
          "#dfc27d","#bf812d","#8c510a","#543005"], N=256)
 
-    BG, PANEL, EDGE = "#0a1628", "#050d1a", "#2a4a7a"
+    BG, PANEL, EDGE = "white", "white", "#bbbbbb"
     fig = plt.figure(figsize=(21, 17), facecolor=BG)
     gs  = gridspec.GridSpec(4, 4, figure=fig, hspace=0.34, wspace=0.30,
                             left=0.05, right=0.96, top=0.93, bottom=0.05)
@@ -722,15 +863,15 @@ def plot_nature_run(run, out_path="outputs/ocean_nature_run.png", S_arr=None):
     def frame(ax, title):
         ax.set_facecolor(PANEL)
         for sp in ax.spines.values(): sp.set_edgecolor(EDGE)
-        ax.set_title(title, color="white", fontsize=9.5, pad=6, fontweight="bold")
-        ax.tick_params(colors="white", labelsize=6)
+        ax.set_title(title, color="black", fontsize=9.5, pad=6, fontweight="bold")
+        ax.tick_params(colors="black", labelsize=6)
 
     def styled(ax, title, im, label):
         ax.set_xticks([]); ax.set_yticks([])
         frame(ax, title)
         cb = fig.colorbar(im, ax=ax, pad=0.02, fraction=0.046)
-        cb.set_label(label, color="white", fontsize=7)
-        cb.ax.yaxis.set_tick_params(color="white", labelcolor="white", labelsize=6)
+        cb.set_label(label, color="black", fontsize=7)
+        cb.ax.yaxis.set_tick_params(color="black", labelcolor="black", labelsize=6)
 
     def show(ax, F, **kw):
         return ax.imshow(F.T, origin="lower", aspect="auto", extent=ext, **kw)
@@ -801,9 +942,9 @@ def plot_nature_run(run, out_path="outputs/ocean_nature_run.png", S_arr=None):
     for L, lbl in [(RD_KM, "$R_d$"), (2*dxkm, "2Δx")]:
         ax.axvline(1/L, color="#ff6b6b", lw=0.8, ls=":", alpha=0.8)
         ax.text(1/L, Pb.max(), f" {lbl}", color="#ff6b6b", fontsize=6, va="top")
-    ax.set_xlabel("k (cycles/km)", color="white", fontsize=7)
-    ax.legend(fontsize=7, labelcolor="white", facecolor=BG, edgecolor=EDGE)
-    ax.grid(True, alpha=0.2, color="white", which="both")
+    ax.set_xlabel("k (cycles/km)", color="black", fontsize=7)
+    ax.legend(fontsize=7, labelcolor="black", facecolor=BG, edgecolor=EDGE)
+    ax.grid(True, alpha=0.3, color="0.7", which="both")
 
     ax = fig.add_subplot(gs[2, 1]); frame(ax, "Spatial autocorrelation (zonal)")
     for F, c, lbl in [(T_arr[snaps[1]], "#fc8d59", "SST"), (S_arr[snaps[1]], "#6baed6", "SSS")]:
@@ -813,12 +954,12 @@ def plot_nature_run(run, out_path="outputs/ocean_nature_run.png", S_arr=None):
         ac /= ac[0] + 1e-12
         lags = np.arange(NX_//2) * dxkm
         ax.plot(lags, ac[:NX_//2], color=c, lw=1.8, label=lbl)
-    ax.axhline(1/np.e, color="white", ls="--", lw=0.8, alpha=0.6)
-    ax.text(lags[-1], 1/np.e, " 1/e", color="white", fontsize=6, va="bottom", ha="right")
+    ax.axhline(1/np.e, color="black", ls="--", lw=0.8, alpha=0.6)
+    ax.text(lags[-1], 1/np.e, " 1/e", color="black", fontsize=6, va="bottom", ha="right")
     ax.axvline(RD_KM, color="#ff6b6b", ls=":", lw=0.9)
-    ax.set_xlabel("distance (km)", color="white", fontsize=7)
-    ax.legend(fontsize=7, labelcolor="white", facecolor=BG, edgecolor=EDGE)
-    ax.grid(True, alpha=0.2, color="white")
+    ax.set_xlabel("distance (km)", color="black", fontsize=7)
+    ax.legend(fontsize=7, labelcolor="black", facecolor=BG, edgecolor=EDGE)
+    ax.grid(True, alpha=0.3, color="0.7")
 
     ax = fig.add_subplot(gs[2, 2]); frame(ax, "Temporal autocorrelation (anomalies)")
     nlag = min(90, nt//3)
@@ -832,10 +973,10 @@ def plot_nature_run(run, out_path="outputs/ocean_nature_run.png", S_arr=None):
             ax.plot(np.arange(nlag)*run.get("dt_days", 1.0), ac,
                     color=c, lw=1.6, ls=ls, alpha=1.0 if not des else 0.8,
                     label=lbl + sfx)
-    ax.axhline(1/np.e, color="white", ls="--", lw=0.8, alpha=0.6)
-    ax.set_xlabel("lag (days)", color="white", fontsize=7)
-    ax.legend(fontsize=6, labelcolor="white", facecolor=BG, edgecolor=EDGE)
-    ax.grid(True, alpha=0.2, color="white")
+    ax.axhline(1/np.e, color="black", ls="--", lw=0.8, alpha=0.6)
+    ax.set_xlabel("lag (days)", color="black", fontsize=7)
+    ax.legend(fontsize=6, labelcolor="black", facecolor=BG, edgecolor=EDGE)
+    ax.grid(True, alpha=0.3, color="0.7")
 
     ax = fig.add_subplot(gs[2, 3]); frame(ax, "T-S diagram + sigma$_0$ isopycnals")
     sub = (slice(None, None, max(1, nt//60)), slice(None, 4), slice(None, 4))
@@ -844,13 +985,13 @@ def plot_nature_run(run, out_path="outputs/ocean_nature_run.png", S_arr=None):
     Tg = np.linspace(tt.min()-0.4, tt.max()+0.4, 120)
     Sg = np.linspace(ss.min()-0.04, ss.max()+0.04, 120)
     TT, SS = np.meshgrid(Tg, Sg, indexing="ij")
-    ax.hist2d(ss, tt, bins=110, cmap="magma", cmin=1,
+    ax.hist2d(ss, tt, bins=110, cmap="YlOrRd", cmin=1,
               range=[[Sg[0], Sg[-1]], [Tg[0], Tg[-1]]])
     cs = ax.contour(Sg, Tg, sigma0(TT, SS), levels=12, colors="#9fc4e8",
                     linewidths=0.7, alpha=0.85)
     ax.clabel(cs, fontsize=5.5, colors="#cfe3f5", fmt="%.1f")
-    ax.set_xlabel("SSS (psu)", color="white", fontsize=7)
-    ax.set_ylabel("SST (°C)", color="white", fontsize=7)
+    ax.set_xlabel("SSS (psu)", color="black", fontsize=7)
+    ax.set_ylabel("SST (°C)", color="black", fontsize=7)
 
     # -- Row 4: time series, distributions, correlation, network ----------------
     ax = fig.add_subplot(gs[3, 0]); frame(ax, "SST time series -- 3 points + domain mean")
@@ -859,20 +1000,20 @@ def plot_nature_run(run, out_path="outputs/ocean_nature_run.png", S_arr=None):
                            (NX_//2, NY_//2, "#ffd93d", "jet"),
                            (4*NX_//5, 4*NY_//5, "#6bcb77", "north")]:
         ax.plot(days, T_arr[:, x, y], color=c, lw=1.0, alpha=0.9, label=lbl)
-    ax.plot(days, T_arr.mean(axis=(1, 2)), color="white", lw=2.0, label="domain mean")
-    ax.set_xlabel("days", color="white", fontsize=7)
-    ax.legend(fontsize=6.5, labelcolor="white", facecolor=BG, edgecolor=EDGE, ncol=2)
-    ax.grid(True, alpha=0.2, color="white")
+    ax.plot(days, T_arr.mean(axis=(1, 2)), color="black", lw=2.0, label="domain mean")
+    ax.set_xlabel("days", color="black", fontsize=7)
+    ax.legend(fontsize=6.5, labelcolor="black", facecolor=BG, edgecolor=EDGE, ncol=2)
+    ax.grid(True, alpha=0.3, color="0.7")
 
     ax = fig.add_subplot(gs[3, 1]); frame(ax, "SST / SSS distributions")
     ax.hist(T_arr.ravel(), bins=70, color="#fc8d59", alpha=0.75, density=True, label="SST")
     ax2t = ax.twinx(); ax2t.set_facecolor(PANEL)
     ax2t.hist(S_arr.ravel(), bins=70, color="#6baed6", alpha=0.55, density=True, label="SSS")
     ax2t.tick_params(colors="#6baed6", labelsize=6)
-    ax.set_xlabel("°C  /  psu", color="white", fontsize=7)
-    ax.legend(fontsize=7, labelcolor="white", facecolor=BG, edgecolor=EDGE, loc="upper left")
-    ax2t.legend(fontsize=7, labelcolor="white", facecolor=BG, edgecolor=EDGE, loc="upper right")
-    ax.grid(True, alpha=0.2, color="white")
+    ax.set_xlabel("°C  /  psu", color="black", fontsize=7)
+    ax.legend(fontsize=7, labelcolor="black", facecolor=BG, edgecolor=EDGE, loc="upper left")
+    ax2t.legend(fontsize=7, labelcolor="black", facecolor=BG, edgecolor=EDGE, loc="upper right")
+    ax.grid(True, alpha=0.3, color="0.7")
 
     ax = fig.add_subplot(gs[3, 2])
     Ta = T_arr - T_arr.mean(0); Sa = S_arr - S_arr.mean(0)
@@ -891,7 +1032,7 @@ def plot_nature_run(run, out_path="outputs/ocean_nature_run.png", S_arr=None):
     fig.text(0.5, 0.975,
              "2D+T Nature Run -- tracers advected by a geostrophic flow "
              "(double gyre + meandering jet + eddies)",
-             ha="center", color="white", fontsize=14, fontweight="bold")
+             ha="center", color="black", fontsize=14, fontweight="bold")
     fig.text(0.5, 0.955,
              f"Domain {NX_*dxkm:.0f} x {NY_*dxkm:.0f} km  |  dx = {dxkm:.0f} km  |  "
              f"{nt} days  |  lat {run.get('lat0', LAT0):.0f}N  |  "
@@ -913,6 +1054,17 @@ if __name__ == "__main__":
     p.add_argument("--nt",   type=int, default=NT)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--out",  type=str, default="outputs/ocean_nature_run.png")
+    p.add_argument("--gif",  action="store_true",
+                   help="also write an animated GIF of the run")
+    p.add_argument("--gif_every", type=int, default=5,
+                   help="one frame every N days (default 5)")
+    p.add_argument("--gif_var", type=str, default="T,GRADT,S,GRADS",
+                   help="fields to animate, comma separated. Available: "
+                        "T, S, SSH, ZETA, GRADT, GRADS. Default is the four "
+                        "panels SST, |grad SST|, SSS, |grad SSS|")
+    p.add_argument("--gif_fps", type=int, default=8)
+    p.add_argument("--gif_max", type=int, default=120,
+                   help="cap on the number of frames")
     args = p.parse_args()
 
     t0 = time.time()
@@ -927,3 +1079,8 @@ if __name__ == "__main__":
     for k, v in gen.diagnostics().items():
         print(f"    {k:<22} {v: .4f}")
     plot_nature_run(run, out_path=args.out)
+    if args.gif:
+        animate_nature_run(run,
+                           out_path=str(Path(args.out).with_suffix(".gif")),
+                           every=args.gif_every, var=args.gif_var,
+                           fps=args.gif_fps, max_frames=args.gif_max)

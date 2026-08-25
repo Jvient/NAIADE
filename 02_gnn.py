@@ -498,7 +498,7 @@ def analyze_network(model, graph_dict, targets, args, T=None, label=""):
         _bg(ax)
         sc = ax.scatter(pos[:, 0], pos[:, 1], c=colors,
                         cmap=cmap, s=size, vmin=vmin, vmax=vmax,
-                        zorder=5, edgecolors="white", linewidths=0.8)
+                        zorder=5, edgecolors="black", linewidths=0.8)
         # Red ring on redundant buoys
         if mark_redundant and is_redundant.any():
             ax.scatter(pos[is_redundant, 0], pos[is_redundant, 1],
@@ -506,7 +506,7 @@ def analyze_network(model, graph_dict, targets, args, T=None, label=""):
                        edgecolors="#ff4444", linewidths=2.0, zorder=7,
                        label=f"Redondant ({is_redundant.sum()})")
             ax.legend(fontsize=7, loc="upper right",
-                      framealpha=0.7, facecolor="#111")
+                      framealpha=0.7, facecolor="black")
         # Colorbar du score
         cb_score = plt.colorbar(sc, ax=ax, pad=0.02, fraction=0.046, location="right")
         cb_score.set_label(cbar_label, fontsize=8)
@@ -557,7 +557,7 @@ def analyze_network(model, graph_dict, targets, args, T=None, label=""):
             alpha_val = float(attention_matrix[s, d])
             ax.plot([pos_arr[s, 0], pos_arr[d, 0]],
                     [pos_arr[s, 1], pos_arr[d, 1]],
-                    color="white", alpha=min(alpha_val * 5, 0.8), linewidth=1.5, zorder=3)
+                    color="black", alpha=min(alpha_val * 5, 0.8), linewidth=1.5, zorder=3)
     sc_g = ax.scatter(pos_arr[:, 0], pos_arr[:, 1],
                c=scores, cmap="RdYlGn", s=100,
                vmin=scores.min(), vmax=scores.max(),
@@ -567,7 +567,7 @@ def analyze_network(model, graph_dict, targets, args, T=None, label=""):
         ax.scatter(pos_arr[is_redundant, 0], pos_arr[is_redundant, 1],
                    s=260, facecolors="none", edgecolors="#ff4444",
                    linewidths=2.0, zorder=7, label=f"Redondant ({is_redundant.sum()})")
-        ax.legend(fontsize=7, loc="upper right", framealpha=0.7, facecolor="#111")
+        ax.legend(fontsize=7, loc="upper right", framealpha=0.7, facecolor="black")
     plt.colorbar(sc_g, ax=ax, pad=0.02, fraction=0.046, label="Contribution")
     for i, (x_p, y_p) in enumerate(positions):
         ax.annotate(f"{i}", (x_p, y_p), fontsize=6, ha="center", va="center",
@@ -628,8 +628,81 @@ def analyze_network(model, graph_dict, targets, args, T=None, label=""):
     return scores, redundancy_score, coverage_grid
 
 
+def train_sage(args, graph_dict, targets, verbose=True):
+    """
+    Train the inductive GraphSAGE on the node-scoring task.
+
+    Same target as the GAT, but the split matters more here: GraphSAGE is the
+    model we then apply to nodes that did not exist at training time, so the
+    held-out MSE is the only honest indication of what its predictions on a
+    brand new position are worth.
+
+    Returns (model, test_mse).
+    """
+    epochs = int(getattr(args, "sage_epochs", 0)
+                 or getattr(args, "gnn_epochs", 0) or 200)
+    if verbose:
+        print("\n-- GraphSAGE training (inductive head) ----------------------------")
+
+    model = GraphSAGEInductive(in_dim=graph_dict["x"].shape[1]).to(DEVICE)
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-4)
+
+    x          = graph_dict["x"].to(DEVICE)
+    edge_index = graph_dict["edge_index"].to(DEVICE)
+    y          = targets.to(DEVICE) if torch.is_tensor(targets) else \
+                 torch.tensor(targets, dtype=torch.float, device=DEVICE)
+
+    n = x.shape[0]
+    n_train = max(1, int(0.8 * n))
+    perm = torch.randperm(n)
+    train_mask = torch.zeros(n, dtype=torch.bool)
+    train_mask[perm[:n_train]] = True
+    test_mask = ~train_mask
+    if test_mask.sum() == 0:          # tiny graphs: keep one node out
+        test_mask[perm[-1]] = True
+        train_mask[perm[-1]] = False
+
+    best_state, best_loss = None, float("inf")
+    for epoch in range(1, epochs + 1):
+        model.train()
+        scores = model(x, edge_index)
+        loss = F.mse_loss(scores[train_mask], y[train_mask])
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+        if epoch % 20 == 0 or epoch == 1 or epoch == epochs:
+            model.eval()
+            with torch.no_grad():
+                test_loss = F.mse_loss(model(x, edge_index)[test_mask],
+                                       y[test_mask]).item()
+            if verbose and (epoch % 20 == 0 or epoch == 1):
+                print(f"  Epoch {epoch:3d} | Train MSE={loss.item():.4f} | "
+                      f"Held-out MSE={test_loss:.4f}")
+            if test_loss < best_loss:
+                best_loss = test_loss
+                best_state = {k: v.detach().clone()
+                              for k, v in model.state_dict().items()}
+
+    if best_state is not None:
+        model.load_state_dict(best_state)
+    model.eval()
+
+    out_dir = Path(args.output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    torch.save(model.state_dict(), out_dir / "sage_best.pt")
+    if verbose:
+        var_y = float(y.var().item()) + 1e-12
+        print(f"  [ok] Held-out MSE={best_loss:.4f}  "
+              f"(target variance {var_y:.4f}, so skill "
+              f"{1 - best_loss / var_y:+.2f})")
+        print(f"  [ok] Checkpoint -> {out_dir}/sage_best.pt")
+
+    return model, best_loss
+
+
 def inductive_eval(model, graph_dict, new_positions, corr_matrix_orig, args,
-                   T=None, S=None):
+                   T=None, S=None, targets=None, sage_model=None):
     """
     Score hypothetical sensors (gliders, Argo floats) unseen during training.
 
@@ -686,10 +759,14 @@ def inductive_eval(model, graph_dict, new_positions, corr_matrix_orig, args,
          graph_dict["edge_index"][1].tolist() + new_edges_dst],
         dtype=torch.long)
 
-    # Evaluation with GraphSAGE
-    sage_model = GraphSAGEInductive(in_dim=x_extended.shape[1]).to(DEVICE)
-    # Note: in production, load pre-trained SAGE weights here
-    # Here the pipeline is illustrated with an untrained model
+    # Evaluation with GraphSAGE, trained on the existing network first.
+    # Scoring a node that never existed is only meaningful if the aggregation
+    # function has been fitted; with random weights the output is noise.
+    sage_mse = None
+    if sage_model is None:
+        if targets is None:
+            targets = compute_proxy_targets(list(existing_pos), corr_matrix_orig)
+        sage_model, sage_mse = train_sage(args, graph_dict, targets)
     sage_model.eval()
     with torch.no_grad():
         scores_all = sage_model(x_extended.to(DEVICE), edge_ext.to(DEVICE))
@@ -711,7 +788,10 @@ def inductive_eval(model, graph_dict, new_positions, corr_matrix_orig, args,
                     label="New sensors (score)", zorder=6)
     plt.colorbar(sc, ax=ax, label="Predicted contribution score")
     ax.set_xlim(0, NX); ax.set_ylim(0, NY)
-    ax.set_title("Inductive evaluation of new sensors\n(star = hypothetical glider / Argo float)")
+    subtitle = "star = candidate position, scored without retraining"
+    if sage_mse is not None:
+        subtitle += f"  |  held-out MSE = {sage_mse:.3f}"
+    ax.set_title("Inductive evaluation of new sensors\n" + subtitle, fontsize=10)
     ax.legend()
     ax.grid(True, alpha=0.2)
     fig.savefig(out_dir / "gnn_inductive_eval.png", dpi=150)

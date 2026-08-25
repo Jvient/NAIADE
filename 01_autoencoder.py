@@ -558,7 +558,7 @@ def train(args):
     print(f"  Final physical RMSE : {rmse_T_phys:.3f} degC | {rmse_S_phys:.4f} psu")
 
     print("\n[4/4] Saving training curves...")
-    fig, axes = plt.subplots(1, 5, figsize=(25, 4), facecolor="#0a1628")
+    fig, axes = plt.subplots(1, 5, figsize=(25, 4), facecolor="black")
     # KL and spectral loss are 0 by construction in v4: show the physical
     # RMSE values instead, which are the genuinely interpretable numbers.
     data = [("Total loss",            "train_loss",      "#6baed6"),
@@ -568,15 +568,15 @@ def train(args):
             ("Deep supervision",      "loss_aux",        "#cc99ff")]
     for ax, (lbl, k, col) in zip(axes, data):
         ax.plot(history[k], color=col, lw=1.8)
-        ax.set_title(lbl, color="white", fontsize=9, fontweight="bold")
-        ax.set_xlabel("Epoch", color="white", fontsize=8)
-        ax.tick_params(colors="white", labelsize=7)
-        ax.set_facecolor("#050d1a")
-        for sp in ax.spines.values(): sp.set_edgecolor("#2a4a7a")
-        ax.grid(True, alpha=0.2, color="white")
+        ax.set_title(lbl, color="black", fontsize=9, fontweight="bold")
+        ax.set_xlabel("Epoch", color="black", fontsize=8)
+        ax.tick_params(colors="black", labelsize=7)
+        ax.set_facecolor("white")
+        for sp in ax.spines.values(): sp.set_edgecolor("#bbbbbb")
+        ax.grid(True, alpha=0.3, color="0.7")
     fig.tight_layout(pad=2)
     fig.savefig(out_dir / "vae_training_curves.png", dpi=130,
-                facecolor="#0a1628", bbox_inches="tight")
+                facecolor="black", bbox_inches="tight")
     plt.close()
     print(f"  Curves -> {out_dir}/vae_training_curves.png")
     print(f"  Checkpoint -> {out_dir}/vae_best.pt")
@@ -596,7 +596,7 @@ def train(args):
 
 @torch.no_grad()
 def plot_network_evaluation(model, T, S, norm, args,
-                            positions=None, n_samples=80, n_loo_t=8):
+                            positions=None, n_samples=80, n_loo_t=40):
     """
     Sensor-network evaluation figure.
 
@@ -615,7 +615,7 @@ def plot_network_evaluation(model, T, S, norm, args,
     sal_cmap = LinearSegmentedColormap.from_list("sal",
         ["#003c30","#01665e","#35978f","#80cdc1","#f5f5f5",
          "#dfc27d","#bf812d","#8c510a","#543005"], N=256)
-    BG = "#0a1628"
+    BG = "white"
 
     model.eval()
     T_n = (T - norm["T_mean"]) / norm["T_std"]
@@ -671,26 +671,75 @@ def plot_network_evaluation(model, T, S, norm, args,
     S_sigma_n = S_sigma / (S_sigma.max() + 1e-9)
     combined_sigma = 0.5 * (T_sigma_n + S_sigma_n)
 
-    # Coverage score: a gap is high sigma AND far from any sensor
-    gap_map = combined_sigma * dist_to_sensor_n   # in [0, 1]
+    # Coverage score: a gap is high sigma AND far from any sensor.
+    #
+    # The distance term SATURATES at the influence radius. Past that scale a
+    # sensor constrains nothing, so being 200 km from the nearest buoy is not
+    # twice as valuable as being 90 km away. Dividing by the global maximum,
+    # as an earlier version did, made the value grow without bound and the
+    # corners of the domain won almost every time.
+    infl_km = float(getattr(args, "gap_influence_km", INFLUENCE_RADIUS_KM))
+    L_px    = max(1.0, infl_km / DX_KM)
+    dist_sat = np.minimum(dist_to_sensor, L_px) / L_px
+
+    gap_map = combined_sigma * dist_sat            # in [0, 1]
     gap_threshold = np.percentile(gap_map, 80)
     gap_binary = (gap_map > gap_threshold).astype(float)
 
-    # -- 3 proposed buoys, maximising gap coverage ------------------------------
-    # Greedy algorithm: at each step place the buoy at the maximum of the
-    # residual gap_map, then update the distance to the nearest sensor.
-    from scipy.ndimage import distance_transform_edt as _edt
+    # -- Proposed buoys, maximising gap coverage --------------------------------
+    # Greedy on the gap map, but only over positions that are actually
+    # deployable: away from the edge, away from existing sensors, and away
+    # from each other. Without this the argmax is drawn to the uncertainty
+    # spikes that sit right on the observation points.
+    # None is a valid value on the CLI and means "use the physical default",
+    # so it has to be handled explicitly: getattr's fallback only fires when
+    # the attribute is absent, not when it is present and None.
+    n_prop = getattr(args, "n_proposed", None)
+    n_prop = 3 if n_prop is None else int(n_prop)
+    _m = getattr(args, "gap_margin_px", None)
+    _s = getattr(args, "gap_min_sep_px", None)
+    margin  = int(round(0.5 * L_px if _m is None else float(_m)))
+    min_sep = float(L_px if _s is None else float(_s))
+
+    gx, gy = np.meshgrid(np.arange(gap_map.shape[0]),
+                         np.arange(gap_map.shape[1]), indexing="ij")
+
+    def _eligible(margin_, min_sep_, taken):
+        ok = np.zeros_like(gap_map, dtype=bool)
+        m = max(0, int(margin_))
+        ok[m:gap_map.shape[0] - m or None, m:gap_map.shape[1] - m or None] = True
+        ok &= (dist_to_sensor >= min_sep_)
+        for (tx, ty) in taken:
+            ok &= ((gx - tx) ** 2 + (gy - ty) ** 2) >= min_sep_ ** 2
+        return ok
+
     proposed_positions = []
-    gap_residual = gap_map.copy()
-    mask_augmented = mask_np.copy()
-    for _ in range(3):
-        flat_idx = np.argmax(gap_residual)
-        px, py   = np.unravel_index(flat_idx, gap_residual.shape)  # px in [0,NX), py in [0,NY)
+    relaxed = False
+    for _ in range(n_prop):
+        ok = _eligible(margin, min_sep, proposed_positions)
+        if not ok.any():
+            # relax rather than fail: half the separation, then drop the
+            # margin, then give up on the constraints entirely
+            for m_, s_ in ((margin, 0.5 * min_sep), (0, 0.5 * min_sep), (0, 0.0)):
+                ok = _eligible(m_, s_, proposed_positions)
+                if ok.any():
+                    relaxed = True
+                    break
+        if not ok.any():
+            break
+        scored = np.where(ok, gap_map, -np.inf)
+        px, py = np.unravel_index(np.argmax(scored), scored.shape)
         proposed_positions.append((int(px), int(py)))
-        mask_augmented[px, py] = 1.0
-        dist_new = _edt(1 - mask_augmented) / (dist_to_sensor.max() + 1e-9)
-        gap_residual = combined_sigma * dist_new
-    proposed_arr = np.array(proposed_positions)  # (3, 2) -- (x, y) in pixels
+
+    proposed_arr = np.array(proposed_positions)    # (n, 2) -- (x, y) in pixels
+
+    if len(proposed_positions):
+        _d = [float(dist_to_sensor[px, py]) for px, py in proposed_positions]
+        print(f"  Gap map: saturation {L_px:.0f} px, margin {margin} px, "
+              f"min separation {min_sep:.0f} px"
+              + ("  [relaxed, domain too crowded]" if relaxed else ""))
+        print("  Distance from each proposal to the nearest existing buoy: "
+              + ", ".join(f"{d:.0f} px" for d in _d))
 
     # -- LOO scores: contribution of each sensor --------------------------------
     t_idx = np.random.choice(len(T), min(n_loo_t, len(T)), replace=False)
@@ -729,12 +778,12 @@ def plot_network_evaluation(model, T, S, norm, args,
             ax.contour(contour.T, levels=[0.5], colors=["#ff6b6b"],
                        linewidths=1.5, linestyles="--")
         ax.set_xticks([]); ax.set_yticks([])
-        ax.set_facecolor("#050d1a")
+        ax.set_facecolor("white")
         for sp in ax.spines.values(): sp.set_edgecolor("#1a3a5c")
-        ax.set_title(title, color="white", fontsize=8.5, pad=5, fontweight="bold")
+        ax.set_title(title, color="black", fontsize=8.5, pad=5, fontweight="bold")
         cb = fig.colorbar(im, ax=ax, pad=0.02, fraction=0.046)
-        cb.set_label(label, color="white", fontsize=7)
-        cb.ax.yaxis.set_tick_params(color="white", labelcolor="white", labelsize=6)
+        cb.set_label(label, color="black", fontsize=7)
+        cb.ax.yaxis.set_tick_params(color="black", labelcolor="black", labelsize=6)
         return im
 
     vT = (T_true.min(), T_true.max())
@@ -759,15 +808,16 @@ def plot_network_evaluation(model, T, S, norm, args,
     cell(ax02, T_sigma, "YlOrRd", 0, T_sigma.max(),
          f"SST MC uncertainty sigma  (N={n_samples} draws)\n"
          "red = zone poorly constrained by the network",
-         "°C", pts=obs_pos, pts_c="cyan", pts_s=12,
+         "°C", pts=obs_pos, pts_c="tab:blue", pts_s=12,
          contour=gap_binary)
 
     # [0,3] Gap map + 3 proposed buoys
     ax03 = fig.add_subplot(gs[0, 3])
-    cell(ax03, gap_map, "inferno", 0, gap_map.max(),
-         f"Gap zones + 3 proposed buoys\n"
+    cell(ax03, gap_map, "YlOrRd", 0, gap_map.max(),
+         f"Gap zones + {len(proposed_arr)} proposed "
+         f"buoy{'s' if len(proposed_arr) != 1 else ''}\n"
          f"(high sigma x sensor distance) -- {int(gap_binary.sum())} critical px",
-         "score", pts=obs_pos, pts_c="cyan", pts_s=15,
+         "score", pts=obs_pos, pts_c="tab:blue", pts_s=15,
          contour=gap_binary)
     # Proposed buoys: numbered yellow stars
     for k, (px, py) in enumerate(proposed_arr):
@@ -794,12 +844,12 @@ def plot_network_evaluation(model, T, S, norm, args,
     ax12 = fig.add_subplot(gs[1, 2])
     cell(ax12, S_sigma, "YlOrRd", 0, S_sigma.max(),
          "SSS MC uncertainty sigma", "psu",
-         pts=obs_pos, pts_c="cyan", pts_s=12,
+         pts=obs_pos, pts_c="tab:blue", pts_s=12,
          contour=gap_binary)
 
     # [1,3] LOO bar chart: contribution of each sensor
     ax13 = fig.add_subplot(gs[1, 3])
-    ax13.set_facecolor("#050d1a")
+    ax13.set_facecolor("white")
     for sp in ax13.spines.values(): sp.set_edgecolor("#1a3a5c")
 
     idx_sort = np.argsort(loo_delta)[::-1]   # sorted by decreasing contribution
@@ -808,33 +858,33 @@ def plot_network_evaluation(model, T, S, norm, args,
                 (loo_delta.max() - loo_delta.min() + 1e-9), 0, 1))
     ax13.barh(np.arange(n_sensors), loo_delta[idx_sort], color=colors_bar,
               edgecolor="#1a3a5c", linewidth=0.5)
-    ax13.axvline(0, color="white", lw=0.8, alpha=0.5)
+    ax13.axvline(0, color="black", lw=0.8, alpha=0.5)
     ax13.set_yticks(np.arange(0, n_sensors, max(1, n_sensors//10)))
     ax13.set_yticklabels([f"C{idx_sort[i]}" for i in
                           range(0, n_sensors, max(1, n_sensors//10))],
-                         color="white", fontsize=6)
-    ax13.set_xlabel("delta RMSE  (LOO - full)", color="white", fontsize=8)
+                         color="black", fontsize=6)
+    ax13.set_xlabel("delta RMSE  (LOO - full)", color="black", fontsize=8)
     ax13.set_title("LOO contribution per sensor\n"
                    "green = essential  |  red = redundant",
-                   color="white", fontsize=8.5, fontweight="bold", pad=5)
-    ax13.tick_params(colors="white", labelsize=6)
-    ax13.grid(True, alpha=0.2, color="white", axis="x")
+                   color="black", fontsize=8.5, fontweight="bold", pad=5)
+    ax13.tick_params(colors="black", labelsize=6)
+    ax13.grid(True, alpha=0.3, color="0.7", axis="x")
 
     # Redundancy threshold (delta < 5% of the maximum)
     thr = loo_delta.max() * 0.05
     n_redondant = (loo_delta < thr).sum()
     ax13.axvline(thr, color="#ffd93d", lw=1, linestyle="--", alpha=0.7,
                  label=f"5% threshold  ({n_redondant} redundant)")
-    ax13.legend(fontsize=6, labelcolor="white", facecolor="#0a1628", loc="lower right")
+    ax13.legend(fontsize=6, labelcolor="black", facecolor="black", loc="lower right")
 
     fig.text(0.5, 0.97,
              f"AE-UNet -- network evaluation  ({n_sensors} sensors)  "
              f"|  red contour = gap zones  |  star = proposed buoy",
-             ha="center", color="white", fontsize=12, fontweight="bold")
+             ha="center", color="black", fontsize=12, fontweight="bold")
     fig.text(0.5, 0.005,
-             "cyan = existing sensor  |  yellow star = proposed buoy (greedy gap)  "
+             "blue = existing sensor  |  yellow star = proposed buoy (greedy gap)  "
              "|  sensor colour in row 1 = LOO contribution",
-             ha="center", color="#8ab4d4", fontsize=8)
+             ha="center", color="0.35", fontsize=8)
 
     out = out_dir / "vae_network_evaluation.png"
     fig.savefig(out, dpi=150, facecolor=BG, bbox_inches="tight")
@@ -864,7 +914,7 @@ def plot_uncertainty_maps(model, T, S, norm, args, n_samples=60):
     ocean_cmap = LinearSegmentedColormap.from_list("oc",
         ["#08306b","#2171b5","#6baed6","#c6dbef","#fff5eb",
          "#fdd49e","#fc8d59","#d7301f","#7f0000"], N=256)
-    BG = "#0a1628"
+    BG = "white"
 
     model.eval()
     T_n = (T - norm["T_mean"]) / norm["T_std"]
@@ -902,33 +952,33 @@ def plot_uncertainty_maps(model, T, S, norm, args, n_samples=60):
         ax = fig.add_subplot(gs[0, col])
         im = ax.imshow(T_s.T, cmap="YlOrRd", origin="lower", aspect="auto",
                        vmin=0, vmax=unc_max_all)
-        ax.scatter(obs_pos[:,0], obs_pos[:,1], c="cyan", s=12,
+        ax.scatter(obs_pos[:,0], obs_pos[:,1], c="tab:blue", s=12,
                    edgecolors="black", linewidths=0.3, zorder=5, alpha=0.8)
         ax.set_xticks([]); ax.set_yticks([])
-        ax.set_facecolor("#050d1a")
+        ax.set_facecolor("white")
         for sp in ax.spines.values(): sp.set_edgecolor("#1a3a5c")
-        ax.set_title(f"{desc}\nSST sigma (°C)", color="white", fontsize=9,
+        ax.set_title(f"{desc}\nSST sigma (°C)", color="black", fontsize=9,
                      fontweight="bold", pad=4)
         cb = fig.colorbar(im, ax=ax, pad=0.02, fraction=0.046)
-        cb.ax.yaxis.set_tick_params(color="white", labelcolor="white", labelsize=6)
+        cb.ax.yaxis.set_tick_params(color="black", labelcolor="black", labelsize=6)
 
         # Ligne 1 : SSS sigma
         ax = fig.add_subplot(gs[1, col])
         im = ax.imshow(S_s.T, cmap="YlOrRd", origin="lower", aspect="auto",
                        vmin=0, vmax=unc_max_all)
-        ax.scatter(obs_pos[:,0], obs_pos[:,1], c="cyan", s=12,
+        ax.scatter(obs_pos[:,0], obs_pos[:,1], c="tab:blue", s=12,
                    edgecolors="black", linewidths=0.3, zorder=5, alpha=0.8)
         ax.set_xticks([]); ax.set_yticks([])
-        ax.set_facecolor("#050d1a")
+        ax.set_facecolor("white")
         for sp in ax.spines.values(): sp.set_edgecolor("#1a3a5c")
-        ax.set_title(f"SSS sigma (psu)", color="white", fontsize=9,
+        ax.set_title(f"SSS sigma (psu)", color="black", fontsize=9,
                      fontweight="bold", pad=4)
         cb = fig.colorbar(im, ax=ax, pad=0.02, fraction=0.046)
-        cb.ax.yaxis.set_tick_params(color="white", labelcolor="white", labelsize=6)
+        cb.ax.yaxis.set_tick_params(color="black", labelcolor="black", labelsize=6)
 
         # Row 2: meridional uncertainty profile (averaged over x)
         ax = fig.add_subplot(gs[2, col])
-        ax.set_facecolor("#050d1a")
+        ax.set_facecolor("white")
         for sp in ax.spines.values(): sp.set_edgecolor("#1a3a5c")
         y_ax = np.arange(NY)
         ax.fill_betweenx(y_ax, 0, T_s.mean(axis=0),
@@ -937,19 +987,19 @@ def plot_uncertainty_maps(model, T, S, norm, args, n_samples=60):
                          color="#6baed6", alpha=0.5, label="SSS sigma")
         # Sensor positions on the profile
         for (_, yp) in obs_pos:
-            ax.axhline(yp, color="cyan", lw=0.4, alpha=0.4)
-        ax.set_title(f"Meridional profile of sigma (x-average)", color="white",
+            ax.axhline(yp, color="tab:blue", lw=0.4, alpha=0.4)
+        ax.set_title(f"Meridional profile of sigma (x-average)", color="black",
                      fontsize=8, fontweight="bold", pad=4)
-        ax.set_xlabel("sigma moyen", color="white", fontsize=7)
-        ax.set_ylabel("y (latitude)", color="white", fontsize=7)
-        ax.tick_params(colors="white", labelsize=6)
-        ax.legend(fontsize=7, labelcolor="white", facecolor="#0a1628")
-        ax.grid(True, alpha=0.2, color="white", axis="x")
+        ax.set_xlabel("sigma moyen", color="black", fontsize=7)
+        ax.set_ylabel("y (latitude)", color="black", fontsize=7)
+        ax.tick_params(colors="black", labelsize=6)
+        ax.legend(fontsize=7, labelcolor="black", facecolor="black")
+        ax.grid(True, alpha=0.3, color="0.7", axis="x")
 
     fig.text(0.5, 0.97,
              "AE-UNet - Uncertainty vs Network Density  "
-             "(cyan = sensors  |  shared colour scale)",
-             ha="center", color="white", fontsize=12, fontweight="bold")
+             "(blue = sensors  |  shared colour scale)",
+             ha="center", color="black", fontsize=12, fontweight="bold")
 
     out = out_dir / "vae_uncertainty_density.png"
     fig.savefig(out, dpi=150, facecolor=BG, bbox_inches="tight")
@@ -990,7 +1040,7 @@ def plot_uncertainty_maps(model, T, S, norm, args, n_samples=60):
         (f"t={t_b}  N=8 obs.",  t_b, 8),
     ]
 
-    fig, axes = plt.subplots(4, 4, figsize=(20, 18), facecolor="#0a1628")
+    fig, axes = plt.subplots(4, 4, figsize=(20, 18), facecolor="black")
     col_titles = ["Ground truth", "Reconstruction (mu)", "Error |pred - true|", "Uncertainty (MC sigma)"]
 
     def cell(ax, data, cmap, vmin=None, vmax=None, title="", label="",
@@ -1002,12 +1052,12 @@ def plot_uncertainty_maps(model, T, S, norm, args, n_samples=60):
             kw["vmin"] = vmin; kw["vmax"] = vmax
         im = ax.imshow(data.T, **kw)
         ax.set_xticks([]); ax.set_yticks([])
-        ax.set_facecolor("#050d1a")
+        ax.set_facecolor("white")
         for sp in ax.spines.values(): sp.set_edgecolor("#1a3a5c")
-        ax.set_title(title, color="white", fontsize=8, pad=4)
+        ax.set_title(title, color="black", fontsize=8, pad=4)
         cb = fig.colorbar(im, ax=ax, pad=0.02, fraction=0.046)
-        cb.set_label(label, color="white", fontsize=6)
-        cb.ax.yaxis.set_tick_params(color="white", labelcolor="white", labelsize=6)
+        cb.set_label(label, color="black", fontsize=6)
+        cb.ax.yaxis.set_tick_params(color="black", labelcolor="black", labelsize=6)
         return im
 
     for row_pair, (desc, t, n_obs) in enumerate(scenarios):
@@ -1091,7 +1141,7 @@ def plot_uncertainty_maps(model, T, S, norm, args, n_samples=60):
 
     fig.text(0.5, 0.995,
              "VAE-UNet — Reconstruction vs Nature Run  (x = position observee)",
-             ha="center", color="white", fontsize=13, fontweight="bold")
+             ha="center", color="black", fontsize=13, fontweight="bold")
 # =============================================================================
 #  HELPERS — RMSE MC
 # =============================================================================
@@ -1206,6 +1256,16 @@ def parse_args():
     p.add_argument("--n_obs_min",    type=int,   default=10)
     p.add_argument("--n_obs_max",    type=int,   default=80)
     p.add_argument("--n_mc_val",     type=int,   default=15)
+    p.add_argument("--n_proposed", type=int, default=3,
+                   help="number of new buoys proposed from the gap map")
+    p.add_argument("--gap_influence_km", type=float, default=INFLUENCE_RADIUS_KM,
+                   help="scale at which the gap map distance term saturates")
+    p.add_argument("--gap_margin_px", type=float, default=None,
+                   help="keep proposals this far from the domain edge "
+                        "(default: half an influence radius)")
+    p.add_argument("--gap_min_sep_px", type=float, default=None,
+                   help="keep proposals this far from existing sensors and from "
+                        "each other (default: one influence radius)")
     p.add_argument("--n_mc",         type=int,   default=60)
     return p.parse_args()
 

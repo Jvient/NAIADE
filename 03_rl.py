@@ -221,6 +221,17 @@ class OceanNetworkEnv:
         A = a.reshape(1, -1) if single else a
         conflicts = (A > 0.5) @ self._conflict          # (B, K)
         invalid = (conflicts > 0) & (A <= 0.5)
+
+        # Hard ceiling on the number of buoys. Without this, n_max is only a
+        # penalty in the reward and the agent can and does exceed it. Masking
+        # here makes the bound exact, in the same way the minimum separation
+        # is exact, and it applies both when sampling and when replaying the
+        # buffer, since the mask is recomputed from the active mask alone.
+        n_active = (A > 0.5).sum(axis=1)                # (B,)
+        at_ceiling = n_active >= self.n_max
+        if at_ceiling.any():
+            invalid = invalid | (at_ceiling[:, None] & (A <= 0.5))
+
         return invalid[0] if single else invalid
 
     def _precompute_field_stats(self):
@@ -956,8 +967,10 @@ def compute_pareto_front(env, policy, args, n_random=25):
     else:
         print(f"  Criterion: {env.info_mode}")
 
-    n_lo = max(1, env.n_min - 5)
-    n_hi = min(env.n_feasible_max, env.n_max + 10)
+    # Clamped to the requested range: a sweep that explores past n_max makes
+    # the elbow land outside the budget the user actually asked for.
+    n_lo = max(1, env.n_min)
+    n_hi = min(env.n_feasible_max, env.n_max)
     n_range = list(range(n_lo, n_hi + 1))
 
     cloud_n, cloud_v, cloud_src = [], [], []
@@ -1027,17 +1040,17 @@ def compute_pareto_front(env, policy, args, n_random=25):
     lam_star = float(np.interp(n_star, n_of_lambda[::-1], lambdas[::-1]))
 
     # ── 6. Figure ─────────────────────────────────────────────────────────────
-    BG, PANEL, EDGE = "#0a1628", "#050d1a", "#2a4a7a"
+    BG, PANEL, EDGE = "white", "white", "#bbbbbb"
     fig, axes = plt.subplots(1, 3, figsize=(21, 6), facecolor=BG)
 
     def frame(ax, title, xlab, ylab):
         ax.set_facecolor(PANEL)
         for sp in ax.spines.values(): sp.set_edgecolor(EDGE)
-        ax.set_title(title, color="white", fontsize=10.5, fontweight="bold", pad=8)
-        ax.set_xlabel(xlab, color="white", fontsize=9)
-        ax.set_ylabel(ylab, color="white", fontsize=9)
-        ax.tick_params(colors="white", labelsize=8)
-        ax.grid(True, alpha=0.2, color="white")
+        ax.set_title(title, color="black", fontsize=10.5, fontweight="bold", pad=8)
+        ax.set_xlabel(xlab, color="black", fontsize=9)
+        ax.set_ylabel(ylab, color="black", fontsize=9)
+        ax.tick_params(colors="black", labelsize=8)
+        ax.grid(True, alpha=0.3, color="0.7")
 
     # (a) nuage + front
     ax = axes[0]
@@ -1065,8 +1078,8 @@ def compute_pareto_front(env, policy, args, n_random=25):
     if n_eq > n_star:
         ax.annotate(f"{n_star} optimised buoys = {n_eq} random ones",
                     xy=(0.03, 0.94), xycoords="axes fraction",
-                    color="#8ab4d4", fontsize=8.5)
-    ax.legend(fontsize=8, labelcolor="white", facecolor=BG, edgecolor=EDGE,
+                    color="0.35", fontsize=8.5)
+    ax.legend(fontsize=8, labelcolor="black", facecolor=BG, edgecolor=EDGE,
               loc="lower right")
 
     # (b) gain marginal
@@ -1080,7 +1093,7 @@ def compute_pareto_front(env, policy, args, n_random=25):
                label=f"20 % du gain initial")
     ax.axvline(n_star, color="#ff6b6b", ls="--", lw=1.5, alpha=0.8,
                label=f"N* = {n_star}")
-    ax.legend(fontsize=8, labelcolor="white", facecolor=BG, edgecolor=EDGE)
+    ax.legend(fontsize=8, labelcolor="black", facecolor=BG, edgecolor=EDGE)
 
     # (c) compromise: N* as a function of the marginal cost
     ax = axes[2]
@@ -1096,10 +1109,10 @@ def compute_pareto_front(env, policy, args, n_random=25):
                 fontsize=9, color="#ff6b6b", fontweight="bold")
     ax.annotate("expensive buoy ->\nlighter network",
                 xy=(0.62, 0.80), xycoords="axes fraction",
-                color="#8ab4d4", fontsize=8)
+                color="0.35", fontsize=8)
 
     fig.suptitle("Brick 3 - Pareto front: information / number of buoys",
-                 color="white", fontsize=13, fontweight="bold", y=1.02)
+                 color="black", fontsize=13, fontweight="bold", y=1.02)
     fig.tight_layout()
     fig.savefig(out_dir / "rl_pareto_front.png", dpi=150,
                 bbox_inches="tight", facecolor=BG)
@@ -1184,7 +1197,7 @@ def compute_multiobjective_front(env, policy, args, n_random=20, n_lambda=6):
     print("\n-- Bi-objective front: information vs operating cost --------------")
     out_dir = Path(args.output_dir); out_dir.mkdir(parents=True, exist_ok=True)
 
-    n_hi = min(env.n_feasible_max, env.n_max + 10)
+    n_hi = min(env.n_feasible_max, env.n_max)
     C_n, C_c, C_v, C_co2, C_src = [], [], [], [], []
 
     def _add(idx, src):
@@ -1193,7 +1206,7 @@ def compute_multiobjective_front(env, policy, args, n_random=20, n_lambda=6):
         C_v.append(_config_info(env, idx)); C_src.append(src)
 
     print(f"  Random draws ({n_random} per N)...")
-    for n_t in range(max(1, min(env.n_min, n_hi) - 5), n_hi + 1):
+    for n_t in range(max(1, min(env.n_min, n_hi)), n_hi + 1):
         for _ in range(n_random):
             _add(env.sample_feasible(n_t), 0)
 
@@ -1215,38 +1228,38 @@ def compute_multiobjective_front(env, policy, args, n_random=20, n_lambda=6):
     front = _pareto_2d(C_c, C_v)
 
     # ── Figure ────────────────────────────────────────────────────────────────
-    BG, PANEL, EDGE = "#0a1628", "#050d1a", "#2a4a7a"
+    BG, PANEL, EDGE = "white", "white", "#bbbbbb"
     fig, axes = plt.subplots(1, 3, figsize=(21, 6), facecolor=BG)
 
     def frame(ax, t, xl, yl):
         ax.set_facecolor(PANEL)
         for sp in ax.spines.values(): sp.set_edgecolor(EDGE)
-        ax.set_title(t, color="white", fontsize=10.5, fontweight="bold", pad=8)
-        ax.set_xlabel(xl, color="white", fontsize=9)
-        ax.set_ylabel(yl, color="white", fontsize=9)
-        ax.tick_params(colors="white", labelsize=8)
-        ax.grid(True, alpha=0.2, color="white")
+        ax.set_title(t, color="black", fontsize=10.5, fontweight="bold", pad=8)
+        ax.set_xlabel(xl, color="black", fontsize=9)
+        ax.set_ylabel(yl, color="black", fontsize=9)
+        ax.tick_params(colors="black", labelsize=8)
+        ax.grid(True, alpha=0.3, color="0.7")
 
     ax = axes[0]
     frame(ax, "Pareto front  -  information vs cost",
           "Operating cost (kEUR/yr)", "Explained mesoscale variance")
     sc = ax.scatter(C_c, C_v, c=C_n, s=16, cmap="viridis", alpha=0.55,
                     edgecolors="none")
-    cb = fig.colorbar(sc, ax=ax, pad=0.02); cb.set_label("N buoys", color="white",
+    cb = fig.colorbar(sc, ax=ax, pad=0.02); cb.set_label("N buoys", color="black",
                                                           fontsize=8)
-    cb.ax.yaxis.set_tick_params(color="white", labelcolor="white", labelsize=7)
+    cb.ax.yaxis.set_tick_params(color="black", labelcolor="black", labelsize=7)
     o = np.argsort(C_c[front])
     ax.plot(C_c[front][o], C_v[front][o], color="#ff6b6b", lw=2.0, zorder=5)
     ax.scatter(C_c[front], C_v[front], s=70, facecolors="none",
                edgecolors="#ff6b6b", linewidths=1.3, zorder=6,
                label=f"front ({front.sum()} configs)")
-    ax.legend(fontsize=8, labelcolor="white", facecolor=BG, edgecolor=EDGE,
+    ax.legend(fontsize=8, labelcolor="black", facecolor=BG, edgecolor=EDGE,
               loc="lower right")
 
     ax = axes[1]
     frame(ax, "Cost spread at fixed N\n(two networks of equal size do not "
               "cost the same)", "Number of buoys", "Cost (kEUR/yr)")
-    ax.scatter(C_n, C_c, c=C_v, s=16, cmap="magma", alpha=0.6, edgecolors="none")
+    ax.scatter(C_n, C_c, c=C_v, s=16, cmap="viridis", alpha=0.7, edgecolors="none")
     ax.scatter(C_n[front], C_c[front], s=60, facecolors="none",
                edgecolors="#ff6b6b", linewidths=1.2, zorder=5)
 
@@ -1268,7 +1281,7 @@ def compute_multiobjective_front(env, policy, args, n_random=20, n_lambda=6):
             ax.axvline(b, color="#5a7ca8", ls=":", lw=1.0, alpha=0.8)
 
     fig.suptitle("Brick 3 - Bi-objective front: information / operating cost",
-                 color="white", fontsize=13, fontweight="bold", y=1.02)
+                 color="black", fontsize=13, fontweight="bold", y=1.02)
     fig.tight_layout()
     fig.savefig(out_dir / "rl_pareto_cost.png", dpi=150,
                 bbox_inches="tight", facecolor=BG)
@@ -1317,11 +1330,11 @@ def mark_retained_config_on_pareto(n_retained, info_retained, out_dir):
              f"* Retained config (best checkpoint): N={n_retained}  |  "
              f"info={info_retained:.3f}",
              ha="center", color="#ffd93d", fontsize=10, fontweight="bold",
-             bbox=dict(boxstyle="round,pad=0.3", facecolor="#0a1628",
+             bbox=dict(boxstyle="round,pad=0.3", facecolor="black",
                        edgecolor="#ffd93d", alpha=0.9))
 
     out = out_dir / "rl_pareto_front_pipeline.png"
-    fig.savefig(out, dpi=150, bbox_inches="tight", facecolor="#0a1628")
+    fig.savefig(out, dpi=150, bbox_inches="tight", facecolor="black")
     plt.close()
     print(f"  Annotated Pareto -> {out}")
 
@@ -1345,7 +1358,7 @@ def visualize_two_configs(env, pareto_points, n_star, policy, args,
     ocean_cmap = LinearSegmentedColormap.from_list("oc",
         ["#08306b","#2171b5","#6baed6","#c6dbef","#fff5eb",
          "#fdd49e","#fc8d59","#d7301f","#7f0000"], N=256)
-    BG = "#0a1628"
+    BG = "white"
 
     n_light = max(env.n_min, int(n_star) // 2)
 
@@ -1390,7 +1403,7 @@ def visualize_two_configs(env, pareto_points, n_star, policy, args,
     title = ("Brick 3 RL - Retained config (best checkpoint) vs Light"
              if best_mask is not None
              else "Brick 3 RL - Dense (N*) vs Light (N*/2)")
-    fig.suptitle(title, color="white", fontsize=13, fontweight="bold", y=0.99)
+    fig.suptitle(title, color="black", fontsize=13, fontweight="bold", y=0.99)
 
     for col, (active_idx, info_score, label, note, col_c) in enumerate([
         (dense_idx,  dense_info,  dense_label, dense_note,  "#6bcb77"),
@@ -1401,7 +1414,7 @@ def visualize_two_configs(env, pareto_points, n_star, policy, args,
         inactive_idx = np.where(env.active_mask <= 0.5)[0]
 
         ax = fig.add_axes([0.05 + col*0.47, 0.10, 0.40, 0.80])
-        ax.set_facecolor("#050d1a")
+        ax.set_facecolor("white")
         for sp in ax.spines.values(): sp.set_edgecolor("#1a3a5c")
 
         ax.imshow(T_bg.T, cmap=ocean_cmap, origin="lower", aspect="auto",
@@ -1412,10 +1425,10 @@ def visualize_two_configs(env, pareto_points, n_star, policy, args,
         sc = ax.scatter(all_pos[active_idx, 0], all_pos[active_idx, 1],
                         c=env.field_stats[active_idx], cmap="plasma",
                         s=90, vmin=0, vmax=1,
-                        edgecolors="white", linewidths=0.8, zorder=6)
+                        edgecolors="black", linewidths=0.8, zorder=6)
         cb = plt.colorbar(sc, ax=ax, pad=0.02, fraction=0.04)
-        cb.set_label("Variance locale", color="white", fontsize=7)
-        cb.ax.yaxis.set_tick_params(color="white", labelcolor="white", labelsize=6)
+        cb.set_label("Variance locale", color="black", fontsize=7)
+        cb.ax.yaxis.set_tick_params(color="black", labelcolor="black", labelsize=6)
         ax.set_title(f"{label}\nN={len(active_idx)} buoys  |  Info={info_score:.3f}",
                      color=col_c, fontsize=11, fontweight="bold", pad=6)
         ax.text(0.02, 0.03, note, transform=ax.transAxes,
@@ -1427,7 +1440,7 @@ def visualize_two_configs(env, pareto_points, n_star, policy, args,
              f"{dense_label}: N={len(dense_idx)} | info={dense_info:.3f}     "
              f"{light_label}: N={len(light_idx)} | info={light_info:.3f}     "
              f"Information loss: {loss_info:.1f}%  for {len(dense_idx)-len(light_idx)} fewer sensors",
-             ha="center", color="#8ab4d4", fontsize=9)
+             ha="center", color="0.35", fontsize=9)
 
     out = out_dir / "rl_two_configs.png"
     fig.savefig(out, dpi=150, facecolor=BG, bbox_inches="tight")
@@ -1521,9 +1534,9 @@ def save_rl_gif(env, policy, args, n_frames=80):
         ["#08306b","#2171b5","#6baed6","#c6dbef","#fff5eb",
          "#fdd49e","#fc8d59","#d7301f","#7f0000"], N=256)
     var_cmap = LinearSegmentedColormap.from_list("vc",
-        ["#050d1a","#1a3a5c","#2e75b6","#ffd93d","#ff6b6b"], N=256)
+        ["white","#1a3a5c","#2e75b6","#ffd93d","#ff6b6b"], N=256)
 
-    BG = "#0a1628"
+    BG = "white"
     cands = np.array(env.candidate_positions)
 
     # Replay with the policy
@@ -1563,9 +1576,9 @@ def save_rl_gif(env, policy, args, n_frames=80):
     ax3 = fig.add_axes([0.70, 0.10, 0.27, 0.78])    # reward curve
 
     for ax in [ax1, ax2, ax3]:
-        ax.set_facecolor("#050d1a")
+        ax.set_facecolor("white")
         for sp in ax.spines.values(): sp.set_edgecolor("#1a3a5c")
-        ax.tick_params(colors="#8ab4d4", labelsize=7)
+        ax.tick_params(colors="0.35", labelsize=7)
 
     # Fixed background ax1: nature run SST field (pixel coordinates NX x NY)
     T_bg = env.T[0]
@@ -1573,7 +1586,7 @@ def save_rl_gif(env, policy, args, n_frames=80):
     ax1.imshow(T_bg.T, cmap=ocean_cmap, origin="lower", aspect="auto",
                vmin=vTmin, vmax=vTmax, extent=[0, NX, 0, NY])
     ax1.set_xlim(0, NX); ax1.set_ylim(0, NY)
-    ax1.set_title("Variance locale (OED target)", color="white",
+    ax1.set_title("Variance locale (OED target)", color="black",
                   fontsize=9, fontweight="bold", pad=5)
     ax1.set_xticks([]); ax1.set_yticks([])
 
@@ -1581,29 +1594,29 @@ def save_rl_gif(env, policy, args, n_frames=80):
     ax2.set_xlim(0, NX); ax2.set_ylim(0, NY)
     ax2.imshow(T_bg.T, cmap=ocean_cmap, origin="lower", aspect="auto",
                vmin=vTmin, vmax=vTmax, alpha=0.3, extent=[0, NX, 0, NY])
-    ax2.set_title("Network graph (kNN)", color="white",
+    ax2.set_title("Network graph (kNN)", color="black",
                   fontsize=9, fontweight="bold", pad=5)
     ax2.set_xticks([]); ax2.set_yticks([])
 
     # Reward curve
     ax3.set_xlim(0, n_frames); ax3.set_ylim(min(cum_rewards)*1.1, max(cum_rewards)*1.1)
-    ax3.set_title("Cumulative reward", color="white", fontsize=9, fontweight="bold", pad=5)
-    ax3.set_xlabel("Etape", color="#8ab4d4", fontsize=8)
-    ax3.grid(True, alpha=0.15, color="white")
+    ax3.set_title("Cumulative reward", color="black", fontsize=9, fontweight="bold", pad=5)
+    ax3.set_xlabel("Etape", color="0.35", fontsize=8)
+    ax3.grid(True, alpha=0.15, color="black")
     reward_line, = ax3.plot([], [], color="#6bcb77", lw=2)
     step_vline   = ax3.axvline(0, color="#ffd93d", lw=1, alpha=0.7)
 
     # Dynamic elements - offsets use pixel coordinates (0->NX, 0->NY)
     sc_inactive = ax1.scatter([], [], c="#1a3a5c", s=20, alpha=0.3, zorder=2)
-    sc_active1  = ax1.scatter([], [], s=90, zorder=5, edgecolors="white",
+    sc_active1  = ax1.scatter([], [], s=90, zorder=5, edgecolors="black",
                                linewidths=0.7)
     sc_inactive2 = ax2.scatter([], [], c="#1a3a5c", s=15, alpha=0.3, zorder=2)
-    sc_active2   = ax2.scatter([], [], s=70, zorder=5, edgecolors="white",
+    sc_active2   = ax2.scatter([], [], s=70, zorder=5, edgecolors="black",
                                 linewidths=0.7)
 
     edge_lines = []   # edge lines (rebuilt at every frame)
 
-    txt_step = fig.text(0.5, 0.96, "", ha="center", color="white",
+    txt_step = fig.text(0.5, 0.96, "", ha="center", color="black",
                          fontsize=11, fontweight="bold")
     txt_n    = ax1.text(0.02, 0.02, "", transform=ax1.transAxes,
                          color="#ffd93d", fontsize=9, va="bottom", fontweight="bold")

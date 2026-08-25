@@ -33,6 +33,7 @@ from torch.utils.data import DataLoader
 
 sys.path.insert(0, str(Path(__file__).parent))
 from config import *
+from data.dataset import animate_nature_run
 from data.dataset import (SyntheticOceanGenerator, build_datasets,
                           mesoscale_anomaly, plot_nature_run,
                           sample_separated_positions)
@@ -59,6 +60,13 @@ def parse_args():
     # AE
     p.add_argument("--ae_epochs",   type=int, default=5)
     p.add_argument("--ae_base_ch",  type=int, default=16)
+    p.add_argument("--n_proposed",  type=int, default=3,
+                   help="number of new buoys the AE proposes from the gap map, "
+                        "and therefore the number the GNN then scores")
+    p.add_argument("--gap_margin_px", type=float, default=None,
+                   help="keep proposals this far from the domain edge")
+    p.add_argument("--gap_min_sep_px", type=float, default=None,
+                   help="keep proposals this far from existing sensors")
     # GNN
     p.add_argument("--gnn_epochs",  type=int, default=30)
     p.add_argument("--gnn_corr_threshold", type=float, default=GNN_CORR_THRESHOLD,
@@ -78,8 +86,34 @@ def parse_args():
                    help="Sensor influence radius (km)")
     p.add_argument("--rl_episode_len", type=int, default=20,
                    help="Actions per RL episode (default 20, same as standalone)")
+    p.add_argument("--no_inductive", action="store_true",
+                   help="pipeline: skip the inductive scoring of new candidates")
+    p.add_argument("--n_inductive", type=int, default=3,
+                   help="pipeline: number of candidate positions to score")
+    p.add_argument("--inductive_min_sep", type=float, default=40.0,
+                   help="pipeline: minimum spacing between scored candidates, in pixels")
     p.add_argument("--gif_frames",  type=int, default=40)
+    p.add_argument("--no_cost_compare", action="store_true",
+                   help="pipeline: skip the information vs cost network comparison")
+    p.add_argument("--cost_info_tol", type=float, default=0.10,
+                   help="pipeline: acceptable information loss for the cost-aware "
+                        "network, as a fraction (default 0.10)")
+    p.add_argument("--cost_n_lambda", type=int, default=8,
+                   help="pipeline: number of lambda values swept")
+    p.add_argument("--cost_compare_ref", choices=["greedy", "rl"], default="greedy",
+                   help="pipeline: baseline for the comparison. greedy (default) "
+                        "puts both networks under the same optimiser and isolates "
+                        "the effect of the cost term; rl compares against the "
+                        "network the agent actually retained")
     p.add_argument("--output_dir",  type=str, default="outputs")
+    p.add_argument("--ocean_gif", action="store_true",
+                   help="also write an animated GIF of the nature run")
+    p.add_argument("--ocean_gif_every", type=int, default=5,
+                   help="one frame every N days (default 5)")
+    p.add_argument("--ocean_gif_var", type=str, default="T,GRADT,S,GRADS",
+                   help="fields to animate, comma separated: T, S, SSH, ZETA, "
+                        "GRADT, GRADS")
+    p.add_argument("--ocean_gif_fps", type=int, default=8)
     p.add_argument("--no_nature_fig", action="store_true",
                    help="Skip the nature run diagnostic figure")
     return p.parse_args()
@@ -171,6 +205,152 @@ def _train_ae_quick(b1, T, S, args, args1):
 # ══════════════════════════════════════════════════════════════════════════════
 
 SEP = "─" * 68
+
+def _compare_info_vs_cost(b3, env, rl_positions, best_mask, args, out):
+    """
+    Build the cost-aware counterpart of the retained network, at equal size,
+    and draw the two side by side.
+
+    Returns a metrics dict, or None if the comparison could not be made.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    idx_rl = np.where(best_mask > 0.5)[0].astype(int)
+    n_star = len(idx_rl)
+    if n_star < 3:
+        print("  [skip] retained network too small to compare")
+        return None
+
+    info_rl = b3._config_info(env, idx_rl)
+    cost_rl, co2_rl, km_rl = env.network_cost(idx_rl)
+    print(f"  RL retained       : N={n_star}  info={info_rl:.3f}  "
+          f"cost={cost_rl:.0f} kEUR/yr  {co2_rl:.0f} tCO2/yr")
+
+    # Reference for the comparison. Both networks must come from the SAME
+    # optimiser, otherwise the difference mixes the effect of the objective
+    # with the quality of the search, and the figure proves nothing.
+    if getattr(args, "cost_compare_ref", "greedy") == "rl":
+        idx_info = idx_rl
+    else:
+        seq0 = b3._greedy_weighted(env, n_star, 0.0)
+        if not seq0:
+            print("  [skip] greedy reference failed")
+            return None
+        idx_info = np.asarray(seq0[-1], dtype=int)
+
+    info_a = b3._config_info(env, idx_info)
+    cost_a, co2_a, km_a = env.network_cost(idx_info)
+
+    # lambda scale: cost of one buoy against the information it typically buys
+    lam_ref = info_a / max(cost_a, 1e-6)
+    lambdas = np.geomspace(0.05 * lam_ref, 5.0 * lam_ref, args.cost_n_lambda)
+
+    print(f"  Information only  : N={len(idx_info)}  info={info_a:.3f}  "
+          f"cost={cost_a:.0f} kEUR/yr  {co2_a:.0f} tCO2/yr  tour={km_a:.0f} km")
+    print(f"  Sweeping {len(lambdas)} lambda values at fixed N={n_star}...")
+
+    best = None
+    for lam in lambdas:
+        seqs = b3._greedy_weighted(env, n_star, float(lam))
+        if not seqs:
+            continue
+        idx_b = np.asarray(seqs[-1], dtype=int)
+        if len(idx_b) != n_star:
+            continue
+        info_b = b3._config_info(env, idx_b)
+        cost_b, co2_b, km_b = env.network_cost(idx_b)
+        loss = (info_a - info_b) / (info_a + 1e-9)
+        saving = (cost_a - cost_b) / (cost_a + 1e-9)
+        if loss <= args.cost_info_tol and (best is None or saving > best["saving"]):
+            best = {"idx": idx_b, "info": info_b, "cost": cost_b, "co2": co2_b,
+                    "km": km_b, "loss": loss, "saving": saving, "lam": float(lam)}
+
+    if best is None:
+        print(f"  [skip] no cost-aware network within {args.cost_info_tol:.0%} "
+              f"information loss")
+        return None
+
+    idx_cost = best["idx"]
+    print(f"  Cost-aware network: N={len(idx_cost)}  info={best['info']:.3f}  "
+          f"cost={best['cost']:.0f} kEUR/yr  {best['co2']:.0f} tCO2/yr  "
+          f"tour={best['km']:.0f} km")
+    print(f"  -> cost {-best['saving']:+.0%}, information {-best['loss']:+.0%} "
+          f"(lambda={best['lam']:.3g})")
+
+    set_a, set_b = set(idx_info.tolist()), set(idx_cost.tolist())
+    shared = sorted(set_a & set_b)
+    only_a = sorted(set_a - set_b)
+    only_b = sorted(set_b - set_a)
+    moved = len(only_a)
+    print(f"  {len(shared)}/{n_star} positions in common, {moved} moved")
+
+    # ---- figure -----------------------------------------------------------
+    try:
+        var_field = env.field_stats.reshape(env.grid_x, env.grid_y)
+    except Exception:
+        var_field = None
+    P = np.asarray(env.candidate_positions, dtype=float)
+
+    fig, axes = plt.subplots(1, 2, figsize=(15, 6.4), facecolor="white")
+    panels = [
+        (axes[0], idx_info, only_a, "#c0392b",
+         f"Information only\nN={n_star}  info={info_a:.3f}  "
+         f"{cost_a:.0f} kEUR/yr  {co2_a:.0f} tCO2/yr"),
+        (axes[1], idx_cost, only_b, "#1e8449",
+         f"Information and cost\nN={len(idx_cost)}  info={best['info']:.3f}  "
+         f"{best['cost']:.0f} kEUR/yr  {best['co2']:.0f} tCO2/yr"),
+    ]
+    for ax, idx, uniq, col, title in panels:
+        if var_field is not None:
+            ax.imshow(np.asarray(var_field).T, origin="lower", cmap="YlOrBr",
+                      alpha=0.5, extent=[0, NX, 0, NY], aspect="auto")
+        ax.scatter(P[:, 0], P[:, 1], s=6, c="0.75", zorder=2,
+                   label="candidate positions")
+        sh = np.array([env.candidate_positions[i] for i in shared], dtype=float)
+        if len(sh):
+            ax.scatter(sh[:, 0], sh[:, 1], s=95, c="0.35", edgecolors="black",
+                       linewidths=0.7, zorder=4, label="kept in both")
+        un = np.array([env.candidate_positions[i] for i in uniq], dtype=float)
+        if len(un):
+            ax.scatter(un[:, 0], un[:, 1], s=140, c=col, edgecolors="black",
+                       linewidths=0.9, marker="D", zorder=5,
+                       label="specific to this network")
+        ax.set_title(title, fontsize=11, fontweight="bold", color="#002060")
+        ax.set_xlim(0, NX); ax.set_ylim(0, NY)
+        ax.set_xlabel("x (pixels)", fontsize=9)
+        ax.set_ylabel("y (pixels)", fontsize=9)
+        ax.grid(True, alpha=0.25, color="0.7")
+        ax.legend(fontsize=8, loc="upper right", framealpha=0.9)
+
+    fig.suptitle("Same size, different answer: adding cost and carbon moves "
+                 f"{moved} of the {n_star} buoys",
+                 fontsize=13, fontweight="bold", color="#002060", y=1.00)
+    fig.text(0.5, -0.02,
+             f"operating cost {-best['saving']:+.0%}, CO2 "
+             f"{-(co2_a - best['co2']) / (co2_a + 1e-9):+.0%}, information "
+             f"{-best['loss']:+.0%}   |   "
+             f"maintenance tour {km_a:.0f} km against {best['km']:.0f} km",
+             ha="center", fontsize=10, color="0.30")
+    fig.tight_layout()
+    out_path = Path(out) / "rl_info_vs_cost_networks.png"
+    fig.savefig(out_path, dpi=150, bbox_inches="tight", facecolor="white")
+    plt.close()
+    print(f"  Figure -> {out_path}")
+
+    return {"cmp_n": n_star,
+            "cmp_info_a": info_a, "cmp_cost_a": cost_a, "cmp_co2_a": co2_a,
+            "cmp_info_b": best["info"], "cmp_cost_b": best["cost"],
+            "cmp_co2_b": best["co2"],
+            "cmp_info_loss_pct": best["loss"] * 100,
+            "cmp_cost_saving_pct": best["saving"] * 100,
+            "cmp_moved": moved, "cmp_shared": len(shared),
+            "cmp_lambda": best["lam"],
+            "cmp_info_rl": info_rl, "cmp_cost_rl": cost_rl, "cmp_co2_rl": co2_rl,
+            "cmp_positions_cost": [tuple(int(v) for v in env.candidate_positions[i])
+                                   for i in idx_cost]}
+
 
 def _report_header(mode, args, T, positions, ts, ocean_diag=None):
     _D = ocean_diag or {}
@@ -291,6 +471,10 @@ def main():
           f"corr T-S={diag['corr_TS_global']:+.2f}")
     if not args.no_nature_fig:
         plot_nature_run(run, out_path=str(out / "ocean_nature_run.png"))
+    if args.ocean_gif:
+        animate_nature_run(run, out_path=str(out / "ocean_nature_run.gif"),
+                           every=args.ocean_gif_every, var=args.ocean_gif_var,
+                           fps=args.ocean_gif_fps)
     metrics_ocean = diag
 
     rng      = np.random.default_rng(args.seed_buoys)
@@ -318,6 +502,9 @@ def main():
         w_unobs=4.0, lambda_grad=0.5, lambda_spec=0.0, lambda_ts=0.0,
         huber_delta=0.5, beta_max=0.0, n_obs_min=10, n_obs_max=60,
         n_mc_val=3, n_mc=20, output_dir=str(out),
+        n_proposed=args.n_proposed,
+        gap_margin_px=args.gap_margin_px,
+        gap_min_sep_px=args.gap_min_sep_px,
         checkpoint=str(out / "vae_best.pt"))
 
     # GNN namespace
@@ -384,7 +571,7 @@ def _run_individual(args, T, S, positions, b1, b2, b3,
           f"({rmse_T_phys:.3f} °C | {rmse_S_phys:.4f} psu)  [{ae_time}s]")
     print(f"\n{SEP}\n  BRICK 2 -- GNN network structure\n{SEP}")
     t0_gnn = time.time()
-    corr   = b2.build_spatial_correlation(T, S, positions, n_timestamps=min(80, args.nt))
+    corr   = b2.build_spatial_correlation(T, S, positions, n_timestamps=min(600, args.nt))
     graph  = b2.build_graph(positions, corr, corr_threshold=0.5, k_nearest=4)
     tgts   = b2.compute_proxy_targets(positions, corr)
     print(f"  Graph : {len(positions)} nodes, {graph['edge_index'].shape[1]} edges")
@@ -513,11 +700,40 @@ def _run_pipeline(args, T, S, init_pos, b1, b2, b3,
          for i, (px, py) in enumerate(rl_positions)]
     metrics["rl_positions"] = rl_positions
 
+    # -- Step 1b: same network with cost and carbon in the objective ------------
+    if not args.no_cost_compare:
+        print(f"\n{SEP}\n  STEP 1b/3 -- RL: information alone against information "
+              f"and cost\n{SEP}")
+        m_cmp = _compare_info_vs_cost(b3, env, rl_positions, best_mask, args, out)
+        if m_cmp:
+            metrics.update(m_cmp)
+            report_sections += [
+                "",
+                "-- INFORMATION-ONLY vs COST-AWARE NETWORK (equal size) --------------",
+                f"  N buoys                : {m_cmp['cmp_n']}",
+                f"  info   (info only)     : {m_cmp['cmp_info_a']:.4f}",
+                f"  info   (with cost)     : {m_cmp['cmp_info_b']:.4f}"
+                f"   ({-m_cmp['cmp_info_loss_pct']:+.1f} %)",
+                f"  cost   (info only)     : {m_cmp['cmp_cost_a']:.0f} kEUR/yr",
+                f"  cost   (with cost)     : {m_cmp['cmp_cost_b']:.0f} kEUR/yr"
+                f"   ({-m_cmp['cmp_cost_saving_pct']:+.1f} %)",
+                f"  CO2    (info only)     : {m_cmp['cmp_co2_a']:.1f} t/yr",
+                f"  CO2    (with cost)     : {m_cmp['cmp_co2_b']:.1f} t/yr",
+                f"  positions in common    : {m_cmp['cmp_shared']}",
+                f"  positions moved        : {m_cmp['cmp_moved']}",
+                f"  lambda retained        : {m_cmp['cmp_lambda']:.4g}",
+                f"  (RL retained network   : info={m_cmp['cmp_info_rl']:.4f}  "
+                f"cost={m_cmp['cmp_cost_rl']:.0f} kEUR/yr  "
+                f"{m_cmp['cmp_co2_rl']:.1f} tCO2/yr)",
+            ] + ["", "-- COST-AWARE POSITIONS (pixel x, y) --------------------------------"] \
+              + [f"  C{i:02d} : ({px:4d}, {py:4d})"
+                 for i, (px, py) in enumerate(m_cmp["cmp_positions_cost"])]
+
     # -- Step 2: GNN scores the RL network --------------------------------------
     print(f"\n{SEP}\n  STEP 2/3 -- GNN: scoring the RL network\n{SEP}")
     t0_gnn = time.time()
     corr   = b2.build_spatial_correlation(T, S, rl_positions,
-                                           n_timestamps=min(80, args.nt))
+                                           n_timestamps=min(600, args.nt))
     graph  = b2.build_graph(rl_positions, corr,
                              corr_threshold=gnn_ns.corr_threshold,
                              k_nearest=gnn_ns.k_nearest, T=T, S=S)
@@ -550,9 +766,38 @@ def _run_pipeline(args, T, S, init_pos, b1, b2, b3,
     ae_fig_ns.output_dir = str(out)
     print("  AE figures on the RL network...")
     model_ae.eval()
-    b1.plot_network_evaluation(model_ae, T, S, norm, ae_fig_ns,
-                                positions=rl_positions, n_samples=ae_ns.n_mc)
+    loo_delta, gap_map, _ae_pos, proposed_arr = b1.plot_network_evaluation(
+        model_ae, T, S, norm, ae_fig_ns,
+        positions=rl_positions, n_samples=ae_ns.n_mc)
     b1.plot_uncertainty_maps(model_ae, T, S, norm, ae_fig_ns, n_samples=ae_ns.n_mc)
+
+    # -- Step 3b: the GNN scores the buoys the AE proposed ----------------------
+    if not args.no_inductive:
+        print(f"\n{SEP}\n  STEP 3b/3 -- GNN: scoring the buoys proposed by the AE"
+              f"\n{SEP}")
+        new_positions = [(int(px), int(py)) for px, py in np.asarray(proposed_arr)]
+        # drop anything that coincides with a buoy already in the network
+        retained = {(int(px), int(py)) for px, py in rl_positions}
+        new_positions = [p for p in new_positions if p not in retained]
+
+        if not new_positions:
+            print("  [skip] the AE proposed no position outside the network")
+        else:
+            print(f"  {len(new_positions)} positions proposed by the AE gap map:")
+            ret_arr = np.asarray(rl_positions, dtype=float)
+            for i, (px, py) in enumerate(new_positions):
+                d = float(np.sqrt(((ret_arr - np.array([px, py], dtype=float)) ** 2)
+                                  .sum(1)).min())
+                print(f"    P{i+1} @ ({px}, {py})  nearest existing buoy at {d:.0f} px")
+
+            b2.inductive_eval(model_gnn, graph, new_positions, corr, gnn_ns,
+                              T=T, S=S)
+            metrics["gnn_inductive_positions"] = new_positions
+            report_sections += [
+                "",
+                "-- GNN SCORES FOR THE AE-PROPOSED BUOYS (pixel x, y) ----------------",
+            ] + [f"  P{i+1} : ({px:4d}, {py:4d})"
+                 for i, (px, py) in enumerate(new_positions)]
 
     m_ae = {"ae_best_loss": float(best_loss), "ae_rmse_val": val_rmse,
             "ae_rmse_T_degC": rmse_T_phys, "ae_rmse_S_psu": rmse_S_phys,

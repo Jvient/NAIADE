@@ -1,6 +1,11 @@
-import torch
+try:                                    # torch is only needed by the NN bricks;
+    import torch                        # the nature run and the OED core are
+    HAS_TORCH = True                   # pure numpy and must stay importable
+except ModuleNotFoundError:             # without it (CI, headless OED runs).
+    torch = None
+    HAS_TORCH = False
 
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+DEVICE = "cuda" if (HAS_TORCH and torch.cuda.is_available()) else "cpu"
 
 # =============================================================================
 #  Domain
@@ -60,7 +65,7 @@ NOISE_STD = 0.01
 # =============================================================================
 #  Observing network
 # =============================================================================
-N_BUOYS = 30
+N_BUOYS = 15
 
 # Instrumental noise, PER VARIABLE and in physical units.
 # A single OBS_NOISE_STD no longer makes sense: sigma(SST) ~ 2.6 degC and

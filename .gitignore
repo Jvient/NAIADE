@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+*.pt
+*.gif
+*.bak
+
+outputs/
+logs/
+.ipynb_checkpoints/
